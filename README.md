@@ -1,0 +1,2 @@
+# dosev
+A DNS resolver.
