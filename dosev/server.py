@@ -436,12 +436,18 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
     except NotImplementedError:
         logging.warning("Signal handlers are not supported on this platform")
 
+    server_task = asyncio.create_task(server.serve_forever())
+    shutdown_task = asyncio.create_task(shutdown_event.wait())
     try:
-        await asyncio.wait([server.serve_forever(), shutdown_event.wait()], return_when=asyncio.FIRST_COMPLETED)
+        await asyncio.wait([server_task, shutdown_task], return_when=asyncio.FIRST_COMPLETED)
     except asyncio.CancelledError:
         pass
     finally:
         logging.info("Shutting down gracefully...")
+        for task in (server_task, shutdown_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(server_task, shutdown_task, return_exceptions=True)
         await resolver.stop_pool_cleanups()
         udp_transport.close()
         server.close()

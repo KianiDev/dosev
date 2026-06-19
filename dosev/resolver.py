@@ -2032,7 +2032,11 @@ class DNSResolver:
             msg.answer = filtered_answer
 
             if self.rebind_action == 'block' and not filtered_answer:
-                return self._make_nxdomain_response(b'\x00'*12)
+                msg.answer = []
+                msg.authority = []
+                msg.additional = []
+                msg.set_rcode(dns.rcode.NXDOMAIN)
+                return msg.to_wire()
             return msg.to_wire()
         except Exception as e:
             self.logger.debug("rebind protection failed: %s", e)

@@ -1,10 +1,12 @@
 import asyncio
+import os
 from types import SimpleNamespace
 
 import dns.message
 import dns.rcode
 import pytest
 
+from dosev.resolver import DNSResolver
 from dosev.server import ResolverHolder, UDPResolverProtocol, _tcp_handler, reload_resolver, _drop_dns_privileges, run_server, run_server_sync
 
 
@@ -273,3 +275,256 @@ def test_run_server_sync_uses_asyncio_run(monkeypatch):
     monkeypatch.setattr("dosev.server.asyncio.run", fake_run)
     run_server_sync("127.0.0.1", 5353, "1.1.1.1", "udp")
     assert called["ran"] is True
+@pytest.mark.asyncio
+async def test_run_server_starts_udp_and_tcp_listeners(monkeypatch):
+    """Test that run_server creates UDP and TCP listeners."""
+    called = {}
+    
+    class FakeUDPTransport:
+        def close(self):
+            pass
+    
+    class FakeTCPServer:
+        async def serve_forever(self):
+            called['served'] = True
+        def close(self):
+            called['closed'] = True
+        async def wait_closed(self):
+            pass
+    
+    async def fake_create_datagram_endpoint(protocol_factory, local_addr):
+        called['udp_started'] = True
+        return FakeUDPTransport(), None
+    
+    async def fake_start_server(handler, host, port):
+        called['tcp_started'] = True
+        return FakeTCPServer()
+    
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "create_datagram_endpoint", fake_create_datagram_endpoint)
+    monkeypatch.setattr(loop, "add_signal_handler", lambda *args, **kwargs: None)
+    monkeypatch.setattr("asyncio.start_server", fake_start_server)
+    monkeypatch.setattr("dosev.server._drop_dns_privileges", lambda *args, **kwargs: None)
+    
+    # Run server with a short timeout
+    task = asyncio.create_task(run_server(
+        listen_ip="127.0.0.1",
+        listen_port=5353,
+        upstream_dns="1.1.1.1",
+        protocol="udp"
+    ))
+    
+    # Let it start
+    await asyncio.sleep(0.1)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    
+    assert called.get('udp_started') is True
+    assert called.get('tcp_started') is True
+
+@pytest.mark.asyncio
+async def test_run_server_graceful_shutdown_on_signal(monkeypatch):
+    """Test that run_server shuts down cleanly when a signal is received."""
+    shutdown_called = False
+    
+    class FakeTCPServer:
+        async def serve_forever(self):
+            await asyncio.sleep(3600)  # Never returns
+        def close(self):
+            nonlocal shutdown_called
+            shutdown_called = True
+        async def wait_closed(self):
+            pass
+    
+    async def fake_start_server(handler, host, port):
+        return FakeTCPServer()
+    
+    class FakeUDPTransport:
+        def close(self):
+            pass
+
+    async def fake_create_datagram_endpoint(protocol_factory, local_addr):
+        return FakeUDPTransport(), None
+    
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "create_datagram_endpoint", fake_create_datagram_endpoint)
+    monkeypatch.setattr(loop, "add_signal_handler", lambda *args, **kwargs: None)
+    monkeypatch.setattr("asyncio.start_server", fake_start_server)
+    monkeypatch.setattr("dosev.server._drop_dns_privileges", lambda *args, **kwargs: None)
+    
+    # Simulate signal by setting shutdown_event manually
+    # We'll test the signal handler path separately
+    # This test ensures the finally block runs
+    task = asyncio.create_task(run_server(
+        listen_ip="127.0.0.1",
+        listen_port=5353,
+        upstream_dns="1.1.1.1",
+        protocol="udp"
+    ))
+    
+    # Wait for startup, then cancel
+    await asyncio.sleep(0.1)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    
+    assert shutdown_called is True
+
+def test_run_server_sync_wraps_asyncio_run():
+    """Test that run_server_sync calls asyncio.run with correct args."""
+    called = {}
+    
+    def fake_asyncio_run(coro):
+        called['coro'] = coro
+    
+    import dosev.server
+    original_run = asyncio.run
+    asyncio.run = fake_asyncio_run
+    
+    try:
+        run_server_sync(
+            listen_ip="1.2.3.4",
+            listen_port=9999,
+            upstream_dns="8.8.8.8",
+            protocol="tls",
+            verbose=True
+        )
+        assert called['coro'] is not None
+    finally:
+        asyncio.run = original_run
+def test_drop_dns_privileges_does_nothing_when_not_root(monkeypatch):
+    """Test that _drop_dns_privileges does nothing when not running as root."""
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)  # Not root
+    called = {}
+    
+    def fake_setgid(gid):
+        called['setgid'] = gid
+    def fake_setuid(uid):
+        called['setuid'] = uid
+    def fake_chroot(path):
+        called['chroot'] = path
+    
+    monkeypatch.setattr(os, "setgid", fake_setgid)
+    monkeypatch.setattr(os, "setuid", fake_setuid)
+    monkeypatch.setattr(os, "chroot", fake_chroot)
+    
+    _drop_dns_privileges("nobody", "nogroup", "/var/empty")
+    
+    # Should not have called any of these
+    assert called == {}
+
+def test_drop_dns_privileges_drops_privs_when_root(monkeypatch):
+    """Test that _drop_dns_privileges drops privileges when running as root."""
+    monkeypatch.setattr(os, "geteuid", lambda: 0)  # Root
+    
+    import pwd
+    import grp
+    
+    class FakePw:
+        pw_gid = 999
+        pw_uid = 999
+    
+    class FakeGrp:
+        gr_gid = 999
+    
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: FakePw())
+    monkeypatch.setattr(grp, "getgrnam", lambda name: FakeGrp())
+    
+    called = {}
+    
+    def fake_setgid(gid):
+        called['setgid'] = gid
+    def fake_setuid(uid):
+        called['setuid'] = uid
+    def fake_setgroups(groups):
+        called['setgroups'] = groups
+    def fake_chroot(path):
+        called['chroot'] = path
+    
+    monkeypatch.setattr(os, "setgid", fake_setgid)
+    monkeypatch.setattr(os, "setuid", fake_setuid)
+    monkeypatch.setattr(os, "setgroups", fake_setgroups)
+    monkeypatch.setattr(os, "chroot", fake_chroot)
+    
+    _drop_dns_privileges("nobody", "nogroup", "/var/empty")
+    
+    assert called.get('setgid') == 999
+    assert called.get('setuid') == 999
+    assert called.get('setgroups') == []
+    assert called.get('chroot') == '/var/empty'
+@pytest.mark.asyncio
+async def test_reload_resolver_reloads_blocklists(monkeypatch, tmp_path):
+    """Test that reload_resolver reloads blocklists when configured."""
+    resolver = DNSResolver("1.1.1.1", protocol="udp")
+    holder = ResolverHolder(resolver)
+    
+    # Create a fake blocklist file
+    blocklist_dir = tmp_path / "blocklists"
+    blocklist_dir.mkdir()
+    (blocklist_dir / "test.txt").write_text("blocked.domain\n.badsuffix\n")
+    
+    blocklists_config = {
+        'action': 'REFUSED',
+        'urls': [],
+        'local_blocklist_dir': str(blocklist_dir),
+    }
+    
+    reload_called = False
+    async def fake_fetch_blocklists(urls, destination_dir):
+        nonlocal reload_called
+        reload_called = True
+    
+    monkeypatch.setattr("dosev.server.fetch_blocklists", fake_fetch_blocklists)
+    
+    config = {
+        'upstream_dns': '9.9.9.9',
+        'protocol': 'tls',
+        'verbose': True,
+        'disable_ipv6': True,
+        'upstream_udp_timeout': 3.0,
+        'upstream_tcp_timeout': 4.0,
+        'upstream_doh_timeout': 6.0,
+        'upstream_retries': 3,
+        'dns_pinned_certs': {},
+        'dnssec_enabled': True,
+        'trust_anchors_file': '',
+        'metrics_enabled': False,
+        'metrics_port': 8000,
+        'rate_limit_rps': 1.0,
+        'rate_limit_burst': 2.0,
+        'upstreams': [],
+        'optimistic_cache_enabled': True,
+        'optimistic_stale_max_age': 100,
+        'optimistic_stale_response_ttl': 10,
+        'dns_rebind_protection': True,
+        'dns_rebind_action': 'block',
+        'pool_max_size': 10,
+        'pool_idle_timeout': 30.0,
+        'doh_version': '2',
+        'doh_auto_cache_ttl': 2000,
+        'bootstrap': {'servers': ['1.1.1.1:53'], 'timeout': 1.0, 'retries': 1},
+    }
+    
+    await reload_resolver(holder, config, resolver, blocklists_config)
+    
+    # Check that the resolver was updated
+    assert resolver.upstream_dns == '9.9.9.9'
+    assert resolver.protocol == 'tls'
+    assert resolver.verbose is True
+    assert resolver.disable_ipv6 is True
+    assert resolver.udp_timeout == 3.0
+    assert resolver.tcp_timeout == 4.0
+    assert resolver.doh_timeout == 6.0
+    assert resolver.retries == 3
+    assert resolver.dnssec_enabled is True
+    
+    # Check blocklist was loaded
+    assert resolver.is_blocked('blocked.domain') is True
+    assert resolver.is_blocked('sub.badsuffix') is True
+    assert resolver.is_blocked('allowed.domain') is False
+    assert resolver.get_block_action() == 'REFUSED'

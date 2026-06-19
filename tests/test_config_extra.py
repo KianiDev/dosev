@@ -87,3 +87,28 @@ def test_load_config_parses_all_extra_sections(tmp_path):
     assert config["optimistic_cache_enabled"] is True
     assert config["dns_privilege_drop_user"] == "dns"
     assert config["dns_log_prefix"] == "custom-log"
+def test_load_config_upstreams_with_default_ports(tmp_path):
+    """Test that upstreams get default ports based on protocol."""
+    cfg_path = tmp_path / "dosev.conf"
+    cfg = configparser.ConfigParser()
+    cfg["upstreams"] = {"servers": "primary,secondary"}
+    cfg["upstreams.primary"] = {"address": "dns1.example.com", "protocol": "tls"}
+    cfg["upstreams.secondary"] = {"address": "dns2.example.com", "protocol": "https"}
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        cfg.write(f)
+    
+    config = load_config(str(cfg_path))
+    assert config["upstreams"][0]["port"] == 853  # TLS default
+    assert config["upstreams"][1]["port"] == 443  # HTTPS default
+
+def test_load_config_upstreams_with_custom_port(tmp_path):
+    """Test that upstreams respect custom port configuration."""
+    cfg_path = tmp_path / "dosev.conf"
+    cfg = configparser.ConfigParser()
+    cfg["upstreams"] = {"servers": "primary"}
+    cfg["upstreams.primary"] = {"address": "dns1.example.com", "protocol": "udp", "port": "5353"}
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        cfg.write(f)
+    
+    config = load_config(str(cfg_path))
+    assert config["upstreams"][0]["port"] == 5353
