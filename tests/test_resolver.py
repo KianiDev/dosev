@@ -40,8 +40,8 @@ async def test_forward_dns_query_cache_expires(monkeypatch):
     resolver = DNSResolver("1.1.1.1", protocol="udp", cache_ttl=1)
     query = dns.message.make_query("example.com", "A").to_wire()
 
-    # FIXED: Added 'self' parameter
-    async def fake_try_upstream(self, upstream, data):
+    # Fake upstream should accept (upstream, data) when set on the instance
+    async def fake_try_upstream(upstream, data):
         return dns.message.make_response(dns.message.from_wire(data)).to_wire()
 
     monkeypatch.setattr(resolver, "_try_upstream", fake_try_upstream)
@@ -59,11 +59,12 @@ async def test_forward_dns_query_cache_expires(monkeypatch):
 async def test_get_auto_doh_version_prefers_http3_then_http2(monkeypatch):
     resolver = DNSResolver("1.1.1.1", protocol="https", doh_timeout=1.0)
 
-    # FIXED: Added 'self' parameter
-    async def fake_https3(self, data, hostname, port, host, path):
+    # When monkeypatching on the instance the fake should match
+    # the call signature used by the resolver (data, hostname, port, host, path)
+    async def fake_https3(data, hostname, port, host, path):
         return b'response'
 
-    async def fake_https2(self, data, hostname, port, host, path):
+    async def fake_https2(data, hostname, port, host, path):
         raise Exception("http2 unavailable")
 
     monkeypatch.setattr(resolver, '_forward_https3', fake_https3)
