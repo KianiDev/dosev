@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dosev"
+version = "0.1.0"
+description = "Multi‑protocol DNS resolver with full server and config support"
+authors = [{ name = "Mohammad Amin Kiani", email = "mohammadamin.k1390@gmail.com" }]
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "dnspython>=2.4.0",
+    "aiohttp>=3.8.0",
+    "aioquic>=0.9.0",
+    "cryptography>=38.0.0",
+    "cachetools>=5.0.0",
+    "httpx>=0.23.0",
+    "prometheus-client>=0.14.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "pytest-cov>=4.0",
+]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "--strict-markers"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[project.scripts]
+dosev = "dosev.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["dosev*"]

@@ -1,0 +1,79 @@
+[server]
+listen_ip = 0.0.0.0
+listen_port = 53
+
+[resolver]
+# You can specify a custom port with the syntax host:port
+# For example, to use port 5353 for UDP/TCP or 853 for TLS:
+upstream_dns = 1.1.1.1:5353
+protocol = udp
+verbose = false
+disable_ipv6 = false
+
+[cache]
+ttl = 300
+max_size = 1024
+
+[timeouts]
+udp = 2.0
+tcp = 5.0
+doh = 5.0
+
+[advanced]
+retries = 2
+rate_limit_rps = 0.0
+rate_limit_burst = 0.0
+optimistic_cache_enabled = false
+optimistic_stale_max_age = 86400
+optimistic_stale_response_ttl = 30
+pool_max_size = 5
+pool_idle_timeout = 60.0
+doh_version = auto
+doh_auto_cache_ttl = 3600
+
+[security]
+dnssec_enabled = false
+trust_anchors_file =
+pinned_certs =
+rebind_protection = false
+rebind_action = strip
+dns_privilege_drop_user =
+dns_privilege_drop_group =
+dns_chroot_dir =
+
+[logging]
+enabled = false
+log_dir = /var/log/dosev
+retention_days = 7
+log_prefix = dns-log
+
+[metrics]
+enabled = false
+port = 8000
+uvloop_enable = false
+
+[bootstrap]
+servers = 1.1.1.1:53,8.8.8.8:53
+timeout = 2.0
+retries = 2
+
+[upstreams]
+# servers = primary,secondary
+# [upstreams.primary]
+# address = 1.1.1.1
+# protocol = udp
+# port = 5353
+# hostname = one.one.one.one
+# [upstreams.secondary]
+# address = 8.8.8.8
+# protocol = tls
+# port = 853
+# hostname = dns.google
+
+[blocklists]
+enabled = false
+urls = https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
+interval_seconds = 86400
+action = NXDOMAIN
+local_blocklist_dir = blocklists
+reload_on_change = true
