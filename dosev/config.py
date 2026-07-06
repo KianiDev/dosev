@@ -27,6 +27,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
             'dns_log_dir': _default_log_dir(),
             'dns_log_prefix': 'dns-log',
             'dns_pinned_certs': {},
+            'dns_ecs_enabled': True,
             'dnssec_enabled': False,
             'auto_update_trust_anchor': True,
             'trust_anchors_file': '',
@@ -72,6 +73,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     protocol = config.get('resolver', 'protocol', fallback='udp').lower()
     verbose = config.getboolean('resolver', 'verbose', fallback=False)
     disable_ipv6 = config.getboolean('resolver', 'disable_ipv6', fallback=False)
+    dns_ecs_enabled = config.getboolean('resolver', 'dns_ecs_enabled', fallback=True)
     strip_ipv6_records_raw = config.get('resolver', 'strip_ipv6_records', fallback=None)
     if strip_ipv6_records_raw is None:
         strip_ipv6_records = None
@@ -198,9 +200,9 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
         'dns_log_dir': dns_log_dir,
         'dns_log_prefix': dns_log_prefix,
         'dns_pinned_certs': dns_pinned_certs,
+        'dns_ecs_enabled': dns_ecs_enabled,
         'dnssec_enabled': dnssec_enabled,
         'auto_update_trust_anchor': auto_update_trust_anchor,
-        'trust_anchors_file': trust_anchors_file,
         'metrics_enabled': metrics_enabled,
         'metrics_port': metrics_port,
         'uvloop_enable': uvloop_enable,

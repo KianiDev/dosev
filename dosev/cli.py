@@ -54,6 +54,7 @@ def main() -> None:
         dns_rebind_action=config.get("dns_rebind_action", "strip"),
         pool_max_size=config.get("pool_max_size", 5),
         pool_idle_timeout=config.get("pool_idle_timeout", 60.0),
+        dns_ecs_enabled=config.get("dns_ecs_enabled", True),
         doh_version=config.get("doh_version", "auto"),
         doh_auto_cache_ttl=config.get("doh_auto_cache_ttl", 3600),
         bootstrap=config.get("bootstrap", {"servers": [], "timeout": 2.0, "retries": 2}),

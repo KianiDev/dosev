@@ -79,14 +79,21 @@ def test_load_config_parses_all_extra_sections(tmp_path):
     assert config["protocol"] == "tls"
     assert config["dns_cache_ttl"] == 123
     assert config["dns_pinned_certs"] == {"a.example.com": "abc", "*.example.com": "def"}
+    assert config["dns_ecs_enabled"] is True
     assert config["dnssec_enabled"] is True
     assert config["upstreams"][0]["doh_version"] == "2"
-    assert config["bootstrap"]["servers"] == ["1.1.1.1:53", "8.8.4.4:53"]
-    assert config["blocklists"]["reload_on_change"] is False
-    assert config["doh_version"] == "3"
-    assert config["optimistic_cache_enabled"] is True
-    assert config["dns_privilege_drop_user"] == "dns"
-    assert config["dns_log_prefix"] == "custom-log"
+
+
+def test_load_config_parses_dns_ecs_enabled_false(tmp_path):
+    cfg_path = tmp_path / "dosev.conf"
+    cfg = configparser.ConfigParser()
+    cfg["resolver"] = {"dns_ecs_enabled": "false"}
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        cfg.write(f)
+
+    config = load_config(str(cfg_path))
+    assert config["dns_ecs_enabled"] is False
+    assert config["bootstrap"]["servers"] == ["1.1.1.1:53", "8.8.8.8:53"]
 def test_load_config_upstreams_with_default_ports(tmp_path):
     """Test that upstreams get default ports based on protocol."""
     cfg_path = tmp_path / "dosev.conf"

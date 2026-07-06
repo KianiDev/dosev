@@ -319,6 +319,7 @@ class DNSResolver:
                   optimistic_stale_response_ttl: int = 30,
                   rebind_protection_enabled: bool = False,
                   rebind_action: str = 'strip',
+                  ecs_enabled: bool = True,
                   pool_max_size: int = 5,
                   pool_idle_timeout: float = 60.0,
                   doh_version: str = 'auto',
@@ -439,6 +440,7 @@ class DNSResolver:
 
         self.rebind_protection_enabled: bool = rebind_protection_enabled
         self.rebind_action: str = rebind_action
+        self.ecs_enabled: bool = bool(ecs_enabled)
 
         self._tcp_pool: ConnectionPool = ConnectionPool(max_size=pool_max_size, idle_timeout=pool_idle_timeout)
         self._h2_pool: ClientPool = ClientPool(max_size=pool_max_size, idle_timeout=pool_idle_timeout)
@@ -764,47 +766,111 @@ class DNSResolver:
         except Exception:
             return None
 
+    def _extract_question_section(self, packet: bytes) -> Tuple[bytes, int, int]:
+        if not packet or len(packet) < 12:
+            return b'', 0, 12
+        qdcount = (packet[4] << 8) | packet[5]
+        offset = 12
+        for _ in range(qdcount):
+            _, offset = self._parse_dns_name(packet, offset)
+            offset += 4
+            if offset > len(packet):
+                raise ValueError("Truncated question section")
+        return packet[12:offset], qdcount, offset
+
+    def _extract_additional_section(self, packet: bytes, question_end: int) -> Tuple[bytes, int]:
+        if not packet or len(packet) < 12 or question_end > len(packet):
+            return b'', 0
+        arcount = (packet[10] << 8) | packet[11]
+        if arcount == 0:
+            return b'', 0
+        return packet[question_end:], arcount
+
+    def _build_cache_key(self, data: bytes) -> Tuple[str, int, str, bytes]:
+        qname = self._extract_qname_from_wire(data) or ""
+        qtype = self._extract_qtype_from_wire(data) or 1
+        try:
+            _, _, question_end = self._extract_question_section(data)
+            opt_bytes = data[question_end:]
+        except Exception:
+            opt_bytes = b''
+        return (qname, qtype, self.protocol, opt_bytes)
+
+    def _strip_ecs(self, data: bytes) -> bytes:
+        try:
+            if not _HAS_DNSPY:
+                return data
+            msg = dns.message.from_wire(data)
+            if msg.opt is None:
+                return data
+            options = [opt for opt in msg.options if not isinstance(opt, dns.edns.ECSOption)]
+            if len(options) == len(msg.options):
+                return data
+            msg.use_edns(edns=msg.edns, payload=msg.payload, options=options)
+            return msg.to_wire()
+        except Exception:
+            return data
+
+    def _normalize_query_for_forward(self, data: bytes) -> bytes:
+        if self.ecs_enabled:
+            return data
+        return self._strip_ecs(data)
+
     def _make_nxdomain_response(self, query_data: bytes) -> bytes:
         if not query_data or len(query_data) < 12:
             tid = 0
             qpart = b''
+            qdcount = 0
+            arcount = 0
             rd = 0
         else:
             tid = int.from_bytes(query_data[0:2], 'big')
             req_flags = int.from_bytes(query_data[2:4], 'big')
             try:
-                _, qend = self._parse_dns_name(query_data, 12)
-                qpart = query_data[12:qend + 4]
+                qpart, qdcount, qend = self._extract_question_section(query_data)
+                extra, arcount = self._extract_additional_section(query_data, qend)
             except Exception:
                 qpart = query_data[12:]
+                qdcount = 0
+                arcount = 0
+                extra = b''
             rd = req_flags & 0x0100
 
         flags = 0x8000 | rd | 0x0003
         header = (
             tid.to_bytes(2, 'big') +
             flags.to_bytes(2, 'big') +
-            (1).to_bytes(2, 'big') +
+            qdcount.to_bytes(2, 'big') +
             (0).to_bytes(2, 'big') +
             (0).to_bytes(2, 'big') +
-            (0).to_bytes(2, 'big')
+            arcount.to_bytes(2, 'big')
         )
-        return header + qpart
+        return header + qpart + extra
 
     def _build_local_A_response(self, query_data: bytes, ip: str) -> bytes:
         if not query_data or len(query_data) < 12:
             return b''
+
         tid = int.from_bytes(query_data[0:2], 'big')
+        try:
+            qpart, qdcount, qend = self._extract_question_section(query_data)
+            extra, arcount = self._extract_additional_section(query_data, qend)
+        except Exception:
+            qpart = query_data[12:]
+            qdcount = 0
+            arcount = 0
+            extra = b''
+
         flags = 0x8000
         header = (
             tid.to_bytes(2, 'big') +
             flags.to_bytes(2, 'big') +
-            (1).to_bytes(2, 'big') +
+            qdcount.to_bytes(2, 'big') +
             (1).to_bytes(2, 'big') +
             (0).to_bytes(2, 'big') +
-            (0).to_bytes(2, 'big')
+            arcount.to_bytes(2, 'big')
         )
-        _, qend = self._parse_dns_name(query_data, 12)
-        qpart = query_data[12:qend + 4]
+
         name_ptr = b'\xc0\x0c'
         rtype = (1).to_bytes(2, 'big')
         rclass = (1).to_bytes(2, 'big')
@@ -813,7 +879,7 @@ class DNSResolver:
         rdata = struct.pack('BBBB', *ip_parts)
         rdlen = (len(rdata)).to_bytes(2, 'big')
         answer = name_ptr + rtype + rclass + ttl + rdlen + rdata
-        return header + qpart + answer
+        return header + qpart + answer + extra
 
     def _extract_min_ttl(self, response: bytes) -> int:
         try:
@@ -1232,9 +1298,11 @@ class DNSResolver:
             raise ValueError(f"Unsupported upstream protocol: {proto}")
 
     async def forward_dns_query(self, data: bytes) -> bytes:
+        original_data = data
+        data = self._normalize_query_for_forward(data)
         qname = self._extract_qname_from_wire(data)
         qtype = self._extract_qtype_from_wire(data) or 1
-        key = (qname or "", qtype, self.protocol)
+        key = self._build_cache_key(data)
 
         async with self._config_lock:
             upstream_dns = self.upstream_dns
@@ -1256,21 +1324,21 @@ class DNSResolver:
                     if _HAS_DNSPY:
                         absolute_qname = qname if qname.endswith('.') else f"{qname}."
                         from dns import message, rdatatype, rdataclass, rrset
-                        resp = dns.message.make_response(dns.message.from_wire(data) if data else None)
+                        resp = dns.message.make_response(dns.message.from_wire(original_data) if original_data else None)
                         rr = dns.rrset.from_text(absolute_qname, 60, dns.rdataclass.IN, dns.rdatatype.A, ip)
                         resp.answer = [rr]
                         return resp.to_wire()
                     else:
-                        return self._build_local_A_response(data, ip)
+                        return self._build_local_A_response(original_data, ip)
                 except Exception:
                     self.logger.exception("failed to synthesize hosts map response for %s", qname)
 
         if await self.is_blocked(qname):
             self._log_event("Blocked (internal)", qname, None, "blocklist")
             try:
-                return self.build_block_response(data)
+                return self.build_block_response(original_data)
             except Exception:
-                return self._make_nxdomain_response(data)
+                return self._make_nxdomain_response(original_data)
 
         cached = await self._wire_cache_get_valid(key)
         if cached is not None:
@@ -2157,6 +2225,7 @@ class DNSResolver:
                             optimistic_stale_response_ttl: Optional[int] = None,
                             rebind_protection_enabled: Optional[bool] = None,
                             rebind_action: Optional[str] = None,
+                            ecs_enabled: Optional[bool] = None,
                             pool_max_size: Optional[int] = None,
                             pool_idle_timeout: Optional[float] = None,
                             doh_version: Optional[str] = None,
@@ -2238,6 +2307,8 @@ class DNSResolver:
                 self.rebind_protection_enabled = rebind_protection_enabled
             if rebind_action is not None:
                 self.rebind_action = rebind_action.lower()
+            if ecs_enabled is not None:
+                self.ecs_enabled = bool(ecs_enabled)
             if pool_max_size is not None:
                 self._tcp_pool.max_size = pool_max_size
                 self._h2_pool.max_size = pool_max_size

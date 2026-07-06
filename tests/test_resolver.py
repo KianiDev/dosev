@@ -24,6 +24,22 @@ def test_build_block_response_nxdomain():
     assert msg.rcode() == dns.rcode.NXDOMAIN
 
 
+def test_build_nxdomain_response_preserves_opt_section():
+    resolver = DNSResolver("1.1.1.1", protocol="udp")
+    query = dns.message.make_query("example.com", "A")
+    ecs_opt = dns.edns.ECSOption("192.0.2.0", 24, 0)
+    query.use_edns(options=[ecs_opt])
+    response = resolver._make_nxdomain_response(query.to_wire())
+    msg = dns.message.from_wire(response)
+
+    assert msg.rcode() == dns.rcode.NXDOMAIN
+    assert msg.opt is not None
+    assert len(msg.options) == 1
+    assert isinstance(msg.options[0], dns.edns.ECSOption)
+    assert msg.options[0].address == "192.0.2.0"
+    assert msg.options[0].srclen == 24
+
+
 @pytest.mark.asyncio
 async def test_make_local_a_response_with_hosts_map():
     resolver = DNSResolver("1.1.1.1", protocol="udp")
@@ -53,6 +69,29 @@ async def test_forward_dns_query_cache_expires(monkeypatch):
     await asyncio.sleep(1.1)
     response3 = await resolver.forward_dns_query(query)
     assert response3 == response1
+
+
+@pytest.mark.asyncio
+async def test_forward_dns_query_strips_ecs_when_disabled(monkeypatch):
+    resolver = DNSResolver("1.1.1.1", protocol="udp", ecs_enabled=False)
+    query = dns.message.make_query("example.com", "A")
+    ecs_opt = dns.edns.ECSOption("192.0.2.0", 24, 0)
+    query.use_edns(options=[ecs_opt])
+    qwire = query.to_wire()
+
+    called = {}
+    async def fake_try_upstream(upstream, data):
+        called['data'] = data
+        return dns.message.make_response(dns.message.from_wire(data)).to_wire()
+
+    monkeypatch.setattr(resolver, "_try_upstream", fake_try_upstream)
+
+    response = await resolver.forward_dns_query(qwire)
+    assert response is not None
+    assert 'data' in called
+    called_msg = dns.message.from_wire(called['data'])
+    assert called_msg.opt is not None
+    assert called_msg.options == ()
 
 
 @pytest.mark.asyncio
