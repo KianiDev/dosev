@@ -64,6 +64,7 @@ except Exception:
     uvloop = None
     _HAS_UVLOOP = False
 
+MAX_UDP_PAYLOAD = 4096
 
 # ---------- Default DNSSEC trust anchor (root KSK) ----------
 DEFAULT_ROOT_DNSKEY = (
@@ -298,6 +299,7 @@ class DNSResolver:
                   disable_ipv6: bool = False,
                   cache_ttl: int = 300,
                   cache_max_size: int = 2048,
+                  negative_cache_ttl: int = 5,
                   doh_timeout: float = 5.0,
                   udp_timeout: float = 2.0,
                   tcp_timeout: float = 5.0,
@@ -320,6 +322,7 @@ class DNSResolver:
                   rebind_protection_enabled: bool = False,
                   rebind_action: str = 'strip',
                   ecs_enabled: bool = True,
+                  max_edns_payload: int = MAX_UDP_PAYLOAD,
                   pool_max_size: int = 5,
                   pool_idle_timeout: float = 60.0,
                   doh_version: str = 'auto',
@@ -347,11 +350,15 @@ class DNSResolver:
         if _HAS_CACHETOOLS:
             self._dns_cache: Any = TTLCache(maxsize=cache_max_size, ttl=cache_ttl)
             self._wire_cache: Any = TTLCache(maxsize=cache_max_size, ttl=cache_ttl)
+            self._negative_cache: Any = TTLCache(maxsize=cache_max_size, ttl=negative_cache_ttl)
             self._cache_is_sync: bool = True
         else:
             self._dns_cache: Any = AsyncTTLCache(maxsize=cache_max_size, ttl=cache_ttl)
             self._wire_cache: Any = AsyncTTLCache(maxsize=cache_max_size, ttl=cache_ttl)
+            self._negative_cache: Any = AsyncTTLCache(maxsize=cache_max_size, ttl=negative_cache_ttl)
             self._cache_is_sync: bool = False
+
+        self.negative_cache_ttl: int = max(1, int(negative_cache_ttl))
 
         self._lock: asyncio.Lock = asyncio.Lock()
         self._config_lock: asyncio.Lock = asyncio.Lock()
@@ -441,6 +448,7 @@ class DNSResolver:
         self.rebind_protection_enabled: bool = rebind_protection_enabled
         self.rebind_action: str = rebind_action
         self.ecs_enabled: bool = bool(ecs_enabled)
+        self.max_edns_payload: int = max(512, int(max_edns_payload))
 
         self._tcp_pool: ConnectionPool = ConnectionPool(max_size=pool_max_size, idle_timeout=pool_idle_timeout)
         self._h2_pool: ClientPool = ClientPool(max_size=pool_max_size, idle_timeout=pool_idle_timeout)
@@ -637,6 +645,45 @@ class DNSResolver:
         except Exception:
             pass
 
+    async def _negative_cache_get(self, key: Tuple[str, int, str]) -> Optional[bytes]:
+        try:
+            if self._cache_is_sync:
+                return self._negative_cache.get(key)
+            return await self._negative_cache.get(key)
+        except Exception:
+            return None
+
+    async def _negative_cache_set(self, key: Tuple[str, int, str], value: bytes) -> None:
+        try:
+            if self._cache_is_sync:
+                self._negative_cache[key] = value
+            else:
+                await self._negative_cache.set(key, value)
+        except Exception:
+            pass
+
+    async def _negative_cache_delete(self, key: Tuple[str, int, str]) -> None:
+        try:
+            if self._cache_is_sync:
+                if key in self._negative_cache:
+                    del self._negative_cache[key]
+            else:
+                await self._negative_cache.delete(key)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _is_negative_response(response_bytes: bytes) -> bool:
+        try:
+            if not response_bytes or len(response_bytes) < 12 or not _HAS_DNSPY:
+                return False
+            msg = dns.message.from_wire(response_bytes)
+            if msg.rcode() == dns.rcode.NXDOMAIN:
+                return True
+            return msg.rcode() == dns.rcode.NOERROR and not msg.answer
+        except Exception:
+            return False
+
     # ---------- other helpers ----------
     async def _maybe_refresh_stale(self, key: Tuple[str, int, str], query_data: bytes) -> None:
         async with self._stale_refresh_lock:
@@ -811,10 +858,52 @@ class DNSResolver:
         except Exception:
             return data
 
-    def _normalize_query_for_forward(self, data: bytes) -> bytes:
-        if self.ecs_enabled:
+    def _cap_existing_edns_payload(self, data: bytes) -> bytes:
+        try:
+            if not _HAS_DNSPY:
+                return data
+            msg = dns.message.from_wire(data)
+            if msg.opt is None:
+                return data
+            if msg.payload > self.max_edns_payload:
+                msg.use_edns(edns=msg.edns, payload=self.max_edns_payload, options=msg.options)
+                return msg.to_wire()
             return data
-        return self._strip_ecs(data)
+        except Exception:
+            return data
+
+    def _ensure_max_edns_payload(self, data: bytes) -> bytes:
+        try:
+            if not _HAS_DNSPY:
+                return data
+            msg = dns.message.from_wire(data)
+            if msg.opt is None:
+                msg.use_edns(payload=self.max_edns_payload)
+                return msg.to_wire()
+            if msg.payload > self.max_edns_payload:
+                msg.use_edns(edns=msg.edns, payload=self.max_edns_payload, options=msg.options)
+                return msg.to_wire()
+            return data
+        except Exception:
+            return data
+
+    def _normalize_query_for_forward(self, data: bytes) -> bytes:
+        if not self.ecs_enabled:
+            data = self._strip_ecs(data)
+        return self._ensure_max_edns_payload(data)
+
+    def _ensure_max_edns_payload_response(self, data: bytes) -> bytes:
+        try:
+            if not _HAS_DNSPY:
+                return data
+            msg = dns.message.from_wire(data)
+            if msg.opt is None:
+                msg.use_edns(payload=self.max_edns_payload)
+            elif msg.payload > self.max_edns_payload:
+                msg.use_edns(edns=msg.edns, payload=self.max_edns_payload, options=msg.options)
+            return msg.to_wire()
+        except Exception:
+            return data
 
     def _make_nxdomain_response(self, query_data: bytes) -> bytes:
         if not query_data or len(query_data) < 12:
@@ -827,8 +916,9 @@ class DNSResolver:
             tid = int.from_bytes(query_data[0:2], 'big')
             req_flags = int.from_bytes(query_data[2:4], 'big')
             try:
-                qpart, qdcount, qend = self._extract_question_section(query_data)
-                extra, arcount = self._extract_additional_section(query_data, qend)
+                capped_query = self._cap_existing_edns_payload(query_data)
+                qpart, qdcount, qend = self._extract_question_section(capped_query)
+                extra, arcount = self._extract_additional_section(capped_query, qend)
             except Exception:
                 qpart = query_data[12:]
                 qdcount = 0
@@ -853,8 +943,9 @@ class DNSResolver:
 
         tid = int.from_bytes(query_data[0:2], 'big')
         try:
-            qpart, qdcount, qend = self._extract_question_section(query_data)
-            extra, arcount = self._extract_additional_section(query_data, qend)
+            capped_query = self._cap_existing_edns_payload(query_data)
+            qpart, qdcount, qend = self._extract_question_section(capped_query)
+            extra, arcount = self._extract_additional_section(capped_query, qend)
         except Exception:
             qpart = query_data[12:]
             qdcount = 0
@@ -1327,18 +1418,23 @@ class DNSResolver:
                         resp = dns.message.make_response(dns.message.from_wire(original_data) if original_data else None)
                         rr = dns.rrset.from_text(absolute_qname, 60, dns.rdataclass.IN, dns.rdatatype.A, ip)
                         resp.answer = [rr]
-                        return resp.to_wire()
+                        return self._ensure_max_edns_payload_response(resp.to_wire())
                     else:
-                        return self._build_local_A_response(original_data, ip)
+                        return self._ensure_max_edns_payload_response(self._build_local_A_response(original_data, ip))
                 except Exception:
                     self.logger.exception("failed to synthesize hosts map response for %s", qname)
 
         if await self.is_blocked(qname):
             self._log_event("Blocked (internal)", qname, None, "blocklist")
             try:
-                return self.build_block_response(original_data)
+                return self._ensure_max_edns_payload_response(self.build_block_response(original_data))
             except Exception:
-                return self._make_nxdomain_response(original_data)
+                return self._ensure_max_edns_payload_response(self._make_nxdomain_response(original_data))
+
+        cached_negative = await self._negative_cache_get(key)
+        if cached_negative is not None:
+            self.logger.debug("negative-cache hit %s", key)
+            return cached_negative
 
         cached = await self._wire_cache_get_valid(key)
         if cached is not None:
@@ -1397,6 +1493,12 @@ class DNSResolver:
                     resp = self._apply_rebind_protection(resp)
                     if resp is None:
                         return self._make_nxdomain_response(data)
+                resp = self._ensure_max_edns_payload_response(resp)
+                if self._is_negative_response(resp):
+                    async with self._lock:
+                        await self._wire_cache_delete(key)
+                        await self._negative_cache_set(key, resp)
+                    return resp
                 ttl = self._extract_min_ttl(resp)
                 if ttl <= 0:
                     ttl = 30
@@ -1404,6 +1506,7 @@ class DNSResolver:
                 stale_until = expiry + self.stale_max_age if self.optimistic_cache_enabled else expiry
                 val = (resp, expiry, data, stale_until, dnssec_ok)
                 async with self._lock:
+                    await self._negative_cache_delete(key)
                     await self._wire_cache_set(key, val)
                 return resp
             except Exception as e:
@@ -2205,6 +2308,7 @@ class DNSResolver:
                             verbose: Optional[bool] = None,
                             cache_ttl: Optional[int] = None,
                             cache_max_size: Optional[int] = None,
+                            negative_cache_ttl: Optional[int] = None,
                             doh_timeout: Optional[float] = None,
                             udp_timeout: Optional[float] = None,
                             tcp_timeout: Optional[float] = None,
@@ -2226,6 +2330,7 @@ class DNSResolver:
                             rebind_protection_enabled: Optional[bool] = None,
                             rebind_action: Optional[str] = None,
                             ecs_enabled: Optional[bool] = None,
+                            max_edns_payload: Optional[int] = None,
                             pool_max_size: Optional[int] = None,
                             pool_idle_timeout: Optional[float] = None,
                             doh_version: Optional[str] = None,
@@ -2245,6 +2350,8 @@ class DNSResolver:
                 pass
             if cache_max_size is not None:
                 pass
+            if negative_cache_ttl is not None:
+                self.negative_cache_ttl = max(1, int(negative_cache_ttl))
             if doh_timeout is not None:
                 self.doh_timeout = doh_timeout
             if udp_timeout is not None:
@@ -2309,6 +2416,8 @@ class DNSResolver:
                 self.rebind_action = rebind_action.lower()
             if ecs_enabled is not None:
                 self.ecs_enabled = bool(ecs_enabled)
+            if max_edns_payload is not None:
+                self.max_edns_payload = max(512, int(max_edns_payload))
             if pool_max_size is not None:
                 self._tcp_pool.max_size = pool_max_size
                 self._h2_pool.max_size = pool_max_size

@@ -1,16 +1,19 @@
 # dosev/server.py – FINAL with all fixes
 
 import asyncio
+import base64
 import logging
 import os
 import signal
+import ssl
 import sys
 from typing import Dict, Set, Tuple, Optional, Any, List
 
+from aiohttp import web
 
 _DEFAULT_LOG_DIR = os.path.join(os.getenv('LOCALAPPDATA') or os.path.expanduser('~'), 'dosev', 'logs') if os.name == 'nt' else '/var/log/dosev'
 
-from .resolver import DNSResolver, RateLimiter
+from .resolver import DNSResolver, RateLimiter, MAX_UDP_PAYLOAD
 from .utils import fetch_blocklists
 
 import dns.message
@@ -225,6 +228,7 @@ async def reload_resolver(holder: ResolverHolder,
         rebind_protection_enabled=config.get("dns_rebind_protection"),
         rebind_action=config.get("dns_rebind_action"),
         ecs_enabled=config.get("dns_ecs_enabled", True),
+        max_edns_payload=config.get("dns_max_payload", MAX_UDP_PAYLOAD),
         pool_max_size=config.get("pool_max_size"),
         pool_idle_timeout=config.get("pool_idle_timeout"),
         doh_version=config.get("doh_version"),
@@ -289,12 +293,111 @@ def _drop_dns_privileges(user: str, group: Optional[str] = None,
         logging.error('drop_privileges helper error: %s', e)
 
 
+def _create_ssl_context(cert_file: str, key_file: str) -> ssl.SSLContext:
+    if not cert_file or not key_file:
+        raise ValueError('TLS listener requires both cert_file and key_file')
+    ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ssl_ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
+    try:
+        ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    except AttributeError:
+        pass
+    return ssl_ctx
+
+
+def _get_client_address(writer: asyncio.StreamWriter) -> str:
+    peer = writer.get_extra_info('peername')
+    return f'{peer[0]}:{peer[1]}' if peer else 'unknown'
+
+
+async def _handle_doh_request(request: web.Request, holder: ResolverHolder) -> web.Response:
+    resolver = holder.resolver
+    client_ip = request.remote or 'unknown'
+    qname: Optional[str] = None
+    try:
+        if request.method == 'GET':
+            dns_param = request.rel_url.query.get('dns')
+            if not dns_param:
+                return web.Response(status=400, text='Missing dns parameter')
+            try:
+                padding = '=' * (-len(dns_param) % 4)
+                raw_query = base64.urlsafe_b64decode(dns_param + padding)
+            except Exception:
+                return web.Response(status=400, text='Invalid dns parameter encoding')
+        elif request.method == 'POST':
+            raw_query = await request.read()
+            if request.content_type != 'application/dns-message':
+                return web.Response(status=415, text='Unsupported content type')
+        else:
+            return web.Response(status=405, text='Method Not Allowed')
+
+        try:
+            request_msg = dns.message.from_wire(raw_query)
+            if request_msg.question:
+                qname = str(request_msg.question[0].name).rstrip('.')
+        except Exception:
+            qname = None
+
+        if resolver.disable_ipv6:
+            try:
+                request_msg = dns.message.from_wire(raw_query)
+                if request_msg.question and request_msg.question[0].rdtype == dns.rdatatype.AAAA:
+                    resp_wire = resolver.build_block_response(raw_query, action='NXDOMAIN')
+                    return web.Response(body=resp_wire, content_type='application/dns-message')
+            except Exception:
+                pass
+
+        if qname and await resolver.is_blocked(qname):
+            action = resolver.get_block_action()
+            resp_wire = resolver.build_block_response(raw_query, action=action)
+            try:
+                await resolver.log_dns_event('Blocked (internal)', qname, f'{client_ip}', f'Action={action}')
+            except Exception:
+                pass
+            return web.Response(body=resp_wire, content_type='application/dns-message')
+
+        response = await resolver.forward_dns_query(raw_query)
+        if resolver.disable_ipv6:
+            try:
+                resp_msg = dns.message.from_wire(response)
+                resp_msg.answer = [rr for rr in resp_msg.answer if rr.rdtype != dns.rdatatype.AAAA]
+                resp_msg.additional = [rr for rr in resp_msg.additional if rr.rdtype != dns.rdatatype.AAAA]
+                response = resp_msg.to_wire()
+            except Exception:
+                pass
+
+        try:
+            if qname:
+                await resolver.log_dns_event('Processed', qname, f'{client_ip}')
+        except Exception:
+            pass
+
+        return web.Response(body=response, content_type='application/dns-message')
+    except Exception as e:
+        logging.error('DoH request handling failed: %s', e)
+        return web.Response(status=500, text='Internal Server Error')
+
+
+async def _start_doh_server(holder: ResolverHolder, listen_ip: str, listen_port: int,
+                            doh_path: str, ssl_context: ssl.SSLContext) -> web.AppRunner:
+    if not doh_path.startswith('/'):
+        doh_path = '/' + doh_path
+    app = web.Application()
+    app.router.add_route('*', doh_path, lambda request: _handle_doh_request(request, holder))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, listen_ip, listen_port, ssl_context=ssl_context)
+    await site.start()
+    return runner
+
+
 async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protocol: str,
                      verbose: bool = False,
                      blocklists: Optional[Dict[str, Any]] = None,
                      disable_ipv6: bool = False,
                      dns_cache_ttl: int = 300,
                      dns_cache_max_size: int = 1024,
+                     dns_negative_cache_ttl: int = 5,
                      dns_logging_enabled: bool = False,
                      dns_log_retention_days: int = 7,
                      dns_log_dir: str = _DEFAULT_LOG_DIR,
@@ -323,6 +426,16 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
                      dns_rebind_protection: bool = False,
                      dns_rebind_action: str = 'strip',
                      dns_ecs_enabled: bool = True,
+                     dns_max_payload: int = MAX_UDP_PAYLOAD,
+                     dns_enable_dot: bool = False,
+                     dns_dot_port: int = 853,
+                     dns_dot_cert_file: str = '',
+                     dns_dot_key_file: str = '',
+                     dns_enable_doh: bool = False,
+                     dns_doh_port: int = 443,
+                     dns_doh_cert_file: str = '',
+                     dns_doh_key_file: str = '',
+                     dns_doh_path: str = '/dns-query',
                      pool_max_size: int = 5,
                      pool_idle_timeout: float = 60.0,
                      doh_version: str = 'auto',
@@ -338,6 +451,7 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
         disable_ipv6=disable_ipv6,
         cache_ttl=dns_cache_ttl,
         cache_max_size=dns_cache_max_size,
+        negative_cache_ttl=dns_negative_cache_ttl,
         doh_timeout=upstream_doh_timeout,
         udp_timeout=upstream_udp_timeout,
         tcp_timeout=upstream_tcp_timeout,
@@ -359,59 +473,59 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
         optimistic_stale_response_ttl=optimistic_stale_response_ttl,
         rebind_protection_enabled=dns_rebind_protection,
         rebind_action=dns_rebind_action,
+        ecs_enabled=dns_ecs_enabled,
+        max_edns_payload=dns_max_payload,
         pool_max_size=pool_max_size,
         pool_idle_timeout=pool_idle_timeout,
-        dns_ecs_enabled=dns_ecs_enabled,
         doh_version=doh_version,
         doh_auto_cache_ttl=doh_auto_cache_ttl,
         bootstrap=bootstrap,
     )
 
-    await resolver.start_pool_cleanups()
-
     holder = ResolverHolder(resolver)
     loop = asyncio.get_running_loop()
 
-    if blocklists:
-        action = blocklists.get('action', 'NXDOMAIN')
-        resolver.set_block_action(action)
-        urls = blocklists.get('urls', []) or []
-        local_dir = blocklists.get('local_blocklist_dir', 'blocklists')
+    if blocklists is None:
+        blocklists = {}
 
-        if urls:
-            try:
-                await fetch_blocklists(urls, destination_dir=local_dir)
-                logging.info("Initial blocklist fetch complete")
-            except Exception as e:
-                logging.warning("Initial async blocklist fetch failed: %s", e)
+    action = blocklists.get('action', 'NXDOMAIN')
+    resolver.set_block_action(action)
+    urls = blocklists.get('urls', []) or []
+    local_dir = blocklists.get('local_blocklist_dir', 'blocklists')
 
+    if urls:
+        try:
+            await fetch_blocklists(urls, destination_dir=local_dir)
+            logging.info("Blocklists fetched on startup")
+        except Exception as e:
+            logging.warning("Blocklist fetch failed on startup: %s", e)
         try:
             exact_set, suffix_set, hosts_map = resolver.load_blocklists_from_dir(local_dir)
             domains = list(exact_set) + ['.' + s for s in suffix_set]
-            await resolver.set_blocklist(domains)
-            await resolver.set_hosts_map(hosts_map)
+            async with resolver._config_lock:
+                await resolver.set_blocklist(domains)
+                await resolver.set_hosts_map(hosts_map)
+            logging.info("Blocklists loaded from %s", local_dir)
         except Exception as e:
-            logging.warning("Failed to load blocklists from %s: %s", local_dir, e)
+            logging.warning("Blocklist load failed on startup: %s", e)
 
-        if blocklists.get('enabled') and urls:
-            interval = blocklists.get('interval_seconds', 86400)
-            async def periodic_reload() -> None:
-                while True:
-                    await asyncio.sleep(interval)
-                    try:
-                        await fetch_blocklists(urls, destination_dir=local_dir)
-                        exact_set, suffix_set, hosts_map = resolver.load_blocklists_from_dir(local_dir)
-                        domains = list(exact_set) + ['.' + s for s in suffix_set]
-                        # FIXED: Added await
-                        async with resolver._config_lock:
-                            await resolver.set_blocklist(domains)
-                            await resolver.set_hosts_map(hosts_map)
-                        logging.debug("Blocklists reloaded")
-                    except Exception as e:
-                        logging.warning("Periodic blocklist reload failed: %s", e)
-
-            loop.create_task(periodic_reload())
-            logging.info("Scheduled periodic blocklist refresh every %s seconds", interval)
+    if blocklists.get('enabled') and urls:
+        interval = blocklists.get('interval_seconds', 86400)
+        async def periodic_reload() -> None:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await fetch_blocklists(urls, destination_dir=local_dir)
+                    exact_set, suffix_set, hosts_map = resolver.load_blocklists_from_dir(local_dir)
+                    domains = list(exact_set) + ['.' + s for s in suffix_set]
+                    async with resolver._config_lock:
+                        await resolver.set_blocklist(domains)
+                        await resolver.set_hosts_map(hosts_map)
+                    logging.debug("Blocklists reloaded")
+                except Exception as e:
+                    logging.warning("Periodic blocklist reload failed: %s", e)
+        loop.create_task(periodic_reload())
+        logging.info("Scheduled periodic blocklist refresh every %s seconds", interval)
 
     udp_transport, _ = await loop.create_datagram_endpoint(
         lambda: UDPResolverProtocol(holder),
@@ -424,6 +538,21 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
         listen_ip, listen_port
     )
     logging.info(f"DNS TCP listener running on {listen_ip}:{listen_port}")
+
+    dot_server = None
+    doh_runner = None
+    if dns_enable_dot:
+        dot_ssl = _create_ssl_context(dns_dot_cert_file, dns_dot_key_file)
+        dot_server = await asyncio.start_server(
+            lambda r, w: _tcp_handler(r, w, holder),
+            listen_ip, dns_dot_port, ssl=dot_ssl
+        )
+        logging.info(f"DNS-over-TLS listener running on {listen_ip}:{dns_dot_port}")
+
+    if dns_enable_doh:
+        doh_ssl = _create_ssl_context(dns_doh_cert_file, dns_doh_key_file)
+        doh_runner = await _start_doh_server(holder, listen_ip, dns_doh_port, dns_doh_path, doh_ssl)
+        logging.info(f"DNS-over-HTTPS listener running on {listen_ip}:{dns_doh_port}{dns_doh_path}")
 
     if dns_privilege_drop_user:
         _drop_dns_privileges(
@@ -461,6 +590,11 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
         await resolver.stop_pool_cleanups()
         await resolver.stop_background_tasks()
         udp_transport.close()
+        if dot_server is not None:
+            dot_server.close()
+            await dot_server.wait_closed()
+        if doh_runner is not None:
+            await doh_runner.cleanup()
         server.close()
         await server.wait_closed()
         logging.info("Shutdown complete.")
@@ -472,6 +606,7 @@ def run_server_sync(listen_ip: str, listen_port: int, upstream_dns: str, protoco
                     disable_ipv6: bool = False,
                     dns_cache_ttl: int = 300,
                     dns_cache_max_size: int = 1024,
+                    dns_negative_cache_ttl: int = 5,
                     dns_logging_enabled: bool = False,
                     dns_log_retention_days: int = 7,
                     dns_log_dir: str = _DEFAULT_LOG_DIR,
@@ -500,6 +635,16 @@ def run_server_sync(listen_ip: str, listen_port: int, upstream_dns: str, protoco
                     dns_rebind_protection: bool = False,
                     dns_rebind_action: str = 'strip',
                     dns_ecs_enabled: bool = True,
+                    dns_max_payload: int = MAX_UDP_PAYLOAD,
+                    dns_enable_dot: bool = False,
+                    dns_dot_port: int = 853,
+                    dns_dot_cert_file: str = '',
+                    dns_dot_key_file: str = '',
+                    dns_enable_doh: bool = False,
+                    dns_doh_port: int = 443,
+                    dns_doh_cert_file: str = '',
+                    dns_doh_key_file: str = '',
+                    dns_doh_path: str = '/dns-query',
                     pool_max_size: int = 5,
                     pool_idle_timeout: float = 60.0,
                     doh_version: str = 'auto',
@@ -512,6 +657,7 @@ def run_server_sync(listen_ip: str, listen_port: int, upstream_dns: str, protoco
         disable_ipv6=disable_ipv6,
         dns_cache_ttl=dns_cache_ttl,
         dns_cache_max_size=dns_cache_max_size,
+        dns_negative_cache_ttl=dns_negative_cache_ttl,
         dns_logging_enabled=dns_logging_enabled,
         dns_log_retention_days=dns_log_retention_days,
         dns_log_dir=dns_log_dir,
@@ -540,6 +686,16 @@ def run_server_sync(listen_ip: str, listen_port: int, upstream_dns: str, protoco
         dns_rebind_protection=dns_rebind_protection,
         dns_rebind_action=dns_rebind_action,
         dns_ecs_enabled=dns_ecs_enabled,
+        dns_max_payload=dns_max_payload,
+        dns_enable_dot=dns_enable_dot,
+        dns_dot_port=dns_dot_port,
+        dns_dot_cert_file=dns_dot_cert_file,
+        dns_dot_key_file=dns_dot_key_file,
+        dns_enable_doh=dns_enable_doh,
+        dns_doh_port=dns_doh_port,
+        dns_doh_cert_file=dns_doh_cert_file,
+        dns_doh_key_file=dns_doh_key_file,
+        dns_doh_path=dns_doh_path,
         pool_max_size=pool_max_size,
         pool_idle_timeout=pool_idle_timeout,
         doh_version=doh_version,

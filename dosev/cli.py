@@ -8,6 +8,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="dosev DNS server")
     parser.add_argument("--config", "-c", default="config/dosev.conf",
                         help="Path to configuration file (default: config/dosev.conf)")
+    parser.add_argument("--check-config", action="store_true",
+                        help="Validate the configuration and exit without starting the server")
     args = parser.parse_args()
 
     try:
@@ -15,6 +17,10 @@ def main() -> None:
     except Exception as e:
         print(f"Failed to load config: {e}", file=sys.stderr)
         sys.exit(1)
+
+    if args.check_config:
+        print("Configuration is valid.")
+        return
 
     run_server_sync(
         listen_ip=config["listen_ip"],
@@ -26,6 +32,7 @@ def main() -> None:
         disable_ipv6=config.get("disable_ipv6", False),
         dns_cache_ttl=config.get("dns_cache_ttl", 300),
         dns_cache_max_size=config.get("dns_cache_max_size", 1024),
+        dns_negative_cache_ttl=config.get("dns_negative_cache_ttl", 5),
         dns_logging_enabled=config.get("dns_logging_enabled", False),
         dns_log_retention_days=config.get("dns_log_retention_days", 7),
         dns_log_dir=config.get("dns_log_dir", _default_log_dir()),
@@ -52,9 +59,19 @@ def main() -> None:
         dns_chroot_dir=config.get("dns_chroot_dir", ""),
         dns_rebind_protection=config.get("dns_rebind_protection", False),
         dns_rebind_action=config.get("dns_rebind_action", "strip"),
+        dns_ecs_enabled=config.get("dns_ecs_enabled", True),
+        dns_max_payload=config.get("dns_max_payload", 4096),
+        dns_enable_dot=config.get("dns_enable_dot", False),
+        dns_dot_port=config.get("dns_dot_port", 853),
+        dns_dot_cert_file=config.get("dns_dot_cert_file", ""),
+        dns_dot_key_file=config.get("dns_dot_key_file", ""),
+        dns_enable_doh=config.get("dns_enable_doh", False),
+        dns_doh_port=config.get("dns_doh_port", 443),
+        dns_doh_cert_file=config.get("dns_doh_cert_file", ""),
+        dns_doh_key_file=config.get("dns_doh_key_file", ""),
+        dns_doh_path=config.get("dns_doh_path", "/dns-query"),
         pool_max_size=config.get("pool_max_size", 5),
         pool_idle_timeout=config.get("pool_idle_timeout", 60.0),
-        dns_ecs_enabled=config.get("dns_ecs_enabled", True),
         doh_version=config.get("doh_version", "auto"),
         doh_auto_cache_ttl=config.get("doh_auto_cache_ttl", 3600),
         bootstrap=config.get("bootstrap", {"servers": [], "timeout": 2.0, "retries": 2}),

@@ -7,10 +7,23 @@ upstream_dns = 1.1.1.1:53
 protocol = udp
 verbose = false
 disable_ipv6 = false
+dns_max_payload = 4096  # maximum EDNS0 UDP payload advertised and accepted
+
+dns_enable_dot = false
+# dns_dot_port = 853
+# dns_dot_cert_file = /path/to/cert.pem
+# dns_dot_key_file = /path/to/key.pem
+
+dns_enable_doh = false
+# dns_doh_port = 443
+# dns_doh_cert_file = /path/to/cert.pem
+# dns_doh_key_file = /path/to/key.pem
+# dns_doh_path = /dns-query
 
 [cache]
 ttl = 300
 max_size = 1024
+negative_ttl = 5
 
 [timeouts]
 udp = 2.0

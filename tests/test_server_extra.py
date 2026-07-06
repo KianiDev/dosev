@@ -1,9 +1,12 @@
 import asyncio
 import os
 import signal
+import ssl
+import types
 from typing import Dict, Optional, Any, List
 import pytest
-from dosev.server import run_server, run_server_sync, reload_resolver, ResolverHolder
+from aiohttp import web
+from dosev.server import run_server, run_server_sync, reload_resolver, ResolverHolder, _handle_doh_request
 from dosev.resolver import DNSResolver
 
 
@@ -37,21 +40,40 @@ async def test_run_server_starts_udp_and_tcp_listeners(monkeypatch):
         called['udp_started'] = True
         return FakeUDPTransport(), None
 
-    async def fake_start_server(handler, host, port):
-        called['tcp_started'] = True
+    async def fake_start_server(handler, host, port, **kwargs):
+        if kwargs.get('ssl') is not None:
+            called['dot_started'] = True
+        else:
+            called['tcp_started'] = True
         return FakeTCPServer()
+
+    async def fake_start_doh_server(holder, listen_ip, listen_port, doh_path, ssl_context):
+        called['doh_started'] = True
+        class FakeDohRunner:
+            async def cleanup(self):
+                pass
+        return FakeDohRunner()
 
     loop = asyncio.get_running_loop()
     monkeypatch.setattr(loop, "create_datagram_endpoint", fake_create_datagram_endpoint)
     monkeypatch.setattr(loop, "add_signal_handler", lambda *args, **kwargs: None)
     monkeypatch.setattr("asyncio.start_server", fake_start_server)
+    monkeypatch.setattr("dosev.server._start_doh_server", fake_start_doh_server)
+    monkeypatch.setattr("dosev.server._create_ssl_context", lambda cert, key: ssl.create_default_context(ssl.Purpose.CLIENT_AUTH))
     monkeypatch.setattr("dosev.server._drop_dns_privileges", lambda *args, **kwargs: None)
 
     task = asyncio.create_task(run_server(
         listen_ip="127.0.0.1",
         listen_port=5353,
         upstream_dns="1.1.1.1",
-        protocol="udp"
+        protocol="udp",
+        dns_enable_dot=True,
+        dns_dot_cert_file="/tmp/cert.pem",
+        dns_dot_key_file="/tmp/key.pem",
+        dns_enable_doh=True,
+        dns_doh_cert_file="/tmp/cert.pem",
+        dns_doh_key_file="/tmp/key.pem",
+        dns_doh_path="/dns-query"
     ))
 
     await asyncio.sleep(0.1)
@@ -63,6 +85,8 @@ async def test_run_server_starts_udp_and_tcp_listeners(monkeypatch):
 
     assert called.get('udp_started') is True
     assert called.get('tcp_started') is True
+    assert called.get('dot_started') is True
+    assert called.get('doh_started') is True
 
 
 @pytest.mark.asyncio
@@ -80,7 +104,9 @@ async def test_run_server_graceful_shutdown_on_signal(monkeypatch):
         async def wait_closed(self):
             pass
 
-    async def fake_start_server(handler, host, port):
+    async def fake_start_server(handler, host, port, **kwargs):
+        if kwargs.get('ssl') is not None:
+            return FakeTCPServer()
         return FakeTCPServer()
 
     async def fake_create_datagram_endpoint(protocol_factory, local_addr):
@@ -109,26 +135,31 @@ async def test_run_server_graceful_shutdown_on_signal(monkeypatch):
     assert shutdown_called is True
 
 
-def test_run_server_sync_uses_asyncio_run():
+def test_run_server_sync_uses_asyncio_run(monkeypatch):
     called = {}
+
+    def fake_run_server(*args, **kwargs):
+        async def _coroutine():
+            return None
+        return _coroutine()
 
     def fake_asyncio_run(coro):
         called['coro'] = coro
+        if hasattr(coro, 'close'):
+            coro.close()
+        return None
 
-    original_run = asyncio.run
-    asyncio.run = fake_asyncio_run
+    monkeypatch.setattr("dosev.server.run_server", fake_run_server)
+    monkeypatch.setattr(asyncio, "run", fake_asyncio_run)
 
-    try:
-        run_server_sync(
-            listen_ip="1.2.3.4",
-            listen_port=9999,
-            upstream_dns="8.8.8.8",
-            protocol="tls",
-            verbose=True
-        )
-        assert called['coro'] is not None
-    finally:
-        asyncio.run = original_run
+    run_server_sync(
+        listen_ip="1.2.3.4",
+        listen_port=9999,
+        upstream_dns="8.8.8.8",
+        protocol="tls",
+        verbose=True
+    )
+    assert called['coro'] is not None
 
 
 def test_drop_dns_privileges_does_nothing_when_not_root(monkeypatch):
@@ -209,6 +240,46 @@ def test_drop_dns_privileges_drops_privs_when_root(monkeypatch):
     assert called.get('setuid') == 999
     assert called.get('setgroups') == []
     assert called.get('chroot') == '/var/empty'
+
+
+@pytest.mark.asyncio
+async def test_reload_resolver_updates_max_edns_payload(monkeypatch):
+    resolver = DNSResolver("1.1.1.1", protocol="udp")
+    holder = ResolverHolder(resolver)
+
+    async def fake_fetch_blocklists(urls, destination_dir):
+        return None
+
+    monkeypatch.setattr("dosev.server.fetch_blocklists", fake_fetch_blocklists)
+
+    config = {
+        'upstream_dns': '9.9.9.9',
+        'protocol': 'udp',
+        'dns_max_payload': 1232,
+    }
+
+    await reload_resolver(holder, config, resolver, None)
+
+    assert resolver.max_edns_payload == 1232
+
+
+@pytest.mark.asyncio
+async def test_handle_doh_request_returns_bad_request_for_missing_dns(monkeypatch):
+    resolver = DNSResolver("1.1.1.1", protocol="udp")
+    holder = ResolverHolder(resolver)
+
+    class FakeRequest:
+        method = 'GET'
+        rel_url = types.SimpleNamespace(query={})
+        remote = '203.0.113.7'
+        content_type = None
+
+        async def read(self):
+            return b''
+
+    response = await _handle_doh_request(FakeRequest(), holder)
+    assert response.status == 400
+    assert 'Missing dns parameter' in response.text
 
 
 @pytest.mark.asyncio

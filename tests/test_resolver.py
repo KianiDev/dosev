@@ -41,6 +41,28 @@ def test_build_nxdomain_response_preserves_opt_section():
 
 
 @pytest.mark.asyncio
+async def test_forward_normalizes_edns_payload_to_4096(monkeypatch):
+    resolver = DNSResolver("1.1.1.1", protocol="udp")
+    query = dns.message.make_query("example.com", "A")
+    query.use_edns(payload=8192)
+    query_wire = query.to_wire()
+
+    captured = {}
+    async def fake_try_upstream(upstream, data):
+        captured['wire'] = data
+        return dns.message.make_response(dns.message.from_wire(data)).to_wire()
+
+    monkeypatch.setattr(resolver, "_try_upstream", fake_try_upstream)
+
+    response = await resolver.forward_dns_query(query_wire)
+    assert captured['wire'] is not None
+    sent_msg = dns.message.from_wire(captured['wire'])
+    assert sent_msg.opt is not None
+    assert sent_msg.payload == 4096
+    assert response is not None
+
+
+@pytest.mark.asyncio
 async def test_make_local_a_response_with_hosts_map():
     resolver = DNSResolver("1.1.1.1", protocol="udp")
     await resolver.set_hosts_map({"example.com": ("203.0.113.1",)})
@@ -49,6 +71,30 @@ async def test_make_local_a_response_with_hosts_map():
     msg = dns.message.from_wire(response)
     assert len(msg.answer) == 1
     assert msg.answer[0].to_text().endswith("203.0.113.1")
+
+
+@pytest.mark.asyncio
+async def test_forward_dns_query_negative_responses_are_cached(monkeypatch):
+    resolver = DNSResolver("1.1.1.1", protocol="udp", negative_cache_ttl=5)
+    query = dns.message.make_query("does-not-exist.example", "A").to_wire()
+    calls = 0
+
+    async def fake_try_upstream(upstream, data):
+        nonlocal calls
+        calls += 1
+        req = dns.message.from_wire(data)
+        resp = dns.message.make_response(req)
+        resp.set_rcode(dns.rcode.NXDOMAIN)
+        return resp.to_wire()
+
+    monkeypatch.setattr(resolver, "_try_upstream", fake_try_upstream)
+
+    response1 = await resolver.forward_dns_query(query)
+    response2 = await resolver.forward_dns_query(query)
+
+    assert calls == 1
+    assert dns.message.from_wire(response1).rcode() == dns.rcode.NXDOMAIN
+    assert dns.message.from_wire(response2).rcode() == dns.rcode.NXDOMAIN
 
 
 @pytest.mark.asyncio

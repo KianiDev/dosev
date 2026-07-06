@@ -1,5 +1,6 @@
 import os
 import configparser
+import warnings
 from typing import Dict, Any, List, Optional
 
 
@@ -7,6 +8,44 @@ def _default_log_dir() -> str:
     if os.name == 'nt':
         return os.path.join(os.getenv('LOCALAPPDATA') or os.path.expanduser('~'), 'dosev', 'logs')
     return '/var/log/dosev'
+
+
+def _validate_and_warn(config: Dict[str, Any]) -> None:
+    listen_port = config.get('listen_port', 53)
+    if not isinstance(listen_port, int) or not 1 <= listen_port <= 65535:
+        raise ValueError('listen_port must be between 1 and 65535')
+
+    dns_max_payload = config.get('dns_max_payload', 4096)
+    if not isinstance(dns_max_payload, int) or not 512 <= dns_max_payload <= 4096:
+        raise ValueError('dns_max_payload must be between 512 and 4096')
+
+    protocol = config.get('protocol', 'udp')
+    if protocol not in {'udp', 'tcp', 'tls', 'https', 'quic'}:
+        raise ValueError('protocol must be one of: udp, tcp, tls, https, quic')
+
+    if config.get('dns_enable_dot', False) and not (config.get('dns_dot_cert_file') and config.get('dns_dot_key_file')):
+        raise ValueError('dns_enable_dot requires dns_dot_cert_file and dns_dot_key_file')
+
+    if config.get('dns_enable_doh', False) and not (config.get('dns_doh_cert_file') and config.get('dns_doh_key_file')):
+        raise ValueError('dns_enable_doh requires dns_doh_cert_file and dns_doh_key_file')
+
+    if config.get('dns_enable_dot', False) or config.get('dns_enable_doh', False):
+        if config.get('protocol') == 'udp':
+            warnings.warn('Secure listeners are enabled while the main resolver protocol is udp; this is usually intentional but verify your upstream defaults.', RuntimeWarning)
+
+    rate_limit_rps = config.get('rate_limit_rps', 0.0)
+    if rate_limit_rps < 0:
+        raise ValueError('rate_limit_rps must be non-negative')
+
+    rate_limit_burst = config.get('rate_limit_burst', 0.0)
+    if rate_limit_burst < 0:
+        raise ValueError('rate_limit_burst must be non-negative')
+
+    if config.get('metrics_enabled', False) and config.get('metrics_port', 8000) == 53:
+        warnings.warn('Metrics are enabled on port 53; this may conflict with DNS traffic.', RuntimeWarning)
+
+    if config.get('doh_version', 'auto') not in {'auto', '1.1', '2', '3'}:
+        raise ValueError('doh_version must be auto, 1.1, 2, or 3')
 
 
 def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
@@ -22,6 +61,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
             'strip_ipv6_records': None,  # None = use disable_ipv6 value
             'dns_cache_ttl': 300,
             'dns_cache_max_size': 1024,
+            'dns_negative_cache_ttl': 5,
             'dns_logging_enabled': False,
             'dns_log_retention_days': 7,
             'dns_log_dir': _default_log_dir(),
@@ -74,6 +114,16 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     verbose = config.getboolean('resolver', 'verbose', fallback=False)
     disable_ipv6 = config.getboolean('resolver', 'disable_ipv6', fallback=False)
     dns_ecs_enabled = config.getboolean('resolver', 'dns_ecs_enabled', fallback=True)
+    dns_max_payload = config.getint('resolver', 'dns_max_payload', fallback=4096)
+    dns_enable_dot = config.getboolean('resolver', 'dns_enable_dot', fallback=False)
+    dns_dot_port = config.getint('resolver', 'dns_dot_port', fallback=853)
+    dns_dot_cert_file = config.get('resolver', 'dns_dot_cert_file', fallback='')
+    dns_dot_key_file = config.get('resolver', 'dns_dot_key_file', fallback='')
+    dns_enable_doh = config.getboolean('resolver', 'dns_enable_doh', fallback=False)
+    dns_doh_port = config.getint('resolver', 'dns_doh_port', fallback=443)
+    dns_doh_cert_file = config.get('resolver', 'dns_doh_cert_file', fallback='')
+    dns_doh_key_file = config.get('resolver', 'dns_doh_key_file', fallback='')
+    dns_doh_path = config.get('resolver', 'dns_doh_path', fallback='/dns-query')
     strip_ipv6_records_raw = config.get('resolver', 'strip_ipv6_records', fallback=None)
     if strip_ipv6_records_raw is None:
         strip_ipv6_records = None
@@ -82,6 +132,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
 
     dns_cache_ttl = config.getint('cache', 'ttl', fallback=300)
     dns_cache_max_size = config.getint('cache', 'max_size', fallback=1024)
+    dns_negative_cache_ttl = config.getint('cache', 'negative_ttl', fallback=5)
 
     upstream_udp_timeout = config.getfloat('timeouts', 'udp', fallback=2.0)
     upstream_tcp_timeout = config.getfloat('timeouts', 'tcp', fallback=5.0)
@@ -185,22 +236,33 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
         'reload_on_change': config.getboolean('blocklists', 'reload_on_change', fallback=True),
     }
 
-    return {
+    validated_config = {
         'listen_ip': listen_ip,
         'listen_port': listen_port,
         'upstream_dns': upstream_dns,
         'protocol': protocol,
+        'dns_enable_dot': dns_enable_dot,
+        'dns_dot_port': dns_dot_port,
+        'dns_dot_cert_file': dns_dot_cert_file,
+        'dns_dot_key_file': dns_dot_key_file,
+        'dns_enable_doh': dns_enable_doh,
+        'dns_doh_port': dns_doh_port,
+        'dns_doh_cert_file': dns_doh_cert_file,
+        'dns_doh_key_file': dns_doh_key_file,
+        'dns_doh_path': dns_doh_path,
         'verbose': verbose,
         'disable_ipv6': disable_ipv6,
         'strip_ipv6_records': strip_ipv6_records,
         'dns_cache_ttl': dns_cache_ttl,
         'dns_cache_max_size': dns_cache_max_size,
+        'dns_negative_cache_ttl': dns_negative_cache_ttl,
         'dns_logging_enabled': dns_logging_enabled,
         'dns_log_retention_days': dns_log_retention_days,
         'dns_log_dir': dns_log_dir,
         'dns_log_prefix': dns_log_prefix,
         'dns_pinned_certs': dns_pinned_certs,
         'dns_ecs_enabled': dns_ecs_enabled,
+        'dns_max_payload': dns_max_payload,
         'dnssec_enabled': dnssec_enabled,
         'auto_update_trust_anchor': auto_update_trust_anchor,
         'metrics_enabled': metrics_enabled,
@@ -228,3 +290,6 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
         'bootstrap': bootstrap,
         'blocklists': blocklists,
     }
+
+    _validate_and_warn(validated_config)
+    return validated_config
