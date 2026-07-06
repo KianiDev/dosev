@@ -15,6 +15,8 @@ import xml.etree.ElementTree as ET
 from typing import Optional, Tuple, Any, Set, Dict, Union, List, Callable, Coroutine, Iterable
 from urllib.parse import urlparse
 
+DEFAULT_LOG_DIR = os.path.join(os.getenv('LOCALAPPDATA') or os.path.expanduser('~'), 'dosev', 'logs') if os.name == 'nt' else '/var/log/dosev'
+
 try:
     from cachetools import TTLCache
     _HAS_CACHETOOLS = True
@@ -301,7 +303,7 @@ class DNSResolver:
                   tcp_timeout: float = 5.0,
                   retries: int = 2,
                   dns_logging_enabled: bool = False,
-                  dns_log_dir: str = "/var/log/phantomd",
+                  dns_log_dir: str = DEFAULT_LOG_DIR,
                   pinned_certs: Optional[Dict[str, str]] = None,
                   dnssec_enabled: bool = False,
                   trust_anchors: Optional[Union[Dict[str, str], str]] = None,
@@ -362,10 +364,11 @@ class DNSResolver:
 
         self.dns_logging_enabled: bool = dns_logging_enabled
         if dns_logging_enabled:
+            dns_log_dir = dns_log_dir or DEFAULT_LOG_DIR
             try:
                 from logging.handlers import TimedRotatingFileHandler
                 os.makedirs(dns_log_dir, exist_ok=True)
-                fh = TimedRotatingFileHandler(f"{dns_log_dir}/dns-requests.log", when="midnight", backupCount=7)
+                fh = TimedRotatingFileHandler(os.path.join(dns_log_dir, 'dns-requests.log'), when='midnight', backupCount=7)
                 fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
                 flog = logging.getLogger("dosev.DNSRequests")
                 flog.setLevel(logging.INFO)

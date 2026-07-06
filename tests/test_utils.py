@@ -12,6 +12,9 @@ async def test_fetch_blocklists_creates_files(tmp_path, monkeypatch):
         async def iter_chunks(self):
             yield (b'example.com', False)
 
+        async def iter_chunked(self, n):
+            yield b'example.com'
+
     class FakeResponse:
         def __init__(self, text, status=200):
             self._text = text

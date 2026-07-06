@@ -29,9 +29,14 @@ async def fetch_blocklists(urls: List[str], destination_dir: str = "blocklists")
                         filename = 'blocklist.txt'
                     filepath = os.path.join(destination_dir, filename)
                     with open(filepath, 'w', encoding='utf-8') as f:
-                        async for chunk, _ in resp.content.iter_chunks():
-                            if chunk:
-                                f.write(chunk.decode('utf-8', errors='ignore'))
+                        if hasattr(resp.content, 'iter_chunked'):
+                            async for chunk in resp.content.iter_chunked(8192):
+                                if chunk:
+                                    f.write(chunk.decode('utf-8', errors='ignore'))
+                        else:
+                            async for chunk, _ in resp.content.iter_chunks():
+                                if chunk:
+                                    f.write(chunk.decode('utf-8', errors='ignore'))
                     logging.debug("Saved blocklist %s -> %s", url, filepath)
             except asyncio.TimeoutError:
                 logging.warning("Timeout fetching %s", url)

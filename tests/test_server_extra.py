@@ -132,7 +132,7 @@ def test_run_server_sync_uses_asyncio_run():
 
 
 def test_drop_dns_privileges_does_nothing_when_not_root(monkeypatch):
-    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(os, "geteuid", lambda: 1000, raising=False)
     called = {}
 
     def fake_setgid(gid):
@@ -144,9 +144,9 @@ def test_drop_dns_privileges_does_nothing_when_not_root(monkeypatch):
     def fake_chroot(path):
         called['chroot'] = path
 
-    monkeypatch.setattr(os, "setgid", fake_setgid)
-    monkeypatch.setattr(os, "setuid", fake_setuid)
-    monkeypatch.setattr(os, "chroot", fake_chroot)
+    monkeypatch.setattr(os, "setgid", fake_setgid, raising=False)
+    monkeypatch.setattr(os, "setuid", fake_setuid, raising=False)
+    monkeypatch.setattr(os, "chroot", fake_chroot, raising=False)
 
     from dosev.server import _drop_dns_privileges
     _drop_dns_privileges("nobody", "nogroup", "/var/empty")
@@ -155,10 +155,23 @@ def test_drop_dns_privileges_does_nothing_when_not_root(monkeypatch):
 
 
 def test_drop_dns_privileges_drops_privs_when_root(monkeypatch):
-    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
 
-    import pwd
-    import grp
+    import importlib.util
+    import types
+    import sys
+
+    if importlib.util.find_spec("pwd") is None:
+        pwd = types.SimpleNamespace()
+        sys.modules["pwd"] = pwd
+    else:
+        import pwd
+
+    if importlib.util.find_spec("grp") is None:
+        grp = types.SimpleNamespace()
+        sys.modules["grp"] = grp
+    else:
+        import grp
 
     class FakePw:
         pw_gid = 999
@@ -167,8 +180,8 @@ def test_drop_dns_privileges_drops_privs_when_root(monkeypatch):
     class FakeGrp:
         gr_gid = 999
 
-    monkeypatch.setattr(pwd, "getpwnam", lambda name: FakePw())
-    monkeypatch.setattr(grp, "getgrnam", lambda name: FakeGrp())
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: FakePw(), raising=False)
+    monkeypatch.setattr(grp, "getgrnam", lambda name: FakeGrp(), raising=False)
 
     called = {}
 
@@ -184,10 +197,10 @@ def test_drop_dns_privileges_drops_privs_when_root(monkeypatch):
     def fake_chroot(path):
         called['chroot'] = path
 
-    monkeypatch.setattr(os, "setgid", fake_setgid)
-    monkeypatch.setattr(os, "setuid", fake_setuid)
-    monkeypatch.setattr(os, "setgroups", fake_setgroups)
-    monkeypatch.setattr(os, "chroot", fake_chroot)
+    monkeypatch.setattr(os, "setgid", fake_setgid, raising=False)
+    monkeypatch.setattr(os, "setuid", fake_setuid, raising=False)
+    monkeypatch.setattr(os, "setgroups", fake_setgroups, raising=False)
+    monkeypatch.setattr(os, "chroot", fake_chroot, raising=False)
 
     from dosev.server import _drop_dns_privileges
     _drop_dns_privileges("nobody", "nogroup", "/var/empty")

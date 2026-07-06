@@ -2,6 +2,13 @@ import os
 import configparser
 from typing import Dict, Any, List, Optional
 
+
+def _default_log_dir() -> str:
+    if os.name == 'nt':
+        return os.path.join(os.getenv('LOCALAPPDATA') or os.path.expanduser('~'), 'dosev', 'logs')
+    return '/var/log/dosev'
+
+
 def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     config = configparser.ConfigParser()
     if not os.path.exists(path):
@@ -17,7 +24,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
             'dns_cache_max_size': 1024,
             'dns_logging_enabled': False,
             'dns_log_retention_days': 7,
-            'dns_log_dir': '/var/log/dosev',
+            'dns_log_dir': _default_log_dir(),
             'dns_log_prefix': 'dns-log',
             'dns_pinned_certs': {},
             'dnssec_enabled': False,
@@ -112,7 +119,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     dns_chroot_dir = config.get('security', 'dns_chroot_dir', fallback='')
 
     dns_logging_enabled = config.getboolean('logging', 'enabled', fallback=False)
-    dns_log_dir = config.get('logging', 'log_dir', fallback='/var/log/dosev')
+    dns_log_dir = config.get('logging', 'log_dir', fallback=_default_log_dir())
     dns_log_retention_days = config.getint('logging', 'retention_days', fallback=7)
     dns_log_prefix = config.get('logging', 'log_prefix', fallback='dns-log')
 

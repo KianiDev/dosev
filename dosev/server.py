@@ -7,6 +7,9 @@ import signal
 import sys
 from typing import Dict, Set, Tuple, Optional, Any, List
 
+
+_DEFAULT_LOG_DIR = os.path.join(os.getenv('LOCALAPPDATA') or os.path.expanduser('~'), 'dosev', 'logs') if os.name == 'nt' else '/var/log/dosev'
+
 from .resolver import DNSResolver, RateLimiter
 from .utils import fetch_blocklists
 
@@ -293,7 +296,7 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
                      dns_cache_max_size: int = 1024,
                      dns_logging_enabled: bool = False,
                      dns_log_retention_days: int = 7,
-                     dns_log_dir: str = '/var/log/dosev',
+                     dns_log_dir: str = _DEFAULT_LOG_DIR,
                      dns_log_prefix: str = 'dns-log',
                      dns_pinned_certs: Optional[Dict[str, str]] = None,
                      dnssec_enabled: bool = False,
@@ -468,7 +471,7 @@ def run_server_sync(listen_ip: str, listen_port: int, upstream_dns: str, protoco
                     dns_cache_max_size: int = 1024,
                     dns_logging_enabled: bool = False,
                     dns_log_retention_days: int = 7,
-                    dns_log_dir: str = '/var/log/dosev',
+                    dns_log_dir: str = _DEFAULT_LOG_DIR,
                     dns_log_prefix: str = 'dns-log',
                     dns_pinned_certs: Optional[Dict[str, str]] = None,
                     dnssec_enabled: bool = False,

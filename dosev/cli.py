@@ -1,6 +1,7 @@
+import os
 import sys
 import argparse
-from .config import load_config
+from .config import load_config, _default_log_dir
 from .server import run_server_sync
 
 def main() -> None:
@@ -27,7 +28,7 @@ def main() -> None:
         dns_cache_max_size=config.get("dns_cache_max_size", 1024),
         dns_logging_enabled=config.get("dns_logging_enabled", False),
         dns_log_retention_days=config.get("dns_log_retention_days", 7),
-        dns_log_dir=config.get("dns_log_dir", "/var/log/dosev"),
+        dns_log_dir=config.get("dns_log_dir", _default_log_dir()),
         dns_log_prefix=config.get("dns_log_prefix", "dns-log"),
         dns_pinned_certs=config.get("dns_pinned_certs", {}),
         dnssec_enabled=config.get("dnssec_enabled", False),
