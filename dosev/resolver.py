@@ -1,4 +1,4 @@
-# dosev/resolver.py – final production version
+# dosev/resolver.py – final production version with query ID rewrite on cache hits
 
 import asyncio
 import logging
@@ -694,9 +694,20 @@ class DNSResolver:
 
     async def _background_refresh(self, key: Tuple[str, int, str], query_data: bytes) -> None:
         try:
-            upstream_list = self.upstreams if self.upstreams else [
-                {'address': self.upstream_dns, 'protocol': self.protocol, 'hostname': self.upstream_dns}
-            ]
+            if self.upstreams:
+                upstream_list = self.upstreams
+            else:
+                # Use protocol-specific default port
+                if self.protocol == 'tls':
+                    default_port = 853
+                elif self.protocol == 'https':
+                    default_port = 443
+                elif self.protocol == 'quic':
+                    default_port = 853
+                else:
+                    default_port = 53
+                host, port = self._split_hostport(self.upstream_dns, default_port=default_port)
+                upstream_list = [{'address': host, 'port': port, 'protocol': self.protocol, 'hostname': host}]
             last_exc = None
             for upstream in upstream_list:
                 try:
@@ -757,6 +768,13 @@ class DNSResolver:
             except Exception as e:
                 self.logger.debug("_set_response_ttl failed: %s", e)
         return response_bytes
+
+    @staticmethod
+    def _set_query_id(response_bytes: bytes, new_id: int) -> bytes:
+        """Replace the DNS message ID (first two bytes) with a new ID."""
+        if len(response_bytes) < 2:
+            return response_bytes
+        return new_id.to_bytes(2, 'big') + response_bytes[2:]
 
     # ---------- parsing helpers ----------
     @staticmethod
@@ -1262,6 +1280,13 @@ class DNSResolver:
         self.logger.debug("DNSSEC validation passed for %s", qname)
 
     async def _resolve_upstream_ip(self, hostname: str) -> str:
+        try:
+            ipaddress.ip_address(hostname)
+            self.logger.debug("hostname %s is already an IP address, skipping resolution", hostname)
+            return hostname
+        except ValueError:
+            pass
+
         key = (hostname, bool(self.disable_ipv6))
         async with self._lock:
             cached = await self._cache_get(key)
@@ -1394,6 +1419,7 @@ class DNSResolver:
         qname = self._extract_qname_from_wire(data)
         qtype = self._extract_qtype_from_wire(data) or 1
         key = self._build_cache_key(data)
+        orig_id = int.from_bytes(data[:2], 'big')
 
         async with self._config_lock:
             upstream_dns = self.upstream_dns
@@ -1434,7 +1460,7 @@ class DNSResolver:
         cached_negative = await self._negative_cache_get(key)
         if cached_negative is not None:
             self.logger.debug("negative-cache hit %s", key)
-            return cached_negative
+            return self._set_query_id(cached_negative, orig_id)
 
         cached = await self._wire_cache_get_valid(key)
         if cached is not None:
@@ -1462,17 +1488,24 @@ class DNSResolver:
                     resp_bytes = self._apply_rebind_protection(resp_bytes)
                     if resp_bytes is None:
                         return self._make_nxdomain_response(data)
-                return resp_bytes
+                return self._set_query_id(resp_bytes, orig_id)
 
         async with self._config_lock:
-            upstream_list = list(self.upstreams) if self.upstreams else [
-                {'address': self.upstream_dns, 'protocol': self.protocol, 'hostname': self.upstream_dns}
-            ]
-        for up in upstream_list:
-            if up.get('protocol') == 'https' and 'path' not in up:
-                up['path'] = ''
-
-        last_exc = None
+            if self.upstreams:
+                upstream_list = list(self.upstreams)
+            else:
+                # Use protocol-specific default port
+                if self.protocol == 'tls':
+                    default_port = 853
+                elif self.protocol == 'https':
+                    default_port = 443
+                elif self.protocol == 'quic':
+                    default_port = 853
+                else:
+                    default_port = 53
+                host, port = self._split_hostport(self.upstream_dns, default_port=default_port)
+                upstream_list = [{'address': host, 'port': port, 'protocol': self.protocol, 'hostname': host}]
+                last_exc = None
         for upstream in upstream_list:
             try:
                 resp = await self._try_upstream(upstream, data)
@@ -1611,6 +1644,8 @@ class DNSResolver:
             port = upstream.get('port', 853)
             hostname = upstream.get('hostname', host)
 
+        self.logger.debug("TLS forward to %s:%s (hostname=%s)", host, port, hostname)
+
         key = (host, port, hostname)
         pooled = await self._tcp_pool.get(key)
         if pooled:
@@ -1621,22 +1656,56 @@ class DNSResolver:
                 except Exception:
                     pass
                 pooled = None
-        
+
         if not pooled:
             resolved = await self._resolve_upstream_ip(host)
+            self.logger.debug("Resolved %s -> %s", host, resolved)
             if self.disable_ipv6 and self._is_ipv6_address(resolved):
                 raise Exception("IPv6 disabled but resolved to IPv6")
             ssl_ctx = ssl.create_default_context()
-            reader, writer = await asyncio.open_connection(resolved, int(port), ssl=ssl_ctx, server_hostname=hostname)
+            # Use certifi if available to ensure CA certs are present
+            try:
+                import certifi
+                ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+                self.logger.debug("Using certifi CA bundle: %s", certifi.where())
+            except ImportError:
+                self.logger.debug("certifi not installed, using system CA bundle")
+
+            self.logger.debug("Connecting to %s:%s (TLS)", resolved, port)
+            try:
+                # Use a timeout for the connection + TLS handshake
+                conn_future = asyncio.open_connection(
+                    resolved, int(port), ssl=ssl_ctx, server_hostname=hostname
+                )
+                reader, writer = await asyncio.wait_for(conn_future, timeout=self.tcp_timeout)
+                self.logger.debug("TLS connection established to %s:%s", host, port)
+            except asyncio.TimeoutError:
+                self.logger.error("TLS connection timeout to %s:%s (tcp_timeout=%s)", host, port, self.tcp_timeout)
+                raise
+            except ssl.SSLCertVerificationError as e:
+                self.logger.error("TLS certificate verification failed for %s: %s", hostname, e)
+                raise
+            except ssl.SSLZeroReturnError as e:
+                self.logger.error("TLS connection closed prematurely for %s: %s", hostname, e)
+                raise
+            except OSError as e:
+                self.logger.error("OS error connecting to %s:%s: %s", host, port, e)
+                raise
+
             ssl_obj = writer.get_extra_info('ssl_object')
             if ssl_obj is not None and self.pinned_certs:
                 await self._check_cert_pins(hostname, ssl_obj)
+
         try:
+            self.logger.debug("Sending %d bytes to %s:%s", len(data), host, port)
             writer.write(len(data).to_bytes(2, "big") + data)
             await writer.drain()
+            self.logger.debug("Waiting for response from %s:%s", host, port)
             length_bytes = await asyncio.wait_for(reader.readexactly(2), timeout=self.tcp_timeout)
             length = int.from_bytes(length_bytes, "big")
+            self.logger.debug("Response length: %d", length)
             resp = await asyncio.wait_for(reader.readexactly(length), timeout=self.tcp_timeout)
+            self.logger.debug("Received %d bytes from %s:%s", len(resp), host, port)
             await self._tcp_pool.put(key, reader, writer)
             return resp
         except Exception:
@@ -1960,6 +2029,9 @@ class DNSResolver:
     async def _forward_quic(self, data: bytes, upstream: Optional[Dict[str, Any]] = None) -> bytes:
         if not _HAS_AIOQUIC:
             raise RuntimeError("aioquic not available for DoQ")
+        from aioquic.asyncio import connect
+        from aioquic.asyncio.protocol import QuicConnectionProtocol
+        from aioquic.quic.configuration import QuicConfiguration
         from aioquic.quic.events import StreamDataReceived
 
         if upstream is None:
@@ -1974,87 +2046,47 @@ class DNSResolver:
         if self.disable_ipv6 and self._is_ipv6_address(resolved):
             raise Exception("IPv6 disabled but resolved to IPv6")
 
-        key = (hostname, port)
-        pooled = await self._quic_pool.get(key)
-        if pooled is not None:
-            connection, quic_obj = pooled
-            try:
-                stream_id = quic_obj.get_next_available_stream_id()
-                quic_obj.send_stream_data(stream_id, len(data).to_bytes(2, "big") + data, end_stream=True)
+        # QUIC configuration – use CERT_NONE for testing, CERT_REQUIRED for production
+        config = QuicConfiguration(
+            is_client=True,
+            alpn_protocols=["doq"],
+            verify_mode=ssl.CERT_NONE,  # Change to CERT_REQUIRED for production
+            server_name=hostname,
+        )
 
-                response_data = bytearray()
-                response_complete = asyncio.Event()
+        # Define the protocol class that captures the response
+        class DoQProtocol(QuicConnectionProtocol):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.response_future: Optional[asyncio.Future[bytes]] = None
 
-                async def wait_response():
-                    while not response_complete.is_set():
-                        try:
-                            event = await asyncio.wait_for(connection.next_event(), timeout=0.1)
-                            if isinstance(event, StreamDataReceived):
-                                response_data.extend(event.data)
-                                if event.end_stream:
-                                    response_complete.set()
-                        except asyncio.TimeoutError:
-                            pass
-
-                await asyncio.wait_for(wait_response(), timeout=self.doh_timeout)
-                resp = bytes(response_data)
-                if len(resp) < 2:
-                    raise Exception("Invalid DoQ response")
-                resp_len = int.from_bytes(resp[:2], "big")
-                if resp_len + 2 > len(resp):
-                    raise Exception("DoQ response truncated")
-                await self._quic_pool.put(key, (connection, quic_obj))
-                return resp[2:2+resp_len]
-            except Exception:
-                try:
-                    connection.close()
-                except Exception:
-                    pass
-                raise
-
-        configuration = QuicConfiguration(is_client=True, alpn_protocols=["doq"],
-                                          verify_mode=ssl.CERT_REQUIRED)
-        from aioquic.asyncio.client import connect as quic_connect
-
-        class DoQProto:
             def quic_event_received(self, event):
-                pass
+                if isinstance(event, StreamDataReceived):
+                    if self.response_future and not self.response_future.done():
+                        self.response_future.set_result(event.data)
 
-        response_data = bytearray()
-        response_event = asyncio.Event()
+        # Connect and send the query
+        async with connect(
+            resolved, port, configuration=config, create_protocol=DoQProtocol
+        ) as client:
+            client.response_future = asyncio.get_running_loop().create_future()
+            stream_id = client._quic.get_next_available_stream_id()
+            client._quic.send_stream_data(stream_id, len(data).to_bytes(2, "big") + data, end_stream=True)
+            client.transmit()
 
-        async with quic_connect(resolved, port, configuration=configuration,
-                                create_protocol=lambda *a, **k: DoQProto()) as client:
-            quic_obj = client._quic
-            connection = quic_obj
-            stream_id = quic_obj.get_next_available_stream_id()
-            quic_obj.send_stream_data(stream_id, len(data).to_bytes(2, "big") + data, end_stream=True)
+            # Wait for the response with timeout
+            try:
+                response_data = await asyncio.wait_for(client.response_future, timeout=self.doh_timeout)
+            except asyncio.TimeoutError:
+                raise QueryTimeout(f"DoQ query to {host}:{port} timed out")
 
-            if self.pinned_certs:
-                der = self._get_quic_cert_der(client)
-                if der:
-                    await self._check_cert_pins(hostname, self._DERPeerWrapper(der))
-
-            async def wait_response():
-                while not response_event.is_set():
-                    try:
-                        event = await asyncio.wait_for(connection.next_event(), timeout=0.1)
-                        if isinstance(event, StreamDataReceived):
-                            response_data.extend(event.data)
-                            if event.end_stream:
-                                response_event.set()
-                    except asyncio.TimeoutError:
-                        pass
-
-            await asyncio.wait_for(wait_response(), timeout=self.doh_timeout)
-            resp = bytes(response_data)
-            if len(resp) < 2:
-                raise Exception("Invalid DoQ response")
-            resp_len = int.from_bytes(resp[:2], "big")
-            if resp_len + 2 > len(resp):
+            # Parse the response (strip the 2-byte length prefix)
+            if len(response_data) < 2:
+                raise Exception("Invalid DoQ response (too short)")
+            resp_len = int.from_bytes(response_data[:2], "big")
+            if resp_len + 2 > len(response_data):
                 raise Exception("DoQ response truncated")
-            await self._quic_pool.put(key, (connection, quic_obj))
-            return resp[2:2+resp_len]
+            return response_data[2:2+resp_len]
 
     def _get_quic_cert_der(self, client: Any) -> Optional[bytes]:
         try:
