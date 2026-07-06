@@ -3,9 +3,7 @@ listen_ip = 0.0.0.0
 listen_port = 53
 
 [resolver]
-# You can specify a custom port with the syntax host:port
-# For example, to use port 5353 for UDP/TCP or 853 for TLS:
-upstream_dns = 1.1.1.1:5353
+upstream_dns = 1.1.1.1:53
 protocol = udp
 verbose = false
 disable_ipv6 = false
@@ -32,11 +30,24 @@ doh_version = auto
 doh_auto_cache_ttl = 3600
 
 [security]
+# Enable DNSSEC validation (uses bundled root key by default)
 dnssec_enabled = false
+
+# Automatically fetch and update root trust anchor from IANA (RFC 5011 style)
+auto_update_trust_anchor = true
+
+# Optional: path to a file with custom trust anchors (DNSKEY/DS records)
+# If not set, the built-in root key is used.
 trust_anchors_file =
+
+# Certificate pinning (format: hostname=sha256_fingerprint, ...)
 pinned_certs =
+
+# Rebinding protection
 rebind_protection = false
 rebind_action = strip
+
+# Privilege dropping (Linux/Unix only)
 dns_privilege_drop_user =
 dns_privilege_drop_group =
 dns_chroot_dir =

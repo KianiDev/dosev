@@ -12,6 +12,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
             'protocol': 'udp',
             'verbose': False,
             'disable_ipv6': False,
+            'strip_ipv6_records': None,  # None = use disable_ipv6 value
             'dns_cache_ttl': 300,
             'dns_cache_max_size': 1024,
             'dns_logging_enabled': False,
@@ -20,6 +21,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
             'dns_log_prefix': 'dns-log',
             'dns_pinned_certs': {},
             'dnssec_enabled': False,
+            'auto_update_trust_anchor': True,
             'trust_anchors_file': '',
             'metrics_enabled': False,
             'metrics_port': 8000,
@@ -63,6 +65,11 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     protocol = config.get('resolver', 'protocol', fallback='udp').lower()
     verbose = config.getboolean('resolver', 'verbose', fallback=False)
     disable_ipv6 = config.getboolean('resolver', 'disable_ipv6', fallback=False)
+    strip_ipv6_records_raw = config.get('resolver', 'strip_ipv6_records', fallback=None)
+    if strip_ipv6_records_raw is None:
+        strip_ipv6_records = None
+    else:
+        strip_ipv6_records = config.getboolean('resolver', 'strip_ipv6_records', fallback=None)
 
     dns_cache_ttl = config.getint('cache', 'ttl', fallback=300)
     dns_cache_max_size = config.getint('cache', 'max_size', fallback=1024)
@@ -85,17 +92,21 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     doh_auto_cache_ttl = config.getint('advanced', 'doh_auto_cache_ttl', fallback=3600)
 
     dnssec_enabled = config.getboolean('security', 'dnssec_enabled', fallback=False)
+    auto_update_trust_anchor = config.getboolean('security', 'auto_update_trust_anchor', fallback=True)
     trust_anchors_file = config.get('security', 'trust_anchors_file', fallback='')
+
     pinned_raw = config.get('security', 'pinned_certs', fallback='')
     dns_pinned_certs = {}
     for item in [s.strip() for s in pinned_raw.split(',') if s.strip()]:
         if '=' in item:
             host, fp = item.split('=', 1)
             dns_pinned_certs[host.strip()] = fp.strip()
+
     dns_rebind_protection = config.getboolean('security', 'rebind_protection', fallback=False)
     dns_rebind_action = config.get('security', 'rebind_action', fallback='strip').lower()
     if dns_rebind_action not in ('strip', 'block'):
         dns_rebind_action = 'strip'
+
     dns_privilege_drop_user = config.get('security', 'dns_privilege_drop_user', fallback='')
     dns_privilege_drop_group = config.get('security', 'dns_privilege_drop_group', fallback='')
     dns_chroot_dir = config.get('security', 'dns_chroot_dir', fallback='')
@@ -172,6 +183,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
         'protocol': protocol,
         'verbose': verbose,
         'disable_ipv6': disable_ipv6,
+        'strip_ipv6_records': strip_ipv6_records,
         'dns_cache_ttl': dns_cache_ttl,
         'dns_cache_max_size': dns_cache_max_size,
         'dns_logging_enabled': dns_logging_enabled,
@@ -180,6 +192,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
         'dns_log_prefix': dns_log_prefix,
         'dns_pinned_certs': dns_pinned_certs,
         'dnssec_enabled': dnssec_enabled,
+        'auto_update_trust_anchor': auto_update_trust_anchor,
         'trust_anchors_file': trust_anchors_file,
         'metrics_enabled': metrics_enabled,
         'metrics_port': metrics_port,

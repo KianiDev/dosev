@@ -31,6 +31,7 @@ def main() -> None:
         dns_log_prefix=config.get("dns_log_prefix", "dns-log"),
         dns_pinned_certs=config.get("dns_pinned_certs", {}),
         dnssec_enabled=config.get("dnssec_enabled", False),
+        auto_update_trust_anchor=config.get("auto_update_trust_anchor", True),  # NEW
         trust_anchors_file=config.get("trust_anchors_file", ""),
         metrics_enabled=config.get("metrics_enabled", False),
         metrics_port=config.get("metrics_port", 8000),

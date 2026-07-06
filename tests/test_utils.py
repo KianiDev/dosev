@@ -8,19 +8,21 @@ from dosev.utils import fetch_blocklists
 async def test_fetch_blocklists_creates_files(tmp_path, monkeypatch):
     called = {}
 
+    class FakeChunkStream:
+        async def iter_chunks(self):
+            yield (b'example.com', False)
+
     class FakeResponse:
         def __init__(self, text, status=200):
             self._text = text
             self.status = status
+            self.content = FakeChunkStream()
 
         async def __aenter__(self):
             return self
 
         async def __aexit__(self, exc_type, exc, tb):
             return False
-
-        async def text(self):
-            return self._text
 
     class FakeSession:
         async def __aenter__(self):

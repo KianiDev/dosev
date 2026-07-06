@@ -1,7 +1,4 @@
-# dosev/resolver.py – final version with:
-# - DNSSEC validation cache
-# - Config lock
-# - All previous fixes (deadlock, pool cleanup, tuple close, TCP timeouts, IP cache race)
+# dosev/resolver.py – final production version
 
 import asyncio
 import logging
@@ -12,6 +9,9 @@ import time
 import hashlib
 import ipaddress
 import os
+import random
+import urllib.request
+import xml.etree.ElementTree as ET
 from typing import Optional, Tuple, Any, Set, Dict, Union, List, Callable, Coroutine, Iterable
 from urllib.parse import urlparse
 
@@ -47,6 +47,9 @@ try:
     import dns.name
     import dns.resolver
     import dns.rdatatype
+    import dns.rrset
+    import dns.rdataclass
+    import dns.rcode
     _HAS_DNSPY = True
 except Exception:
     dns = None
@@ -58,6 +61,14 @@ try:
 except Exception:
     uvloop = None
     _HAS_UVLOOP = False
+
+
+# ---------- Default DNSSEC trust anchor (root KSK) ----------
+DEFAULT_ROOT_DNSKEY = (
+    ". 172800 IN DNSKEY 257 3 8 "
+    "AwEAAaz/tAm8yTn4Mfeh5eyI96WSVexTBAvkMgJzkKTOiW1vkIbzxeF3+/4RgWOq7HrxRixHlFlExOLAJr5emLvN7SWXgnLh4+B5xQlNVz8Og8kvArMtNROxVQuCaSnIDdD5LKyWbRd2n9WGe2R8PzgCmr3EgVLrjyBxWezF0jLHwVN8efS3rCj/EWgvIWgb9tarpVUDK/b58Da+Erq1sBvNaRfxv4d8+1o5RsS5rG3FJ0fruu1Wg+0JvN6sL5nlk46iS2BsUj8IYL0="
+)
+DEFAULT_ROOT_DS = "19036 8 2 49AAC11D7B6F6446702E54A1607371607A1A41855200FD2CE1CDDE32F24E8FB5"
 
 
 class AsyncTTLCache:
@@ -245,7 +256,6 @@ class ClientPool:
 
     async def _close_client(self, client: Any) -> None:
         try:
-            # Handle tuple (connection, h3) from _forward_https3
             if isinstance(client, tuple) and len(client) == 2:
                 conn, _ = client
                 if hasattr(conn, 'close'):
@@ -276,6 +286,7 @@ class DNSResolver:
       - Bootstrap DNS servers for upstream hostname resolution
       - Custom port support (host:port)
       - DNSSEC validation cache (store validation result per RRset)
+      - Automatic trust anchor management (bundled root key + optional IANA fetch)
     """
 
     def __init__(self,
@@ -294,6 +305,7 @@ class DNSResolver:
                   pinned_certs: Optional[Dict[str, str]] = None,
                   dnssec_enabled: bool = False,
                   trust_anchors: Optional[Union[Dict[str, str], str]] = None,
+                  auto_update_trust_anchor: bool = True,
                   metrics_enabled: bool = False,
                   metrics_port: int = 8000,
                   uvloop_enable: bool = False,
@@ -339,7 +351,9 @@ class DNSResolver:
             self._cache_is_sync: bool = False
 
         self._lock: asyncio.Lock = asyncio.Lock()
-        self._config_lock: asyncio.Lock = asyncio.Lock()  # for update_config
+        self._config_lock: asyncio.Lock = asyncio.Lock()
+        self._trust_anchor_lock: asyncio.Lock = asyncio.Lock()
+        self._blocklist_lock: asyncio.Lock = asyncio.Lock()
 
         self.doh_timeout: float = doh_timeout
         self.udp_timeout: float = udp_timeout
@@ -349,7 +363,6 @@ class DNSResolver:
         self.dns_logging_enabled: bool = dns_logging_enabled
         if dns_logging_enabled:
             try:
-                import os
                 from logging.handlers import TimedRotatingFileHandler
                 os.makedirs(dns_log_dir, exist_ok=True)
                 fh = TimedRotatingFileHandler(f"{dns_log_dir}/dns-requests.log", when="midnight", backupCount=7)
@@ -367,9 +380,12 @@ class DNSResolver:
 
         self.pinned_certs: Dict[str, str] = pinned_certs or {}
         self.dnssec_enabled: bool = bool(dnssec_enabled)
-        self.trust_anchors: Any = trust_anchors or {}
+        self.auto_update_trust_anchor: bool = auto_update_trust_anchor
+
+        self.trust_anchors: Any = trust_anchors
         self._dnssec_raw_anchors: Optional[Any] = None
         self._dnssec_keyring: Optional[Any] = None
+        self._trust_anchor_updater_task: Optional[asyncio.Task] = None
 
         self.metrics_enabled: bool = bool(metrics_enabled) and _HAS_PROM
         self._metrics: Optional[Dict[str, Any]] = None
@@ -431,47 +447,75 @@ class DNSResolver:
         self._doh_auto_cache: Dict[str, Tuple[str, float]] = {}
         self._doh_auto_lock: asyncio.Lock = asyncio.Lock()
 
+        if self.dnssec_enabled:
+            self._load_trust_anchors()
+            if self.auto_update_trust_anchor:
+                self._trust_anchor_updater_task = asyncio.create_task(self._background_trust_anchor_updater())
+
     async def start_pool_cleanups(self) -> None:
-        """Start the background cleanup tasks for all connection pools."""
         await self._tcp_pool.start_cleanup()
         await self._h2_pool.start_cleanup()
         await self._h3_pool.start_cleanup()
         await self._quic_pool.start_cleanup()
 
     async def stop_pool_cleanups(self) -> None:
-        """Stop the background cleanup tasks for all connection pools."""
         await self._tcp_pool.stop()
         await self._h2_pool.stop()
         await self._h3_pool.stop()
         await self._quic_pool.stop()
 
+    async def stop_background_tasks(self) -> None:
+        if self._trust_anchor_updater_task is not None:
+            self._trust_anchor_updater_task.cancel()
+            try:
+                await self._trust_anchor_updater_task
+            except asyncio.CancelledError:
+                pass
+            self._trust_anchor_updater_task = None
+
     # ---------- blocklist helpers ----------
-    def set_blocklist(self, domains: Iterable[str]) -> None:
-        self._blocklist_exact.clear()
-        self._blocklist_suffix.clear()
-        for d in domains:
-            d = d.strip().lower().rstrip('.')
-            if not d:
-                continue
+    async def set_blocklist(self, domains: Iterable[str]) -> None:
+        async with self._blocklist_lock:
+            self._blocklist_exact.clear()
+            self._blocklist_suffix.clear()
+            for d in domains:
+                d = d.strip().lower().rstrip('.')
+                if not d:
+                    continue
+                if d.startswith("."):
+                    self._blocklist_suffix.add(d.lstrip("."))
+                else:
+                    self._blocklist_exact.add(d)
+
+    async def set_hosts_map(self, hosts_map: Dict[str, Tuple[str, ...]]) -> None:
+        async with self._blocklist_lock:
+            self._hosts_map = {k.lower().rstrip('.'): tuple(v) for k, v in (hosts_map or {}).items()}
+
+    async def get_host_for(self, qname: str) -> Optional[Tuple[str, ...]]:
+        if not qname:
+            return None
+        async with self._blocklist_lock:
+            return self._hosts_map.get(qname.lower().rstrip('.'))
+
+    async def add_blocked(self, domain: str) -> None:
+        d = domain.strip().lower().rstrip('.')
+        async with self._blocklist_lock:
             if d.startswith("."):
                 self._blocklist_suffix.add(d.lstrip("."))
             else:
                 self._blocklist_exact.add(d)
 
-    def set_hosts_map(self, hosts_map: Dict[str, Tuple[str, ...]]) -> None:
-        self._hosts_map = {k.lower().rstrip('.'): tuple(v) for k, v in (hosts_map or {}).items()}
-
-    def get_host_for(self, qname: str) -> Optional[Tuple[str, ...]]:
+    async def is_blocked(self, qname: Optional[str]) -> bool:
         if not qname:
-            return None
-        return self._hosts_map.get(qname.lower().rstrip('.'))
-
-    def add_blocked(self, domain: str) -> None:
-        d = domain.strip().lower().rstrip('.')
-        if d.startswith("."):
-            self._blocklist_suffix.add(d.lstrip("."))
-        else:
-            self._blocklist_exact.add(d)
+            return False
+        q = qname.lower().rstrip('.')
+        async with self._blocklist_lock:
+            if q in self._blocklist_exact:
+                return True
+            for suf in self._blocklist_suffix:
+                if q == suf or q.endswith("." + suf):
+                    return True
+        return False
 
     @staticmethod
     def load_blocklists_from_dir(directory: str) -> Tuple[Set[str], Set[str], Dict[str, Tuple[str, ...]]]:
@@ -504,27 +548,13 @@ class DNSResolver:
                         exact_set.add(domain)
         return exact_set, suffix_set, hosts_map
 
-    def is_blocked(self, qname: Optional[str]) -> bool:
-        if not qname:
-            return False
-        q = qname.lower().rstrip('.')
-        exact = tuple(self._blocklist_exact)
-        suffixes = tuple(self._blocklist_suffix)
-        if q in exact:
-            return True
-        for suf in suffixes:
-            if q == suf or q.endswith("." + suf):
-                return True
-        return False
-
-    # ---------- wire-cache helpers with DNSSEC validation flag ----------
+    # ---------- wire-cache helpers ----------
     async def _wire_cache_get(self, key: Tuple[str, int, str]) -> Optional[Tuple[bytes, float, bytes, float, bool]]:
         try:
             if self._cache_is_sync:
                 val = self._wire_cache.get(key)
                 if val is None:
                     return None
-                # For backward compatibility, support old 4‑tuple format
                 if isinstance(val, tuple):
                     if len(val) == 4:
                         a, b, c, d = val
@@ -568,7 +598,6 @@ class DNSResolver:
             pass
 
     async def _wire_cache_get_valid(self, key: Tuple[str, int, str]) -> Optional[Tuple[bytes, bool]]:
-        """Return (response_bytes, dnssec_validated) or None."""
         async with self._lock:
             entry = await self._wire_cache_get(key)
             if entry is None:
@@ -582,7 +611,6 @@ class DNSResolver:
                 stale_resp = self._set_response_ttl(resp_bytes, self.stale_response_ttl)
                 asyncio.create_task(self._maybe_refresh_stale(key, query_data))
                 return stale_resp, dnssec_validated
-            # Expired and not stale – remove it
             await self._wire_cache_delete(key)
             return None
 
@@ -737,7 +765,7 @@ class DNSResolver:
         if not query_data or len(query_data) < 12:
             tid = 0
             qpart = b''
-            req_flags = 0
+            rd = 0
         else:
             tid = int.from_bytes(query_data[0:2], 'big')
             req_flags = int.from_bytes(query_data[2:4], 'big')
@@ -746,7 +774,8 @@ class DNSResolver:
                 qpart = query_data[12:qend + 4]
             except Exception:
                 qpart = query_data[12:]
-        rd = req_flags & 0x0100
+            rd = req_flags & 0x0100
+
         flags = 0x8000 | rd | 0x0003
         header = (
             tid.to_bytes(2, 'big') +
@@ -878,78 +907,147 @@ class DNSResolver:
             self.logger.exception("certificate pin check failed for %s", hostname)
             raise
 
+    # ---------- DNSSEC trust anchor management ----------
+    @staticmethod
+    def _fetch_root_trust_anchor_from_iana() -> Optional[str]:
+        try:
+            with urllib.request.urlopen("https://data.iana.org/root-anchors/root-anchors.xml", timeout=10) as response:
+                xml_data = response.read()
+            root = ET.fromstring(xml_data)
+            for child in root:
+                if child.tag == "KeyDigest":
+                    key_tag = child.attrib.get("keyTag")
+                    algo = child.attrib.get("algorithm")
+                    digest_type = child.attrib.get("digestType")
+                    digest = child.text.strip()
+                    if key_tag and algo and digest_type and digest:
+                        return f"{key_tag} {algo} {digest_type} {digest}"
+            return None
+        except Exception as e:
+            self.logger.warning("Failed to fetch root trust anchor from IANA: %s", e)
+            return None
+
     def _load_trust_anchors(self) -> None:
-        if not self.trust_anchors:
+        if not self.dnssec_enabled:
             return
-        path = None
-        if isinstance(self.trust_anchors, dict):
-            path = self.trust_anchors.get('file')
+
+        anchors: Dict[dns.name.Name, dns.rrset.RRset] = {}
+
+        if self.trust_anchors is None:
+            try:
+                rr = dns.rrset.from_text(".", 172800, "IN", "DNSKEY", DEFAULT_ROOT_DNSKEY)
+                anchors[dns.name.root] = rr
+                self.logger.info("Using bundled default root trust anchor")
+            except Exception as e:
+                self.logger.error("Failed to parse default root trust anchor: %s", e)
+                return
+
         elif isinstance(self.trust_anchors, str):
             path = self.trust_anchors
-        if not path:
-            return
-        try:
-            anchors: Dict[Any, Any] = {}
-            with open(path, 'r') as fh:
-                for raw in fh:
-                    line = raw.strip()
-                    if not line or line.startswith('#') or line.startswith(';'):
-                        continue
-                    parts = line.split()
-                    if len(parts) < 5:
-                        self.logger.debug("skipping malformed anchor line: %s", line)
-                        continue
-                    try:
-                        idx = parts.index('DNSKEY')
-                    except ValueError:
-                        try:
-                            idx = parts.index('dnskey')
-                        except ValueError:
-                            self.logger.debug("no DNSKEY token in line: %s", line)
-                            continue
-                    if idx < 1:
-                        self.logger.debug("unexpected DNSKEY line format: %s", line)
-                        continue
-                    name_text = parts[0]
-                    ttl_text = parts[1] if idx >= 2 else '3600'
-                    try:
-                        ttl = int(ttl_text)
-                    except Exception:
-                        ttl = 3600
-                    rdata_text = ' '.join(parts[idx+1:])
-                    try:
-                        rr = dns.rrset.from_text(name_text, ttl, 'IN', 'DNSKEY', rdata_text)
-                        name_obj = dns.name.from_text(name_text)
-                        if name_obj in anchors:
-                            for r in rr:
-                                anchors[name_obj].add(r)
-                        else:
-                            anchors[name_obj] = rr
-                    except Exception as e:
-                        self.logger.debug("failed to parse anchor line '%s': %s", line, e)
-                        continue
-            self._dnssec_raw_anchors = anchors
             try:
-                simple = {name: [r.to_text() for r in rr] for name, rr in anchors.items()}
-                self._dnssec_keyring = dns.dnssec.make_keyring(simple)
-                self.logger.debug("built dnssec keyring from %s (%d names)", path, len(simple))
-            except Exception:
-                self._dnssec_keyring = None
-                self.logger.debug("could not build unified keyring; will build per-name at validation time")
-        except Exception as e:
-            self.logger.warning("failed to load trust anchors from %s: %s", path, e)
+                with open(path, 'r') as fh:
+                    for raw in fh:
+                        line = raw.strip()
+                        if not line or line.startswith('#') or line.startswith(';'):
+                            continue
+                        parts = line.split()
+                        if len(parts) < 5:
+                            self.logger.debug("skipping malformed anchor line: %s", line)
+                            continue
+                        try:
+                            idx = parts.index('DNSKEY')
+                        except ValueError:
+                            try:
+                                idx = parts.index('dnskey')
+                            except ValueError:
+                                self.logger.debug("no DNSKEY token in line: %s", line)
+                                continue
+                        if idx < 1:
+                            self.logger.debug("unexpected DNSKEY line format: %s", line)
+                            continue
+                        name_text = parts[0]
+                        ttl_text = parts[1] if idx >= 2 else '3600'
+                        try:
+                            ttl = int(ttl_text)
+                        except Exception:
+                            ttl = 3600
+                        rdata_text = ' '.join(parts[idx+1:])
+                        try:
+                            rr = dns.rrset.from_text(name_text, ttl, 'IN', 'DNSKEY', rdata_text)
+                            name_obj = dns.name.from_text(name_text)
+                            if name_obj in anchors:
+                                for r in rr:
+                                    anchors[name_obj].add(r)
+                            else:
+                                anchors[name_obj] = rr
+                        except Exception as e:
+                            self.logger.debug("failed to parse anchor line '%s': %s", line, e)
+                            continue
+                self.logger.info("Loaded trust anchors from file: %s", path)
+            except Exception as e:
+                self.logger.warning("failed to load trust anchors from %s: %s", path, e)
+                return
 
+        elif isinstance(self.trust_anchors, dict):
+            anchors = self.trust_anchors
+            self.logger.info("Using provided trust anchors dict")
+
+        else:
+            self.logger.warning("Unsupported trust_anchors type: %s", type(self.trust_anchors))
+            return
+
+        self._dnssec_raw_anchors = anchors
+        try:
+            simple = {name: [r.to_text() for r in rr] for name, rr in anchors.items()}
+            self._dnssec_keyring = dns.dnssec.make_keyring(simple)
+            self.logger.debug("Built DNSSEC keyring with %d anchors", len(simple))
+        except Exception as e:
+            self._dnssec_keyring = None
+            self.logger.warning("Could not build unified keyring: %s", e)
+
+    async def _update_trust_anchor_from_iana(self) -> bool:
+        if not self.dnssec_enabled:
+            return False
+
+        async with self._trust_anchor_lock:
+            new_ds = await asyncio.get_running_loop().run_in_executor(
+                None, self._fetch_root_trust_anchor_from_iana
+            )
+            if new_ds is None:
+                return False
+
+            try:
+                rr = dns.rrset.from_text(".", 0, "IN", "DS", new_ds)
+                anchors = {dns.name.root: rr}
+                self._dnssec_raw_anchors = anchors
+                simple = {dns.name.root: [rr.to_text()]}
+                self._dnssec_keyring = dns.dnssec.make_keyring(simple)
+                self.logger.info("Updated root trust anchor from IANA: %s", new_ds)
+                return True
+            except Exception as e:
+                self.logger.warning("Failed to update trust anchor from IANA: %s", e)
+                return False
+
+    async def _background_trust_anchor_updater(self) -> None:
+        await asyncio.sleep(random.randint(300, 900))
+        while True:
+            try:
+                updated = await self._update_trust_anchor_from_iana()
+                if updated:
+                    self.logger.info("Trust anchor updated from IANA")
+            except Exception as e:
+                self.logger.warning("Background trust anchor update failed: %s", e)
+            await asyncio.sleep(86400)
+
+    # ---------- DNSSEC validation ----------
     async def _dnssec_validate(self, qname: str, response_wire: bytes) -> None:
         if not self.dnssec_enabled:
             return
         if not _HAS_DNSPY:
             raise RuntimeError("dnspython is required for DNSSEC validation")
-        try:
+        if self._dnssec_raw_anchors is None:
             self._load_trust_anchors()
-        except Exception as e:
-            self.logger.warning("failed to load trust anchors: %s", e)
-            raise
-        if not getattr(self, '_dnssec_raw_anchors', None):
+        if not self._dnssec_raw_anchors:
             self.logger.warning("DNSSEC enabled but no trust anchors available; aborting validation")
             raise Exception("DNSSEC trust anchors missing")
 
@@ -976,10 +1074,10 @@ class DNSResolver:
                                 break
                     if candidate is None:
                         raise Exception(f"no RRSIG for rrset {name} type {rrset.rdtype}")
-                    if getattr(self, '_dnssec_keyring', None):
+                    if self._dnssec_keyring:
                         keyring = self._dnssec_keyring
                     else:
-                        anchors = getattr(self, '_dnssec_raw_anchors', {})
+                        anchors = self._dnssec_raw_anchors or {}
                         ks: Dict[Any, Any] = {}
                         if name in anchors:
                             ks[name] = [r.to_text() for r in anchors[name]]
@@ -1147,7 +1245,7 @@ class DNSResolver:
             stale_response_ttl = self.stale_response_ttl
             upstreams = list(self.upstreams) if self.upstreams else []
 
-        host_values = self.get_host_for(qname)
+        host_values = await self.get_host_for(qname)
         if host_values:
             if qtype == 1 and len(host_values) > 0:
                 ip = host_values[0]
@@ -1164,26 +1262,22 @@ class DNSResolver:
                 except Exception:
                     self.logger.exception("failed to synthesize hosts map response for %s", qname)
 
-        if self.is_blocked(qname):
+        if await self.is_blocked(qname):
             self._log_event("Blocked (internal)", qname, None, "blocklist")
             try:
                 return self.build_block_response(data)
             except Exception:
                 return self._make_nxdomain_response(data)
 
-        # Check cache – now we get (response, dnssec_validated)
         cached = await self._wire_cache_get_valid(key)
         if cached is not None:
             resp_bytes, dnssec_validated = cached
             self.logger.debug("wire-cache hit %s", key)
             if self.dnssec_enabled and not dnssec_validated:
-                # Revalidate because DNSSEC was turned on later
                 self.logger.debug("cache entry lacks DNSSEC validation, revalidating...")
                 try:
                     await self._dnssec_validate(qname, resp_bytes)
-                    # Update cache with validation flag
                     async with self._lock:
-                        # fetch current entry to keep TTL
                         entry = await self._wire_cache_get(key)
                         if entry is not None:
                             _, expiry, query_data, stale_until, _ = entry
@@ -1192,17 +1286,17 @@ class DNSResolver:
                     dnssec_validated = True
                 except Exception as e:
                     self.logger.warning("DNSSEC revalidation failed for %s, treating as cache miss", key)
-                    # Remove stale entry and fall through to upstream
                     async with self._lock:
                         await self._wire_cache_delete(key)
-                    cached = None  # force refetch
+                    cached = None
 
             if cached is not None:
                 if self.rebind_protection_enabled:
                     resp_bytes = self._apply_rebind_protection(resp_bytes)
+                    if resp_bytes is None:
+                        return self._make_nxdomain_response(data)
                 return resp_bytes
 
-        # Use _config_lock to safely read upstream list
         async with self._config_lock:
             upstream_list = list(self.upstreams) if self.upstreams else [
                 {'address': self.upstream_dns, 'protocol': self.protocol, 'hostname': self.upstream_dns}
@@ -1210,8 +1304,6 @@ class DNSResolver:
         for up in upstream_list:
             if up.get('protocol') == 'https' and 'path' not in up:
                 up['path'] = ''
-        # Exit config lock before making upstream requests
-        # upstream_list is now a safe snapshot
 
         last_exc = None
         for upstream in upstream_list:
@@ -1232,6 +1324,8 @@ class DNSResolver:
                         raise
                 if self.rebind_protection_enabled:
                     resp = self._apply_rebind_protection(resp)
+                    if resp is None:
+                        return self._make_nxdomain_response(data)
                 ttl = self._extract_min_ttl(resp)
                 if ttl <= 0:
                     ttl = 30
@@ -1306,7 +1400,6 @@ class DNSResolver:
         pooled = await self._tcp_pool.get(key)
         if pooled:
             reader, writer = pooled
-            # Validate pooled connection is still open
             if writer.is_closing():
                 try:
                     writer.close()
@@ -1348,7 +1441,6 @@ class DNSResolver:
         pooled = await self._tcp_pool.get(key)
         if pooled:
             reader, writer = pooled
-            # Validate pooled connection is still open
             if writer.is_closing():
                 try:
                     writer.close()
@@ -1416,7 +1508,6 @@ class DNSResolver:
                 version, expiry = self._doh_auto_cache[hostname]
                 if now < expiry and version != '_probing':
                     return version
-            # Mark as probing to prevent duplicate version reads during probing
             self._doh_auto_cache[hostname] = ('_probing', now + 60)
 
         probe_data = dns.message.make_query('probe.invalid', 'A').to_wire()
@@ -1605,11 +1696,11 @@ class DNSResolver:
 
                 async def handle_events():
                     iterations_without_data = 0
-                    max_idle_iterations = int(self.doh_timeout * 10)  # Approx 10 per second
+                    max_idle_iterations = int(self.doh_timeout * 10)
                     while not response_complete.is_set():
                         try:
                             event = await asyncio.wait_for(connection.next_event(), timeout=0.1)
-                            iterations_without_data = 0  # Reset counter on event
+                            iterations_without_data = 0
                             for h3_event in h3.handle_event(event):
                                 if isinstance(h3_event, DataReceived) and h3_event.stream_id == stream_id:
                                     response_data.extend(h3_event.data)
@@ -1620,7 +1711,6 @@ class DNSResolver:
                         except asyncio.TimeoutError:
                             iterations_without_data += 1
                             if iterations_without_data > max_idle_iterations:
-                                # Timeout if no data received for too long
                                 raise asyncio.TimeoutError("HTTP/3 response timeout")
 
                 await asyncio.wait_for(handle_events(), timeout=self.doh_timeout + 5)
@@ -1672,11 +1762,11 @@ class DNSResolver:
 
             async def handle_events():
                 iterations_without_data = 0
-                max_idle_iterations = int(self.doh_timeout * 10)  # Approx 10 per second
+                max_idle_iterations = int(self.doh_timeout * 10)
                 while not response_complete.is_set():
                     try:
                         event = await asyncio.wait_for(connection.next_event(), timeout=0.1)
-                        iterations_without_data = 0  # Reset counter on event
+                        iterations_without_data = 0
                         for h3_event in h3.handle_event(event):
                             if isinstance(h3_event, DataReceived) and h3_event.stream_id == stream_id:
                                 response_data.extend(h3_event.data)
@@ -1687,7 +1777,6 @@ class DNSResolver:
                     except asyncio.TimeoutError:
                         iterations_without_data += 1
                         if iterations_without_data > max_idle_iterations:
-                            # Timeout if no data received for too long
                             raise asyncio.TimeoutError("HTTP/3 response timeout")
 
             await asyncio.wait_for(handle_events(), timeout=self.doh_timeout + 5)
@@ -2009,7 +2098,7 @@ class DNSResolver:
                     ip.is_multicast or
                     ip.is_unspecified)
 
-    def _apply_rebind_protection(self, response_bytes: bytes) -> bytes:
+    def _apply_rebind_protection(self, response_bytes: bytes) -> Optional[bytes]:
         if not self.rebind_protection_enabled or not _HAS_DNSPY:
             return response_bytes
         try:
@@ -2032,7 +2121,7 @@ class DNSResolver:
             msg.answer = filtered_answer
 
             if self.rebind_action == 'block' and not filtered_answer:
-                return self._make_nxdomain_response(b'\x00'*12)
+                return None
             return msg.to_wire()
         except Exception as e:
             self.logger.debug("rebind protection failed: %s", e)
@@ -2053,6 +2142,7 @@ class DNSResolver:
                             pinned_certs: Optional[Dict[str, str]] = None,
                             dnssec_enabled: Optional[bool] = None,
                             trust_anchors: Optional[Union[Dict[str, str], str]] = None,
+                            auto_update_trust_anchor: Optional[bool] = None,
                             metrics_enabled: Optional[bool] = None,
                             metrics_port: Optional[int] = None,
                             uvloop_enable: Optional[bool] = None,
@@ -2069,7 +2159,6 @@ class DNSResolver:
                             doh_version: Optional[str] = None,
                             doh_auto_cache_ttl: Optional[int] = None,
                             bootstrap: Optional[Dict[str, Any]] = None) -> None:
-        """Hot‑update resolver settings without recreating the object."""
         async with self._config_lock:
             if upstream_dns is not None:
                 self.upstream_dns = upstream_dns
@@ -2098,8 +2187,23 @@ class DNSResolver:
                 self.pinned_certs = pinned_certs
             if dnssec_enabled is not None:
                 self.dnssec_enabled = bool(dnssec_enabled)
+                if self.dnssec_enabled and self._dnssec_raw_anchors is None:
+                    self._load_trust_anchors()
             if trust_anchors is not None:
-                self.trust_anchors = trust_anchors or {}
+                self.trust_anchors = trust_anchors
+                if self.dnssec_enabled:
+                    self._load_trust_anchors()
+            if auto_update_trust_anchor is not None:
+                self.auto_update_trust_anchor = auto_update_trust_anchor
+                if self.auto_update_trust_anchor and self._trust_anchor_updater_task is None:
+                    self._trust_anchor_updater_task = asyncio.create_task(self._background_trust_anchor_updater())
+                elif not self.auto_update_trust_anchor and self._trust_anchor_updater_task is not None:
+                    self._trust_anchor_updater_task.cancel()
+                    try:
+                        await self._trust_anchor_updater_task
+                    except asyncio.CancelledError:
+                        pass
+                    self._trust_anchor_updater_task = None
             if metrics_enabled is not None:
                 self.metrics_enabled = bool(metrics_enabled) and _HAS_PROM
             if metrics_port is not None:

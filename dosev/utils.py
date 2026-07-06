@@ -1,3 +1,5 @@
+# dosev/utils.py – streaming fetch (same as before)
+
 import asyncio
 import os
 import logging
@@ -10,6 +12,7 @@ async def fetch_blocklists(urls: List[str], destination_dir: str = "blocklists")
     """
     Download each URL and save it as a file inside destination_dir.
     Filename is derived from the URL's last part (e.g., 'domainlist.txt').
+    Uses streaming to avoid loading large files into memory.
     """
     os.makedirs(destination_dir, exist_ok=True)
     async with aiohttp.ClientSession() as session:
@@ -21,13 +24,14 @@ async def fetch_blocklists(urls: List[str], destination_dir: str = "blocklists")
                     if resp.status != 200:
                         logging.warning("Failed to fetch %s: HTTP %s", url, resp.status)
                         continue
-                    content = await resp.text()
                     filename = url.split('/')[-1] or 'blocklist.txt'
                     if not filename:
                         filename = 'blocklist.txt'
                     filepath = os.path.join(destination_dir, filename)
                     with open(filepath, 'w', encoding='utf-8') as f:
-                        f.write(content)
+                        async for chunk, _ in resp.content.iter_chunks():
+                            if chunk:
+                                f.write(chunk.decode('utf-8', errors='ignore'))
                     logging.debug("Saved blocklist %s -> %s", url, filepath)
             except asyncio.TimeoutError:
                 logging.warning("Timeout fetching %s", url)

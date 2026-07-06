@@ -1,4 +1,4 @@
-# dosev/server.py – final version with graceful shutdown and await update_config
+# dosev/server.py – FINAL with all fixes
 
 import asyncio
 import logging
@@ -71,7 +71,7 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
                     pass
                 return
 
-            if qname and resolver.is_blocked(qname):
+            if qname and await resolver.is_blocked(qname):
                 action = resolver.get_block_action()
                 resp_wire = resolver.build_block_response(data, action=action)
                 if self.transport:
@@ -151,7 +151,7 @@ async def _tcp_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                 pass
             return
 
-        if qname and resolver.is_blocked(qname):
+        if qname and await resolver.is_blocked(qname):
             action = resolver.get_block_action()
             resp_wire = resolver.build_block_response(data, action=action)
             writer.write(len(resp_wire).to_bytes(2, 'big') + resp_wire)
@@ -209,6 +209,7 @@ async def reload_resolver(holder: ResolverHolder,
         retries=config.get("upstream_retries"),
         pinned_certs=config.get("dns_pinned_certs"),
         dnssec_enabled=config.get("dnssec_enabled", False),
+        auto_update_trust_anchor=config.get("auto_update_trust_anchor", True),
         trust_anchors=config.get("trust_anchors_file"),
         metrics_enabled=config.get("metrics_enabled", False),
         metrics_port=config.get("metrics_port", 8000),
@@ -241,10 +242,10 @@ async def reload_resolver(holder: ResolverHolder,
         try:
             exact_set, suffix_set, hosts_map = current_resolver.load_blocklists_from_dir(local_dir)
             domains = list(exact_set) + ['.' + s for s in suffix_set]
-            # Use config lock to synchronize with ongoing queries
+            # FIXED: Added await
             async with current_resolver._config_lock:
-                current_resolver.set_blocklist(domains)
-                current_resolver.set_hosts_map(hosts_map)
+                await current_resolver.set_blocklist(domains)
+                await current_resolver.set_hosts_map(hosts_map)
             logging.info("Blocklists reloaded from %s", local_dir)
         except Exception as e:
             logging.warning("Blocklist reload during config update failed: %s", e)
@@ -296,6 +297,7 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
                      dns_log_prefix: str = 'dns-log',
                      dns_pinned_certs: Optional[Dict[str, str]] = None,
                      dnssec_enabled: bool = False,
+                     auto_update_trust_anchor: bool = True,
                      trust_anchors_file: Optional[str] = None,
                      metrics_enabled: bool = False,
                      metrics_port: int = 8000,
@@ -321,7 +323,7 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
                      doh_version: str = 'auto',
                      doh_auto_cache_ttl: int = 3600,
                      bootstrap: Optional[Dict[str, Any]] = None) -> None:
-    """Start the DNS server (UDP + TCP) with graceful shutdown."""
+    """Start the DNS server (UDP + TCP) with graceful shutdown and DNSSEC auto‑update."""
     logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
 
     resolver = DNSResolver(
@@ -339,6 +341,7 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
         dns_log_dir=dns_log_dir,
         pinned_certs=dns_pinned_certs,
         dnssec_enabled=dnssec_enabled,
+        auto_update_trust_anchor=auto_update_trust_anchor,
         trust_anchors=None if not trust_anchors_file else {'file': trust_anchors_file},
         metrics_enabled=metrics_enabled,
         metrics_port=metrics_port,
@@ -379,8 +382,8 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
         try:
             exact_set, suffix_set, hosts_map = resolver.load_blocklists_from_dir(local_dir)
             domains = list(exact_set) + ['.' + s for s in suffix_set]
-            resolver.set_blocklist(domains)
-            resolver.set_hosts_map(hosts_map)
+            await resolver.set_blocklist(domains)
+            await resolver.set_hosts_map(hosts_map)
         except Exception as e:
             logging.warning("Failed to load blocklists from %s: %s", local_dir, e)
 
@@ -393,10 +396,10 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
                         await fetch_blocklists(urls, destination_dir=local_dir)
                         exact_set, suffix_set, hosts_map = resolver.load_blocklists_from_dir(local_dir)
                         domains = list(exact_set) + ['.' + s for s in suffix_set]
-                        # Use config lock to safely update blocklists (prevents TOCTOU with queries)
+                        # FIXED: Added await
                         async with resolver._config_lock:
-                            resolver.set_blocklist(domains)
-                            resolver.set_hosts_map(hosts_map)
+                            await resolver.set_blocklist(domains)
+                            await resolver.set_hosts_map(hosts_map)
                         logging.debug("Blocklists reloaded")
                     except Exception as e:
                         logging.warning("Periodic blocklist reload failed: %s", e)
@@ -423,7 +426,6 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
             chroot_dir=dns_chroot_dir or None
         )
 
-    # Graceful shutdown handling
     shutdown_event = asyncio.Event()
 
     def handle_signal(signum, frame):
@@ -436,13 +438,22 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
     except NotImplementedError:
         logging.warning("Signal handlers are not supported on this platform")
 
+    # FIXED: Convert coroutines to tasks
+    serve_task = asyncio.create_task(server.serve_forever())
+    shutdown_task = asyncio.create_task(shutdown_event.wait())
+
     try:
-        await asyncio.wait([server.serve_forever(), shutdown_event.wait()], return_when=asyncio.FIRST_COMPLETED)
+        await asyncio.wait([serve_task, shutdown_task], return_when=asyncio.FIRST_COMPLETED)
     except asyncio.CancelledError:
         pass
     finally:
+        if not serve_task.done():
+            serve_task.cancel()
+        if not shutdown_task.done():
+            shutdown_task.cancel()
         logging.info("Shutting down gracefully...")
         await resolver.stop_pool_cleanups()
+        await resolver.stop_background_tasks()
         udp_transport.close()
         server.close()
         await server.wait_closed()
@@ -453,12 +464,77 @@ def run_server_sync(listen_ip: str, listen_port: int, upstream_dns: str, protoco
                     verbose: bool = False,
                     blocklists: Optional[Dict[str, Any]] = None,
                     disable_ipv6: bool = False,
-                    **kwargs: Any) -> None:
-    """Synchronous wrapper for run_server."""
+                    dns_cache_ttl: int = 300,
+                    dns_cache_max_size: int = 1024,
+                    dns_logging_enabled: bool = False,
+                    dns_log_retention_days: int = 7,
+                    dns_log_dir: str = '/var/log/dosev',
+                    dns_log_prefix: str = 'dns-log',
+                    dns_pinned_certs: Optional[Dict[str, str]] = None,
+                    dnssec_enabled: bool = False,
+                    auto_update_trust_anchor: bool = True,
+                    trust_anchors_file: Optional[str] = None,
+                    metrics_enabled: bool = False,
+                    metrics_port: int = 8000,
+                    uvloop_enable: bool = False,
+                    upstream_retries: int = 2,
+                    upstream_initial_backoff: float = 0.1,
+                    upstream_udp_timeout: float = 2.0,
+                    upstream_tcp_timeout: float = 5.0,
+                    upstream_doh_timeout: float = 5.0,
+                    rate_limit_rps: float = 0.0,
+                    rate_limit_burst: float = 0.0,
+                    upstreams: Optional[List[Dict[str, Any]]] = None,
+                    optimistic_cache_enabled: bool = False,
+                    optimistic_stale_max_age: int = 86400,
+                    optimistic_stale_response_ttl: int = 30,
+                    dns_privilege_drop_user: str = '',
+                    dns_privilege_drop_group: str = '',
+                    dns_chroot_dir: str = '',
+                    dns_rebind_protection: bool = False,
+                    dns_rebind_action: str = 'strip',
+                    pool_max_size: int = 5,
+                    pool_idle_timeout: float = 60.0,
+                    doh_version: str = 'auto',
+                    doh_auto_cache_ttl: int = 3600,
+                    bootstrap: Optional[Dict[str, Any]] = None) -> None:
     asyncio.run(run_server(
         listen_ip, listen_port, upstream_dns, protocol,
         verbose=verbose,
         blocklists=blocklists,
         disable_ipv6=disable_ipv6,
-        **kwargs
+        dns_cache_ttl=dns_cache_ttl,
+        dns_cache_max_size=dns_cache_max_size,
+        dns_logging_enabled=dns_logging_enabled,
+        dns_log_retention_days=dns_log_retention_days,
+        dns_log_dir=dns_log_dir,
+        dns_log_prefix=dns_log_prefix,
+        dns_pinned_certs=dns_pinned_certs,
+        dnssec_enabled=dnssec_enabled,
+        auto_update_trust_anchor=auto_update_trust_anchor,
+        trust_anchors_file=trust_anchors_file,
+        metrics_enabled=metrics_enabled,
+        metrics_port=metrics_port,
+        uvloop_enable=uvloop_enable,
+        upstream_retries=upstream_retries,
+        upstream_initial_backoff=upstream_initial_backoff,
+        upstream_udp_timeout=upstream_udp_timeout,
+        upstream_tcp_timeout=upstream_tcp_timeout,
+        upstream_doh_timeout=upstream_doh_timeout,
+        rate_limit_rps=rate_limit_rps,
+        rate_limit_burst=rate_limit_burst,
+        upstreams=upstreams,
+        optimistic_cache_enabled=optimistic_cache_enabled,
+        optimistic_stale_max_age=optimistic_stale_max_age,
+        optimistic_stale_response_ttl=optimistic_stale_response_ttl,
+        dns_privilege_drop_user=dns_privilege_drop_user,
+        dns_privilege_drop_group=dns_privilege_drop_group,
+        dns_chroot_dir=dns_chroot_dir,
+        dns_rebind_protection=dns_rebind_protection,
+        dns_rebind_action=dns_rebind_action,
+        pool_max_size=pool_max_size,
+        pool_idle_timeout=pool_idle_timeout,
+        doh_version=doh_version,
+        doh_auto_cache_ttl=doh_auto_cache_ttl,
+        bootstrap=bootstrap,
     ))
