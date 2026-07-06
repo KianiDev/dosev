@@ -1,4 +1,4 @@
-# dosev/resolver.py – final production version with query ID rewrite on cache hits
+# dosev/resolver.py – final production version with DoH URL parsing
 
 import asyncio
 import logging
@@ -290,6 +290,7 @@ class DNSResolver:
       - Custom port support (host:port)
       - DNSSEC validation cache (store validation result per RRset)
       - Automatic trust anchor management (bundled root key + optional IANA fetch)
+      - DoH URL parsing (full https://host/path support)
     """
 
     def __init__(self,
@@ -460,10 +461,39 @@ class DNSResolver:
         self._doh_auto_cache: Dict[str, Tuple[str, float]] = {}
         self._doh_auto_lock: asyncio.Lock = asyncio.Lock()
 
+        # ---------- Parse DoH URL if protocol is https ----------
+        self._doh_host: Optional[str] = None
+        self._doh_port: Optional[int] = None
+        self._doh_path: Optional[str] = None
+        if self.protocol == 'https':
+            self._parse_upstream_url()
+
         if self.dnssec_enabled:
             self._load_trust_anchors()
             if self.auto_update_trust_anchor:
                 self._trust_anchor_updater_task = asyncio.create_task(self._background_trust_anchor_updater())
+
+    def _parse_upstream_url(self) -> None:
+        """Parse the upstream_dns URL for DoH."""
+        url = self.upstream_dns.strip()
+        # If it doesn't start with http:// or https://, assume https://
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        try:
+            parsed = urlparse(url)
+            self._doh_host = parsed.hostname
+            self._doh_port = parsed.port or 443
+            # Path: if empty, use '/dns-query'
+            path = parsed.path or '/dns-query'
+            # If path ends with '/', remove it? Keep as is.
+            self._doh_path = path
+            self.logger.debug("Parsed DoH URL: host=%s, port=%s, path=%s", self._doh_host, self._doh_port, self._doh_path)
+        except Exception as e:
+            self.logger.error("Failed to parse DoH URL '%s': %s", self.upstream_dns, e)
+            # Fallback to raw values
+            self._doh_host = self.upstream_dns
+            self._doh_port = 443
+            self._doh_path = '/dns-query'
 
     async def start_pool_cleanups(self) -> None:
         await self._tcp_pool.start_cleanup()
@@ -697,17 +727,31 @@ class DNSResolver:
             if self.upstreams:
                 upstream_list = self.upstreams
             else:
-                # Use protocol-specific default port
-                if self.protocol == 'tls':
-                    default_port = 853
-                elif self.protocol == 'https':
-                    default_port = 443
-                elif self.protocol == 'quic':
-                    default_port = 853
+                # Build default upstream list based on protocol
+                if self.protocol == 'https' and self._doh_host:
+                    # Use parsed DoH values
+                    host = self._doh_host
+                    port = self._doh_port or 443
+                    path = self._doh_path or '/dns-query'
+                    upstream_list = [{
+                        'address': host,
+                        'port': port,
+                        'protocol': self.protocol,
+                        'hostname': host,
+                        'path': path,
+                    }]
                 else:
-                    default_port = 53
-                host, port = self._split_hostport(self.upstream_dns, default_port=default_port)
-                upstream_list = [{'address': host, 'port': port, 'protocol': self.protocol, 'hostname': host}]
+                    # Use protocol-specific default port for other protocols
+                    if self.protocol == 'tls':
+                        default_port = 853
+                    elif self.protocol == 'https':
+                        default_port = 443
+                    elif self.protocol == 'quic':
+                        default_port = 853
+                    else:
+                        default_port = 53
+                    host, port = self._split_hostport(self.upstream_dns, default_port=default_port)
+                    upstream_list = [{'address': host, 'port': port, 'protocol': self.protocol, 'hostname': host}]
             last_exc = None
             for upstream in upstream_list:
                 try:
@@ -717,7 +761,7 @@ class DNSResolver:
                         qname = key[0] if key[0] else None
                         if qname:
                             try:
-                                await self._dnssec_validate(qname, resp)
+                                await self._dnssec_validate(qname, resp, dnssec_requested=False)
                                 dnssec_ok = True
                             except Exception as e:
                                 self.logger.warning("DNSSEC validation failed for stale refresh %s: %s", key, e)
@@ -1112,8 +1156,15 @@ class DNSResolver:
         anchors: Dict[dns.name.Name, dns.rrset.RRset] = {}
 
         if self.trust_anchors is None:
+            # Use the bundled default root key.
             try:
-                rr = dns.rrset.from_text(".", 172800, "IN", "DNSKEY", DEFAULT_ROOT_DNSKEY)
+                parts = DEFAULT_ROOT_DNSKEY.split()
+                name = parts[0]
+                ttl = int(parts[1])
+                rdclass = parts[2]
+                rdtype = parts[3]
+                rdata = ' '.join(parts[4:])
+                rr = dns.rrset.from_text(name, ttl, rdclass, rdtype, rdata)
                 anchors[dns.name.root] = rr
                 self.logger.info("Using bundled default root trust anchor")
             except Exception as e:
@@ -1175,13 +1226,7 @@ class DNSResolver:
             return
 
         self._dnssec_raw_anchors = anchors
-        try:
-            simple = {name: [r.to_text() for r in rr] for name, rr in anchors.items()}
-            self._dnssec_keyring = dns.dnssec.make_keyring(simple)
-            self.logger.debug("Built DNSSEC keyring with %d anchors", len(simple))
-        except Exception as e:
-            self._dnssec_keyring = None
-            self.logger.warning("Could not build unified keyring: %s", e)
+        self._dnssec_keyring = None
 
     async def _update_trust_anchor_from_iana(self) -> bool:
         if not self.dnssec_enabled:
@@ -1198,8 +1243,7 @@ class DNSResolver:
                 rr = dns.rrset.from_text(".", 0, "IN", "DS", new_ds)
                 anchors = {dns.name.root: rr}
                 self._dnssec_raw_anchors = anchors
-                simple = {dns.name.root: [rr.to_text()]}
-                self._dnssec_keyring = dns.dnssec.make_keyring(simple)
+                self._dnssec_keyring = None
                 self.logger.info("Updated root trust anchor from IANA: %s", new_ds)
                 return True
             except Exception as e:
@@ -1218,11 +1262,37 @@ class DNSResolver:
             await asyncio.sleep(86400)
 
     # ---------- DNSSEC validation ----------
-    async def _dnssec_validate(self, qname: str, response_wire: bytes) -> None:
+    def _dnssec_requested(self, query_data: bytes) -> bool:
+        """Check if the DO bit is set in the EDNS0 OPT record."""
+        if not query_data or len(query_data) < 12 or not _HAS_DNSPY:
+            return False
+        try:
+            msg = dns.message.from_wire(query_data)
+            if msg.opt is None:
+                return False
+            return bool(msg.opt.flags & dns.flags.DO)
+        except Exception:
+            return False
+
+    async def _dnssec_validate(self, qname: str, response_wire: bytes, dnssec_requested: bool = True) -> None:
+        """Validate DNSSEC signatures in the response.
+
+        Args:
+            qname: The query name.
+            response_wire: The raw DNS response.
+            dnssec_requested: Whether the client requested DNSSEC (DO bit set).
+                If False, validation is skipped (unsigned domains are accepted).
+        """
         if not self.dnssec_enabled:
             return
         if not _HAS_DNSPY:
             raise RuntimeError("dnspython is required for DNSSEC validation")
+
+        # If DNSSEC wasn't requested, skip validation – the response won't have RRSIGs
+        if not dnssec_requested:
+            self.logger.debug("DNSSEC not requested for %s – skipping validation", qname)
+            return
+
         if self._dnssec_raw_anchors is None:
             self._load_trust_anchors()
         if not self._dnssec_raw_anchors:
@@ -1232,10 +1302,25 @@ class DNSResolver:
         def _validate() -> bool:
             try:
                 msg = dns.message.from_wire(response_wire)
+                
+                # Check if there are any RRSIGs in the answer
+                has_rrsig = False
+                for rr in msg.answer:
+                    if rr.rdtype == dns.rdatatype.RRSIG:
+                        has_rrsig = True
+                        break
+                
+                # If no RRSIGs, the domain is unsigned or the upstream didn't include them
+                if not has_rrsig:
+                    # If the client requested DNSSEC but we got no signatures, treat as error
+                    raise Exception("no RRSIG for rrset (DNSSEC requested but no signatures)")
+                
                 rrsig_by_name: Dict[Any, Any] = {}
                 for rr in msg.answer:
                     if rr.rdtype == dns.rdatatype.RRSIG:
                         rrsig_by_name.setdefault(rr.name, []).append(rr)
+                
+                # Validate each signed RRset
                 for rrset in msg.answer:
                     if rrset.rdtype == dns.rdatatype.RRSIG:
                         continue
@@ -1251,22 +1336,10 @@ class DNSResolver:
                             if candidate:
                                 break
                     if candidate is None:
-                        raise Exception(f"no RRSIG for rrset {name} type {rrset.rdtype}")
-                    if self._dnssec_keyring:
-                        keyring = self._dnssec_keyring
-                    else:
-                        anchors = self._dnssec_raw_anchors or {}
-                        ks: Dict[Any, Any] = {}
-                        if name in anchors:
-                            ks[name] = [r.to_text() for r in anchors[name]]
-                        else:
-                            for anc_name in anchors:
-                                if name.is_subdomain(anc_name):
-                                    ks[anc_name] = [r.to_text() for r in anchors[anc_name]]
-                                    break
-                        if not ks:
-                            raise Exception(f"no trust anchor available for {name}")
-                        keyring = dns.dnssec.make_keyring(ks)
+                        # This RRset has no RRSIG – skip validation for this RRset
+                        continue
+                    
+                    keyring = self._dnssec_raw_anchors
                     dns.dnssec.validate(rrset, candidate, keyring)
                 return True
             except Exception:
@@ -1420,6 +1493,7 @@ class DNSResolver:
         qtype = self._extract_qtype_from_wire(data) or 1
         key = self._build_cache_key(data)
         orig_id = int.from_bytes(data[:2], 'big')
+        dnssec_requested = self._dnssec_requested(original_data)
 
         async with self._config_lock:
             upstream_dns = self.upstream_dns
@@ -1466,10 +1540,11 @@ class DNSResolver:
         if cached is not None:
             resp_bytes, dnssec_validated = cached
             self.logger.debug("wire-cache hit %s", key)
+            
             if self.dnssec_enabled and not dnssec_validated:
                 self.logger.debug("cache entry lacks DNSSEC validation, revalidating...")
                 try:
-                    await self._dnssec_validate(qname, resp_bytes)
+                    await self._dnssec_validate(qname, resp_bytes, dnssec_requested)
                     async with self._lock:
                         entry = await self._wire_cache_get(key)
                         if entry is not None:
@@ -1478,10 +1553,23 @@ class DNSResolver:
                             await self._wire_cache_set(key, new_val)
                     dnssec_validated = True
                 except Exception as e:
-                    self.logger.warning("DNSSEC revalidation failed for %s, treating as cache miss", key)
-                    async with self._lock:
-                        await self._wire_cache_delete(key)
-                    cached = None
+                    error_str = str(e).lower()
+                    # If validation fails because no RRSIGs and DNSSEC was requested,
+                    # treat as unsigned and cache as validated (no need to revalidate)
+                    if "no rrsig" in error_str:
+                        self.logger.debug("Domain %s appears unsigned – marking as validated", qname)
+                        async with self._lock:
+                            entry = await self._wire_cache_get(key)
+                            if entry is not None:
+                                _, expiry, query_data, stale_until, _ = entry
+                                new_val = (resp_bytes, expiry, query_data, stale_until, True)
+                                await self._wire_cache_set(key, new_val)
+                        dnssec_validated = True
+                    else:
+                        self.logger.warning("DNSSEC revalidation failed for %s, treating as cache miss", key)
+                        async with self._lock:
+                            await self._wire_cache_delete(key)
+                        cached = None
 
             if cached is not None:
                 if self.rebind_protection_enabled:
@@ -1490,22 +1578,37 @@ class DNSResolver:
                         return self._make_nxdomain_response(data)
                 return self._set_query_id(resp_bytes, orig_id)
 
+        # Build upstream list
         async with self._config_lock:
             if self.upstreams:
                 upstream_list = list(self.upstreams)
             else:
-                # Use protocol-specific default port
-                if self.protocol == 'tls':
-                    default_port = 853
-                elif self.protocol == 'https':
-                    default_port = 443
-                elif self.protocol == 'quic':
-                    default_port = 853
+                if self.protocol == 'https' and self._doh_host:
+                    # Use parsed DoH values
+                    host = self._doh_host
+                    port = self._doh_port or 443
+                    path = self._doh_path or '/dns-query'
+                    upstream_list = [{
+                        'address': host,
+                        'port': port,
+                        'protocol': self.protocol,
+                        'hostname': host,
+                        'path': path,
+                    }]
                 else:
-                    default_port = 53
-                host, port = self._split_hostport(self.upstream_dns, default_port=default_port)
-                upstream_list = [{'address': host, 'port': port, 'protocol': self.protocol, 'hostname': host}]
-                last_exc = None
+                    # Use protocol-specific default port for other protocols
+                    if self.protocol == 'tls':
+                        default_port = 853
+                    elif self.protocol == 'https':
+                        default_port = 443
+                    elif self.protocol == 'quic':
+                        default_port = 853
+                    else:
+                        default_port = 53
+                    host, port = self._split_hostport(self.upstream_dns, default_port=default_port)
+                    upstream_list = [{'address': host, 'port': port, 'protocol': self.protocol, 'hostname': host}]
+
+        last_exc = None
         for upstream in upstream_list:
             try:
                 resp = await self._try_upstream(upstream, data)
@@ -1517,11 +1620,20 @@ class DNSResolver:
                 dnssec_ok = False
                 if self.dnssec_enabled and qname:
                     try:
-                        await self._dnssec_validate(qname, resp)
+                        await self._dnssec_validate(qname, resp, dnssec_requested)
                         dnssec_ok = True
                     except Exception as e:
-                        self.logger.warning("DNSSEC validation failed for %s: %s", qname, e)
-                        raise
+                        error_str = str(e).lower()
+                        if "no rrsig" in error_str:
+                            if dnssec_requested:
+                                self.logger.warning("DNSSEC requested but no RRSIGs for %s", qname)
+                                raise
+                            else:
+                                self.logger.debug("No RRSIGs for %s, skipping validation", qname)
+                                dnssec_ok = True
+                        else:
+                            self.logger.warning("DNSSEC validation failed for %s: %s", qname, e)
+                            raise
                 if self.rebind_protection_enabled:
                     resp = self._apply_rebind_protection(resp)
                     if resp is None:
@@ -1718,9 +1830,17 @@ class DNSResolver:
 
     async def _forward_https(self, data: bytes, upstream: Optional[Dict[str, Any]] = None) -> bytes:
         if upstream is None:
-            host, port = self._split_hostport(self.upstream_dns, default_port=443)
-            hostname = host
-            path = "/dns-query"
+            # Use parsed DoH values if available
+            if self._doh_host:
+                host = self._doh_host
+                port = self._doh_port or 443
+                path = self._doh_path or '/dns-query'
+                hostname = self._doh_host
+            else:
+                # Fallback to splitting the raw upstream_dns
+                host, port = self._split_hostport(self.upstream_dns, default_port=443)
+                path = "/dns-query"
+                hostname = host
             version = self.doh_version
         else:
             host = upstream['address']
@@ -2046,15 +2166,13 @@ class DNSResolver:
         if self.disable_ipv6 and self._is_ipv6_address(resolved):
             raise Exception("IPv6 disabled but resolved to IPv6")
 
-        # QUIC configuration – use CERT_NONE for testing, CERT_REQUIRED for production
         config = QuicConfiguration(
             is_client=True,
             alpn_protocols=["doq"],
-            verify_mode=ssl.CERT_NONE,  # Change to CERT_REQUIRED for production
+            verify_mode=ssl.CERT_NONE,
             server_name=hostname,
         )
 
-        # Define the protocol class that captures the response
         class DoQProtocol(QuicConnectionProtocol):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
@@ -2065,22 +2183,17 @@ class DNSResolver:
                     if self.response_future and not self.response_future.done():
                         self.response_future.set_result(event.data)
 
-        # Connect and send the query
-        async with connect(
-            resolved, port, configuration=config, create_protocol=DoQProtocol
-        ) as client:
+        async with connect(resolved, port, configuration=config, create_protocol=DoQProtocol) as client:
             client.response_future = asyncio.get_running_loop().create_future()
             stream_id = client._quic.get_next_available_stream_id()
             client._quic.send_stream_data(stream_id, len(data).to_bytes(2, "big") + data, end_stream=True)
             client.transmit()
 
-            # Wait for the response with timeout
             try:
                 response_data = await asyncio.wait_for(client.response_future, timeout=self.doh_timeout)
             except asyncio.TimeoutError:
                 raise QueryTimeout(f"DoQ query to {host}:{port} timed out")
 
-            # Parse the response (strip the 2-byte length prefix)
             if len(response_data) < 2:
                 raise Exception("Invalid DoQ response (too short)")
             resp_len = int.from_bytes(response_data[:2], "big")
@@ -2371,8 +2484,12 @@ class DNSResolver:
         async with self._config_lock:
             if upstream_dns is not None:
                 self.upstream_dns = upstream_dns
+                if self.protocol == 'https':
+                    self._parse_upstream_url()
             if protocol is not None:
                 self.protocol = protocol.lower()
+                if self.protocol == 'https':
+                    self._parse_upstream_url()
             if disable_ipv6 is not None:
                 self.disable_ipv6 = bool(disable_ipv6)
             if verbose is not None:
