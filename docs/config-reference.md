@@ -1,78 +1,128 @@
-# dosev Configuration Reference
+# Configuration Reference
 
-## [server]
+`dosev` uses an INI‑style configuration file. This document describes every available option.
 
-- `listen_ip`: IP address to bind the server on.
-- `listen_port`: Port for plain DNS UDP/TCP listeners.
+---
 
-## [resolver]
+## Global Sections
 
-- `upstream_dns`: Upstream DNS resolver address.
-- `protocol`: Upstream protocol (`udp`, `tcp`, `tls`, `https`).
-- `verbose`: `true` or `false`.
-- `disable_ipv6`: `true` to block AAAA queries and IPv6 responses.
-- `dns_max_payload`: Maximum EDNS0 UDP payload size advertised and accepted.
-- `dns_enable_dot`: `true` to enable DNS-over-TLS (DoT) server listener.
-- `dns_dot_port`: Port for the DoT listener (default `853`).
-- `dns_dot_cert_file`: TLS certificate file path for DoT.
-- `dns_dot_key_file`: TLS key file path for DoT.
-- `dns_enable_doh`: `true` to enable DNS-over-HTTPS (DoH) server listener.
-- `dns_doh_port`: Port for the DoH listener (default `443`).
-- `dns_doh_cert_file`: TLS certificate file path for DoH.
-- `dns_doh_key_file`: TLS key file path for DoH.
-- `dns_doh_path`: HTTP path for DoH requests (default `/dns-query`).
+### `[server]`
 
-## [cache]
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `listen_ip` | string | `0.0.0.0` | IP address to bind to. |
+| `listen_port` | int | `53` | Port for UDP and TCP (plain DNS). |
+| `listen_tls_port` | int | `853` | Port for DNS‑over‑TLS (DoT). |
+| `listen_https_port` | int | `443` | Port for DNS‑over‑HTTPS (DoH). |
+| `https_cert_file` | string | `""` | Path to TLS certificate file (required for DoT/DoH). |
+| `https_key_file` | string | `""` | Path to TLS private key file (required for DoT/DoH). |
+| `https_ca_file` | string | `""` | Path to CA bundle for client certificate verification (optional). |
 
-- `ttl`: Cache time-to-live in seconds.
-- `max_size`: Maximum cache entries.
+---
 
-## [timeouts]
+### `[resolver]`
 
-- `udp`: Upstream UDP timeout.
-- `tcp`: Upstream TCP timeout.
-- `doh`: Upstream DoH timeout.
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `upstream_dns` | string | `1.1.1.1` | Upstream DNS server (host or IP; optional port). |
+| `protocol` | string | `udp` | Protocol to use: `udp`, `tcp`, `tls`, `https`, `quic`. |
+| `verbose` | bool | `false` | Enable debug logging. |
+| `disable_ipv6` | bool | `false` | Do not query AAAA records. |
+| `strip_ipv6_records` | bool | `false` | Strip AAAA records from responses. |
 
-## [advanced]
+---
 
-- `retries`: Upstream retry count.
-- `rate_limit_rps`: Rate limit in requests per second.
-- `rate_limit_burst`: Token-bucket burst size.
-- `optimistic_cache_enabled`: `true` to enable optimistic caching.
-- `optimistic_stale_max_age`: Maximum age for stale optimistic cache.
-- `optimistic_stale_response_ttl`: TTL for stale optimistic responses.
-- `pool_max_size`: Connection pool max size.
-- `pool_idle_timeout`: Connection pool idle timeout.
-- `doh_version`: Preferred DoH version (`auto`, `1.1`, `2`, `3`).
-- `doh_auto_cache_ttl`: TTL for auto-detected DoH version results.
+### `[cache]`
 
-## [security]
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `ttl` | int | `300` | TTL (seconds) for positive cache entries. |
+| `max_size` | int | `1024` | Maximum number of cache entries. |
+| `negative_ttl` | int | `60` | TTL for negative (NXDOMAIN) cache entries. |
 
-- `dnssec_enabled`: `true` to enable DNSSEC validation.
-- `auto_update_trust_anchor`: `true` to auto-update root trust anchors.
-- `trust_anchors_file`: Custom trust anchor file path.
-- `pinned_certs`: Certificate pinning map.
-- `rebind_protection`: `true` to enable DNS rebinding protection.
-- `rebind_action`: `strip` or `block`.
-- `dns_privilege_drop_user`: User for privilege dropping.
-- `dns_privilege_drop_group`: Group for privilege dropping.
-- `dns_chroot_dir`: Chroot directory.
+---
 
-## [metrics]
+### `[timeouts]`
 
-- `enabled`: Start Prometheus metrics server.
-- `port`: Metrics port.
-- `uvloop_enable`: `true` to use uvloop if available.
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `udp` | float | `2.0` | UDP query timeout (seconds). |
+| `tcp` | float | `5.0` | TCP/TLS query timeout. |
+| `doh` | float | `5.0` | DoH/DoQ query timeout. |
 
-## [bootstrap]
+---
 
-- `servers`: Comma-separated bootstrap DNS servers.
-- `timeout`: Bootstrap timeout seconds.
-- `retries`: Bootstrap retry count.
+### `[advanced]`
 
-## [upstreams]
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `retries` | int | `2` | Number of retries per upstream. |
+| `rate_limit_rps` | float | `0.0` | Request per second per client IP (0 = disabled). |
+| `rate_limit_burst` | float | `0.0` | Max burst (must be ≥ `rate_limit_rps`). |
+| `optimistic_cache_enabled` | bool | `false` | Serve stale responses while refreshing. |
+| `optimistic_stale_max_age` | int | `86400` | Maximum age (seconds) for stale responses. |
+| `optimistic_stale_response_ttl` | int | `30` | TTL to set on stale responses. |
+| `pool_max_size` | int | `5` | Max connections per upstream pool. |
+| `pool_idle_timeout` | float | `60.0` | Idle timeout (seconds) for pooled connections. |
+| `doh_version` | string | `auto` | DoH version: `1.1`, `2`, `3`, or `auto`. |
+| `doh_auto_cache_ttl` | int | `3600` | Cache TTL for auto‑detected DoH versions. |
+| `load_balancing` | string | `failover` | Strategy: `failover`, `roundrobin`, `weighted`. |
+| `health_check_interval` | int | `60` | Interval (seconds) between upstream health checks. |
+| `health_check_timeout` | float | `2.0` | Timeout for a health check query. |
 
-Defines upstream resolver endpoints by name. Example:
+---
+
+### `[security]`
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `dnssec_enabled` | bool | `false` | Enable DNSSEC validation. |
+| `auto_update_trust_anchor` | bool | `true` | Automatically fetch root trust anchor from IANA. |
+| `trust_anchors_file` | string | `""` | Custom trust anchor file (overrides built‑in). |
+| `pinned_certs` | string | `""` | Comma‑separated `hostname=sha256` pins for TLS connections. |
+| `rebind_protection` | bool | `false` | Enable rebinding protection. |
+| `rebind_action` | string | `strip` | `strip` or `block` when private IPs are detected. |
+| `dns_privilege_drop_user` | string | `""` | User to drop privileges to (Linux/Unix). |
+| `dns_privilege_drop_group` | string | `""` | Group to drop privileges to. |
+| `dns_chroot_dir` | string | `""` | chroot directory (Linux/Unix). |
+
+---
+
+### `[logging]`
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable request logging to file. |
+| `log_dir` | string | `/var/log/dosev` or `%LOCALAPPDATA%/dosev/logs` | Directory for log files. |
+| `retention_days` | int | `7` | Number of days to keep log files. |
+| `log_prefix` | string | `dns-log` | Prefix for log filenames. |
+| `format` | string | `text` | Log format: `text` or `json`. |
+
+---
+
+### `[metrics]`
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable Prometheus metrics endpoint. |
+| `port` | int | `8000` | Port for metrics server. |
+| `uvloop_enable` | bool | `false` | Use uvloop (faster event loop on Unix). |
+
+---
+
+### `[bootstrap]`
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `servers` | string | `1.1.1.1:53,8.8.8.8:53` | Comma‑separated list of bootstrap DNS servers (used to resolve upstream hostnames). |
+| `timeout` | float | `2.0` | Timeout for bootstrap lookups. |
+| `retries` | int | `2` | Number of retries for bootstrap. |
+
+---
+
+### `[upstreams]`
+
+Define multiple upstream servers with custom settings.
 
 ```ini
 [upstreams]
@@ -81,9 +131,52 @@ servers = primary,secondary
 [upstreams.primary]
 address = 1.1.1.1
 protocol = udp
+port = 53
+hostname = one.one.one.one
 
 [upstreams.secondary]
-address = dns.google
-protocol = https
-path = /dns-query
+address = 8.8.8.8
+protocol = tls
+port = 853
+hostname = dns.google
 ```
+
+Each upstream section supports:
+- `address`: IP or hostname.
+- `protocol`: `udp`, `tcp`, `tls`, `https`, `quic`.
+- `port`: optional (defaults to standard port for the protocol).
+- `hostname`: used for SNI (TLS/DoH).
+- `path`: DoH path (default `/dns-query`).
+- `doh_version`: `auto`, `1.1`, `2`, `3`.
+- `weight`: for weighted load balancing (default `1`).
+
+---
+
+### `[blocklists]`
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable blocklist filtering. |
+| `urls` | string | `""` | Comma‑separated list of URLs to fetch. |
+| `interval_seconds` | int | `86400` | Refresh interval for remote lists. |
+| `action` | string | `NXDOMAIN` | Action for blocked domains: `NXDOMAIN`, `REFUSED`, `ZEROIP`. |
+| `local_blocklist_dir` | string | `blocklists` | Directory to store downloaded lists. |
+| `reload_on_change` | bool | `true` | Automatically reload if files change. |
+
+---
+
+### `[hosts]`
+
+Define static A/AAAA records.
+
+```ini
+[hosts]
+# Format: domain = ip
+myinternal.local = 192.168.1.10
+```
+
+---
+
+## Example Full Configuration
+
+See `examples/dosev.conf.example` in the source repository for a complete example covering all sections.

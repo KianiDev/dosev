@@ -1,53 +1,190 @@
-# dosev Architecture
+# Architecture
+
+This document describes the internal architecture of `dosev` – its components, data flow, and key design decisions.
+
+---
 
 ## Overview
 
-dosev is structured as a config-driven DNS resolver and server. It accepts client DNS queries, forwards them to configured upstream resolvers, and returns responses while applying policies such as caching, blocklists, DNSSEC, and secure transport handling.
+`dosev` is an asynchronous DNS resolver and server built on Python's `asyncio`. It is split into several logical layers:
 
-## Components
+1. **Configuration** – loading and validating settings from an INI file.
+2. **Server** – listening for incoming DNS queries over multiple protocols (UDP, TCP, TLS, HTTPS).
+3. **Resolver** – the core logic that processes queries, applies blocklists, handles caching, performs DNSSEC validation, and forwards to upstreams.
+4. **Transports** – protocol‑specific client implementations for upstream communication (UDP, TCP, TLS, HTTPS, QUIC).
+5. **Utilities** – helpers for blocklist fetching, logging, and metrics.
 
-### Server
+All components are designed to be modular and testable.
 
-The server layer is implemented in `dosev/server.py`.
+---
 
-- UDP listener: handles traditional DNS over UDP.
-- TCP listener: handles traditional DNS over TCP.
-- DoT listener: optional DNS-over-TLS listener using TLS-wrapped TCP.
-- DoH listener: optional DNS-over-HTTPS listener using `aiohttp` to accept HTTP requests.
-- Signal handling and graceful shutdown.
-- Hot configuration reload support for resolver settings and blocklists.
+## High‑Level Data Flow
 
-### Resolver
+```text
+Client
+   │
+   ▼
+Server (UDP / TCP / TLS / HTTPS)
+   │
+   ▼
+Resolver.forward_dns_query()
+   │
+   ├── Hosts override?
+   ├── Blocklist match?
+   ├── Cache hit?
+   │       └── (positive / negative / stale)
+   ├── EDNS0 processing
+   ├── Load balancer → select upstream
+   ├── Forward via transport
+   ├── DNSSEC validation
+   ├── Cache response
+   └── Return to client
+```
 
-The core resolver lives in `dosev/resolver.py`.
+---
 
-- Forwards queries to upstream DNS servers over UDP, TCP, TLS, or HTTPS.
-- Supports DNS-over-HTTPS client behavior with HTTP/1.1, HTTP/2, and HTTP/3.
-- Implements EDNS0 and ECS handling, including payload capping.
-- Supports DNSSEC validation, auto-updating trust anchors, and pinned certificates.
-- Includes caching, rate limiting, blocklist enforcement, and rebind protection.
+## Core Components
 
-### Config
+### 1. `DNSResolver` (dosev/resolver.py)
 
-Configuration is handled in `dosev/config.py`.
+The heart of the system. It manages:
 
-- Loads defaults when no config file exists.
-- Reads server and resolver sections and normalizes values.
-- Supports upstream definitions with protocol-specific defaults.
-- Exposes secure listener options for DoT and DoH.
+- **Caches**: positive cache (TTL‑based), negative cache (NXDOMAIN/NODATA), and stale‑serve logic.
+- **Blocklists & Hosts**: exact‑match and suffix‑based domain filtering; static A/AAAA overrides.
+- **Upstream management**: health checks, load balancing (failover, round‑robin, weighted).
+- **DNSSEC**: validates responses using a trust anchor (bundled or IANA‑fetched); caches validation results.
+- **EDNS0**: parses client subnet and forwards it to upstreams.
+- **Rate limiting**: token‑bucket per client IP.
+- **Rebinding protection**: strips or blocks private IPs.
+- **Metrics**: collects request counts, errors, latency, and cache statistics.
 
-## Request flow
+**Key Methods**:
 
-1. The server receives a query via UDP/TCP/DoT/DoH.
-2. The server parses the raw DNS message and optionally applies local IPv6/blocklist checks.
-3. If the query is allowed, it calls `resolver.forward_dns_query()`.
-4. The resolver chooses an upstream transport based on config.
-5. The upstream response is received, sanitized, and returned to the server.
-6. The server sends the response back to the client.
+- `forward_dns_query(data: bytes) -> bytes` – the main entry point for processing a raw DNS query.
+- `_try_upstream(upstream, data) -> bytes` – sends a query to a single upstream, with retries.
+- `_wire_cache_get_valid(key) -> Optional[bytes]` – fetches a cached response, with stale‑serve logic.
+- `_dnssec_validate(qname, response) -> None` – validates DNSSEC signatures.
 
-## Deployment model
+### 2. Server Layer (dosev/server.py)
 
-- Run as a service behind proper privilege separation.
-- Use TLS certs when enabling DoT or DoH.
-- Keep upstream servers explicit in `config/dosev.conf`.
-- Enable metrics and logs for production monitoring.
+Provides listeners for:
+
+- **UDP**: `asyncio.DatagramProtocol`.
+- **TCP**: `asyncio.StreamReader` / `StreamWriter`.
+- **TLS (DoT)**: TCP with SSL context on port 853.
+- **HTTPS (DoH)**: HTTP/2 and HTTP/3 servers using `aiohttp` and `aioquic`.
+
+Each listener accepts a query, passes it to the resolver, and sends back the response.
+
+**Graceful Shutdown**: Signal handlers (SIGINT, SIGTERM) trigger a clean shutdown, closing all listeners and connection pools.
+
+### 3. Transports (client‑side)
+
+Each transport implements the `Transport` interface (from early design; now integrated into `DNSResolver` methods):
+
+- `_forward_udp()`
+- `_forward_tcp()`
+- `_forward_tls()`
+- `_forward_https1()`, `_forward_https2()`, `_forward_https3()`
+- `_forward_quic()`
+
+These handle connection pooling, timeouts, retries, and certificate pinning.
+
+### 4. Caching
+
+Two‑layer cache:
+
+- **DNS cache** (`_dns_cache`): stores parsed responses (used for upstream IP resolution).
+- **Wire cache** (`_wire_cache`): stores raw wire‑format responses for fast replay.
+
+Both support TTL expiration and size limits. The wire cache includes a `dnssec_validated` flag.
+
+### 5. Configuration (dosev/config.py)
+
+Loads an INI file and returns a flat dictionary with sensible defaults. Supports all sections documented in the configuration reference.
+
+### 6. Utilities (dosev/utils.py)
+
+- `fetch_blocklists()` – downloads remote blocklists using streaming HTTP.
+- Logging helpers.
+- Metrics (Prometheus) integration.
+
+---
+
+## Concurrency Model
+
+`dosev` uses `asyncio` for non‑blocking I/O. Each client connection is handled in its own coroutine; the resolver is stateless, so multiple queries can be processed concurrently.
+
+**Thread safety**: The resolver uses `asyncio.Lock` for mutable state (caches, blocklists, configuration). Connection pools also use locks.
+
+**Background tasks**:
+
+- Connection pool cleanup.
+- Blocklist refresh.
+- DNSSEC trust anchor update.
+- Upstream health checks.
+
+---
+
+## Security Considerations
+
+- **Privilege dropping**: After binding to privileged ports, the process drops to a non‑root user/group (Linux/Unix).
+- **Certificate pinning**: SHA‑256 pinning for TLS connections.
+- **Rebinding protection**: Prevents DNS rebinding attacks by filtering private IPs.
+- **Rate limiting**: Protects against DDoS.
+- **DNSSEC**: Validates response authenticity.
+- **chroot**: Optional jail for additional isolation.
+
+---
+
+## Performance Optimizations
+
+- **Asynchronous I/O**: All network operations are non‑blocking.
+- **Connection pooling**: Reuses TCP/TLS/HTTP/QUIC connections to reduce handshake overhead.
+- **Caching**: Reduces upstream load and latency.
+- **Optimistic caching**: Serves stale responses while refreshing in the background.
+- **Load balancing**: Distributes load across upstreams.
+- **uvloop**: Optional faster event loop (Unix).
+
+---
+
+## Extensibility
+
+The modular design makes it easy to add:
+
+- New transport protocols (e.g., DNSCrypt, ODoH).
+- Additional caching strategies.
+- Custom load‑balancing policies.
+- New metrics or logging backends.
+
+---
+
+## Dependencies
+
+| Library | Purpose |
+|---------|---------|
+| `dnspython` | DNS message parsing and construction. |
+| `aiohttp` | HTTP/1.1 and HTTP/2 client & server. |
+| `aioquic` | HTTP/3 and QUIC client & server. |
+| `httpx` | HTTP/2 client (optional fallback). |
+| `cachetools` | TTL cache (fallback to internal `AsyncTTLCache`). |
+| `prometheus-client` | Metrics exposition. |
+| `cryptography` | Certificate handling. |
+
+---
+
+## Testing
+
+- **Unit tests**: cover all core logic with mocked network calls.
+- **Integration tests**: (planned) test against real upstreams using a local stub server.
+- **CI**: runs on Linux, macOS, and Windows for Python 3.10–3.14.
+
+---
+
+## Future Directions
+
+- Full RFC 5011 trust anchor management.
+- DNSCrypt and ODoH client/server support.
+- Web‑based status dashboard.
+- More advanced EDNS0 options.
+- Enhanced load balancing with latency‑based routing.
