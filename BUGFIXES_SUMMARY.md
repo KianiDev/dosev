@@ -1,18 +1,19 @@
-# v1.4.0 (2026-07-08)
+# v1.5.0 (2026-07-08)
 
 ## Features
 
-- **HTTP/3 server**: New `dns_enable_http3` option to serve DNS over HTTPS using HTTP/3 (aioquic).
-- **DoQ connection pooling**: QUIC connections are reused across queries, reducing latency and handshake overhead.
-- **IPv6 stripping**: New `strip_ipv6_records` option to remove AAAA records from responses.
-- **Default config**: Removed deprecated `upstream_dns` and `protocol`; now uses `[upstreams]` section with `ip` and full comments.
+- **Load balancing strategies**: Added `parallel`, `random`, and `roundrobin` upstream selection strategies (in addition to existing `failover`).
+  - `parallel`: query all upstreams concurrently, return first success.
+  - `random`: pick a random upstream for each query.
+  - `roundrobin`: cycle through upstreams in order.
+- **Configuration**: New `load_balancing` option in `[advanced]` section.
 
 ## Bug Fixes
 
-- **DoQ**: Fixed `closed` attribute access and connection pooling logic.
-- **HTTP/3 tests**: Corrected mock setups to reliably test request handling.
+- **Parallel strategy**: Fixed `asyncio.wait()` usage to pass `Task` objects instead of bare coroutines (required for Python 3.14+).
+- **Tests**: Made `test_load_balancing_parallel` deterministic and fixed cache-related issues in `test_load_balancing_random` and `test_load_balancing_roundrobin`.
 
 ## Other
 
-- Documentation updated for all new features.
-- All 85 tests now pass on Windows, macOS, and Linux.
+- Documentation updated for all new strategies.
+- All 90 tests now pass on Windows, macOS, and Linux (Python 3.10–3.14).
