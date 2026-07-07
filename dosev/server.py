@@ -1,4 +1,4 @@
-# dosev/server.py – FINAL with HTTP/3 support, IPv6 stripping, and all fixes
+# dosev/server.py – FINAL with HTTP/3 support, IPv6 stripping, load balancing, and all fixes
 
 import asyncio
 import base64
@@ -241,6 +241,7 @@ async def reload_resolver(holder: ResolverHolder,
         pool_idle_timeout=config.get("pool_idle_timeout"),
         doh_version=config.get("doh_version"),
         doh_auto_cache_ttl=config.get("doh_auto_cache_ttl"),
+        load_balancing=config.get("load_balancing", "failover"),
         bootstrap=config.get("bootstrap"),
     )
 
@@ -553,6 +554,7 @@ async def run_server(listen_ip: str, listen_port: int,
                      pool_idle_timeout: float = 60.0,
                      doh_version: str = 'auto',
                      doh_auto_cache_ttl: int = 3600,
+                     load_balancing: str = 'failover',
                      bootstrap: Optional[Dict[str, Any]] = None,
                      dns_enable_http3: bool = False) -> None:
     """Start the DNS server with full protocol support (UDP, TCP, TLS, DoH, HTTP/3)."""
@@ -592,6 +594,7 @@ async def run_server(listen_ip: str, listen_port: int,
         pool_idle_timeout=pool_idle_timeout,
         doh_version=doh_version,
         doh_auto_cache_ttl=doh_auto_cache_ttl,
+        load_balancing=load_balancing,
         bootstrap=bootstrap,
     )
 
@@ -779,6 +782,7 @@ def run_server_sync(listen_ip: str, listen_port: int,
                     pool_idle_timeout: float = 60.0,
                     doh_version: str = 'auto',
                     doh_auto_cache_ttl: int = 3600,
+                    load_balancing: str = 'failover',
                     bootstrap: Optional[Dict[str, Any]] = None,
                     dns_enable_http3: bool = False) -> None:
     asyncio.run(run_server(
@@ -832,6 +836,7 @@ def run_server_sync(listen_ip: str, listen_port: int,
         pool_idle_timeout=pool_idle_timeout,
         doh_version=doh_version,
         doh_auto_cache_ttl=doh_auto_cache_ttl,
+        load_balancing=load_balancing,
         bootstrap=bootstrap,
         dns_enable_http3=dns_enable_http3,
     ))

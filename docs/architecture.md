@@ -34,7 +34,7 @@ Resolver.forward_dns_query()
    ├── Cache hit?
    │       └── (positive / negative / stale)
    ├── EDNS0 processing
-   ├── Upstream selection (failover – try each in order until one succeeds)
+   ├── Upstream selection (configurable: failover, parallel, random, roundrobin)
    ├── Forward via transport (UDP/TCP/TLS/DoH/DoQ)
    ├── DNSSEC validation
    ├── Cache response
@@ -51,7 +51,7 @@ The heart of the system. It manages:
 
 - **Caches**: positive cache (TTL‑based), negative cache (NXDOMAIN/NODATA), and stale‑serve logic.
 - **Blocklists & Hosts**: exact‑match and suffix‑based domain filtering; static A/AAAA overrides.
-- **Upstream management**: failover – tries upstreams in order until one responds.
+- **Upstream management**: supports `failover`, `parallel`, `random`, and `roundrobin` strategies; configured via `load_balancing` in the config.
 - **DNSSEC**: validates responses using a trust anchor (bundled or IANA‑fetched); caches validation results.
 - **EDNS0**: parses client subnet and forwards it to upstreams.
 - **Rate limiting**: token‑bucket per client IP.

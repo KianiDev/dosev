@@ -41,7 +41,7 @@ For detailed instructions, see the [Quick Start Guide](docs/quickstart.md).
 | **Blocklists** | Filter domains using local files or remote lists (automatically refreshed). |
 | **Hosts overrides** | Custom A/AAAA records for local name resolution. |
 | **EDNS0 & Client Subnet** | Pass client subnet to upstreams for geo‑optimised responses. |
-| **Upstream failover** | Try upstreams in order; fall back to the next on failure. |
+| **Upstream selection** | Multiple strategies: `failover` (try in order), `parallel` (query all, return first success), `random`, `roundrobin`. |
 | **Rate limiting** | Token‑bucket limiter per client IP. |
 | **Rebinding protection** | Strip or block private IP addresses from responses. |
 | **Metrics** | Prometheus‑compatible metrics (requests, errors, latency). |

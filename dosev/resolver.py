@@ -1,6 +1,7 @@
 # dosev/resolver.py – final production version with DoH URL parsing
 # RFC compliance fixes applied: EDNS0, DNSSEC unsigned, negative cache TTL, TC bit
 # Added: DoQ connection pooling, IPv6 stripping, HTTP/3 client (already present)
+# Added: Upstream selection strategies (failover, parallel, random, roundrobin)
 
 import asyncio
 import logging
@@ -303,6 +304,7 @@ class DNSResolver:
       - Automatic trust anchor management (bundled root key + optional IANA fetch)
       - DoH URL parsing (full https://host/path support)
       - IPv6 stripping (strip AAAA records from responses)
+      - Upstream selection strategies: failover, parallel, random, roundrobin
     """
 
     def __init__(self,
@@ -339,6 +341,7 @@ class DNSResolver:
                   pool_idle_timeout: float = 60.0,
                   doh_version: str = 'auto',
                   doh_auto_cache_ttl: int = 3600,
+                  load_balancing: str = 'failover',
                   bootstrap: Optional[Dict[str, Any]] = None) -> None:
         self.upstreams: List[Dict[str, Any]] = upstreams or []
 
@@ -470,6 +473,10 @@ class DNSResolver:
         self.doh_auto_cache_ttl: int = doh_auto_cache_ttl
         self._doh_auto_cache: Dict[str, Tuple[str, float]] = {}
         self._doh_auto_lock: asyncio.Lock = asyncio.Lock()
+
+        # Load‑balancing settings
+        self.load_balancing: str = load_balancing
+        self._rr_index: int = 0  # for round‑robin
 
         if self.dnssec_enabled:
             self._load_trust_anchors()
@@ -1284,7 +1291,7 @@ class DNSResolver:
         if cached is not None:
             resp_bytes, dnssec_validated = cached
             self.logger.debug("wire-cache hit %s", key)
-            
+
             if self.dnssec_enabled and not dnssec_validated:
                 self.logger.debug("cache entry lacks DNSSEC validation, revalidating...")
                 try:
@@ -1322,7 +1329,144 @@ class DNSResolver:
             }]
 
         last_exc = None
-        for upstream in upstream_list:
+
+        # ---------- Load balancing strategy ----------
+        strategy = self.load_balancing
+
+        if strategy == 'failover':
+            # Sequential failover: try each upstream in order
+            for upstream in upstream_list:
+                try:
+                    resp = await self._try_upstream(upstream, data)
+                    if self.metrics_enabled and self._metrics:
+                        try:
+                            self._metrics['requests_total'].labels(proto=upstream['protocol']).inc()
+                        except Exception:
+                            pass
+                    dnssec_ok = False
+                    if self.dnssec_enabled and qname:
+                        try:
+                            secure, insecure = await self._dnssec_validate(qname, resp, dnssec_requested)
+                            if secure:
+                                dnssec_ok = True
+                            else:
+                                dnssec_ok = False
+                        except Exception as e:
+                            self.logger.warning("DNSSEC validation failed for %s: %s", qname, e)
+                            raise
+                    if self.rebind_protection_enabled:
+                        resp = self._apply_rebind_protection(resp)
+                        if resp is None:
+                            return self._make_nxdomain_response(data)
+                    if self.strip_ipv6_records:
+                        resp = self._strip_ipv6_records(resp)
+                    if self._is_negative_response(resp):
+                        ttl = self._extract_soa_minimum(resp)
+                        if ttl is None:
+                            ttl = self.negative_cache_ttl
+                        async with self._lock:
+                            await self._wire_cache_delete(key)
+                            await self._negative_cache_set(key, resp, ttl=ttl)
+                        return resp
+                    ttl = self._extract_min_ttl(resp)
+                    if ttl <= 0:
+                        ttl = 30
+                    expiry = time.time() + ttl
+                    stale_until = expiry + self.stale_max_age if self.optimistic_cache_enabled else expiry
+                    val = (resp, expiry, data, stale_until, dnssec_ok)
+                    async with self._lock:
+                        await self._negative_cache_delete(key)
+                        await self._wire_cache_set(key, val)
+                    return resp
+                except Exception as e:
+                    last_exc = e
+                    self.logger.debug("upstream %s failed: %s", upstream.get('address'), e)
+                    continue
+            raise last_exc or Exception("All upstreams failed")
+
+        elif strategy == 'parallel':
+            # Query all upstreams concurrently, return first success
+            tasks = [self._try_upstream(upstream, data) for upstream in upstream_list]
+            pending = set(tasks)
+            try:
+                while pending:
+                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    for task in done:
+                        if not task.cancelled():
+                            try:
+                                result = task.result()
+                                # We have a successful response
+                                resp = result
+                                # Process and cache response (same as failover above)
+                                if self.metrics_enabled and self._metrics:
+                                    try:
+                                        self._metrics['requests_total'].labels(proto='parallel').inc()
+                                    except Exception:
+                                        pass
+                                dnssec_ok = False
+                                if self.dnssec_enabled and qname:
+                                    try:
+                                        secure, insecure = await self._dnssec_validate(qname, resp, dnssec_requested)
+                                        if secure:
+                                            dnssec_ok = True
+                                        else:
+                                            dnssec_ok = False
+                                    except Exception as e:
+                                        self.logger.warning("DNSSEC validation failed for %s: %s", qname, e)
+                                        # This upstream gave bogus response, fail it
+                                        raise
+                                if self.rebind_protection_enabled:
+                                    resp = self._apply_rebind_protection(resp)
+                                    if resp is None:
+                                        return self._make_nxdomain_response(data)
+                                if self.strip_ipv6_records:
+                                    resp = self._strip_ipv6_records(resp)
+                                if self._is_negative_response(resp):
+                                    ttl = self._extract_soa_minimum(resp)
+                                    if ttl is None:
+                                        ttl = self.negative_cache_ttl
+                                    async with self._lock:
+                                        await self._wire_cache_delete(key)
+                                        await self._negative_cache_set(key, resp, ttl=ttl)
+                                    return resp
+                                ttl = self._extract_min_ttl(resp)
+                                if ttl <= 0:
+                                    ttl = 30
+                                expiry = time.time() + ttl
+                                stale_until = expiry + self.stale_max_age if self.optimistic_cache_enabled else expiry
+                                val = (resp, expiry, data, stale_until, dnssec_ok)
+                                async with self._lock:
+                                    await self._negative_cache_delete(key)
+                                    await self._wire_cache_set(key, val)
+                                return resp
+                            except Exception as e:
+                                # This task failed; cancel remaining tasks and re‑raise if all fail
+                                if not pending:
+                                    raise e
+                                continue
+                    # If no task succeeded and we've exhausted pending, break
+                    break
+                # If we exit the loop without returning, all tasks failed
+                if pending:
+                    # Cancel remaining tasks
+                    for task in pending:
+                        task.cancel()
+                    # Wait for cancellation
+                    await asyncio.gather(*pending, return_exceptions=True)
+                raise last_exc or Exception("All upstreams failed in parallel")
+            except Exception as e:
+                # Cancel remaining tasks on exception
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                # Wait for cancellation
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise e
+
+        elif strategy == 'random':
+            # Pick a random upstream
+            import random
+            upstream = random.choice(upstream_list)
             try:
                 resp = await self._try_upstream(upstream, data)
                 if self.metrics_enabled and self._metrics:
@@ -1345,7 +1489,6 @@ class DNSResolver:
                     resp = self._apply_rebind_protection(resp)
                     if resp is None:
                         return self._make_nxdomain_response(data)
-                # Apply IPv6 stripping
                 if self.strip_ipv6_records:
                     resp = self._strip_ipv6_records(resp)
                 if self._is_negative_response(resp):
@@ -1368,11 +1511,63 @@ class DNSResolver:
                 return resp
             except Exception as e:
                 last_exc = e
-                self.logger.debug("upstream %s failed: %s", upstream.get('address'), e)
-                continue
+                self.logger.debug("random upstream %s failed: %s", upstream.get('address'), e)
+                raise last_exc
 
-        self.logger.error("all upstreams failed")
-        raise last_exc or Exception("All upstreams exhausted")
+        elif strategy == 'roundrobin':
+            # Round‑robin: cycle through upstreams
+            idx = self._rr_index % len(upstream_list)
+            upstream = upstream_list[idx]
+            self._rr_index += 1
+            try:
+                resp = await self._try_upstream(upstream, data)
+                if self.metrics_enabled and self._metrics:
+                    try:
+                        self._metrics['requests_total'].labels(proto=upstream['protocol']).inc()
+                    except Exception:
+                        pass
+                dnssec_ok = False
+                if self.dnssec_enabled and qname:
+                    try:
+                        secure, insecure = await self._dnssec_validate(qname, resp, dnssec_requested)
+                        if secure:
+                            dnssec_ok = True
+                        else:
+                            dnssec_ok = False
+                    except Exception as e:
+                        self.logger.warning("DNSSEC validation failed for %s: %s", qname, e)
+                        raise
+                if self.rebind_protection_enabled:
+                    resp = self._apply_rebind_protection(resp)
+                    if resp is None:
+                        return self._make_nxdomain_response(data)
+                if self.strip_ipv6_records:
+                    resp = self._strip_ipv6_records(resp)
+                if self._is_negative_response(resp):
+                    ttl = self._extract_soa_minimum(resp)
+                    if ttl is None:
+                        ttl = self.negative_cache_ttl
+                    async with self._lock:
+                        await self._wire_cache_delete(key)
+                        await self._negative_cache_set(key, resp, ttl=ttl)
+                    return resp
+                ttl = self._extract_min_ttl(resp)
+                if ttl <= 0:
+                    ttl = 30
+                expiry = time.time() + ttl
+                stale_until = expiry + self.stale_max_age if self.optimistic_cache_enabled else expiry
+                val = (resp, expiry, data, stale_until, dnssec_ok)
+                async with self._lock:
+                    await self._negative_cache_delete(key)
+                    await self._wire_cache_set(key, val)
+                return resp
+            except Exception as e:
+                last_exc = e
+                self.logger.debug("roundrobin upstream %s failed: %s", upstream.get('address'), e)
+                raise last_exc
+
+        else:
+            raise ValueError(f"Unknown load balancing strategy: {strategy}")
 
     # --- forwarding implementations ---
 
@@ -1432,7 +1627,7 @@ class DNSResolver:
                 except Exception:
                     pass
                 pooled = None
-        
+
         if not pooled:
             resolved = await self._resolve_upstream_ip(host, ip_override)
             if self.disable_ipv6 and self._is_ipv6_address(resolved):
@@ -1923,6 +2118,7 @@ class DNSResolver:
             await self._quic_pool.put(key, client)
 
         return resp
+
     def _get_quic_cert_der(self, client: Any) -> Optional[bytes]:
         try:
             if hasattr(client, 'get_peer_certificate'):
@@ -2392,6 +2588,7 @@ class DNSResolver:
                             pool_idle_timeout: Optional[float] = None,
                             doh_version: Optional[str] = None,
                             doh_auto_cache_ttl: Optional[int] = None,
+                            load_balancing: Optional[str] = None,
                             bootstrap: Optional[Dict[str, Any]] = None) -> None:
         async with self._config_lock:
             if verbose is not None:
@@ -2487,6 +2684,10 @@ class DNSResolver:
                 self.doh_version = doh_version
             if doh_auto_cache_ttl is not None:
                 self.doh_auto_cache_ttl = doh_auto_cache_ttl
+            if load_balancing is not None:
+                self.load_balancing = load_balancing.lower()
+                if self.load_balancing not in ('failover', 'parallel', 'random', 'roundrobin'):
+                    self.load_balancing = 'failover'
             if bootstrap is not None:
                 self.bootstrap_servers = bootstrap.get('servers', [])
                 self.bootstrap_timeout = bootstrap.get('timeout', 2.0)
@@ -2494,9 +2695,9 @@ class DNSResolver:
 
             self.logger.info("DNSResolver configuration updated: "
                              "disable_ipv6=%s, strip_ipv6_records=%s, verbose=%s, rate_limit=%s/%s, optimistic_cache=%s, "
-                             "rebind_protection=%s/%s, doh_version=%s, bootstrap_servers=%s",
+                             "rebind_protection=%s/%s, doh_version=%s, load_balancing=%s, bootstrap_servers=%s",
                              self.disable_ipv6, self.strip_ipv6_records, self.verbose,
                              self.rate_limit_rps, self.rate_limit_burst,
                              self.optimistic_cache_enabled,
                              self.rebind_protection_enabled, self.rebind_action,
-                             self.doh_version, self.bootstrap_servers)
+                             self.doh_version, self.load_balancing, self.bootstrap_servers)

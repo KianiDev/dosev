@@ -45,6 +45,9 @@ dns_doh_cert_file =
 dns_doh_key_file = 
 dns_doh_path = /dns-query
 
+# ---------- DNS over HTTPS (HTTP/3) server listener ----------
+dns_enable_http3 = false
+
 # If true, strip all AAAA records (IPv6) from responses.
 strip_ipv6_records = false
 
@@ -92,6 +95,13 @@ pool_idle_timeout = 60.0
 doh_version = auto
 # TTL for caching the DoH version auto‑detection result.
 doh_auto_cache_ttl = 3600
+
+# Upstream selection strategy: failover, parallel, random, roundrobin.
+# - failover: try upstreams in order until one succeeds.
+# - parallel: query all upstreams concurrently, return the first successful response.
+# - random: pick a random upstream for each query.
+# - roundrobin: cycle through upstreams in order.
+load_balancing = failover
 
 # ============================================================================
 # SECURITY – DNSSEC, certificate pinning, rebind protection, privilege drop
@@ -264,10 +274,14 @@ def _validate_and_warn(config: Dict[str, Any]) -> None:
     if config.get('doh_version', 'auto') not in {'auto', '1.1', '2', '3'}:
         raise ValueError('doh_version must be auto, 1.1, 2, or 3')
 
+    load_balancing = config.get('load_balancing', 'failover')
+    if load_balancing not in ('failover', 'parallel', 'random', 'roundrobin'):
+        raise ValueError('load_balancing must be failover, parallel, random, or roundrobin')
+
 def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     config = configparser.ConfigParser()
     if not os.path.exists(path):
-        # Return defaults without upstream_dns/protocol – they are now in upstreams.
+        # Return defaults
         return {
             'listen_ip': '0.0.0.0',
             'listen_port': 53,
@@ -296,7 +310,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
             'upstream_doh_timeout': 5.0,
             'rate_limit_rps': 0.0,
             'rate_limit_burst': 0.0,
-            'upstreams': [],  # will be populated if needed
+            'upstreams': [],
             'optimistic_cache_enabled': False,
             'optimistic_stale_max_age': 86400,
             'optimistic_stale_response_ttl': 30,
@@ -309,6 +323,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
             'pool_idle_timeout': 60.0,
             'doh_version': 'auto',
             'doh_auto_cache_ttl': 3600,
+            'load_balancing': 'failover',
             'bootstrap': {'servers': ['1.1.1.1:53', '8.8.8.8:53'], 'timeout': 2.0, 'retries': 2},
             'blocklists': {
                 'enabled': False,
@@ -326,7 +341,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     listen_ip = config.get('server', 'listen_ip', fallback='0.0.0.0')
     listen_port = config.getint('server', 'listen_port', fallback=53)
 
-    # Resolver (ignore upstream_dns and protocol if present for backwards compat)
+    # Resolver
     verbose = config.getboolean('resolver', 'verbose', fallback=False)
     disable_ipv6 = config.getboolean('resolver', 'disable_ipv6', fallback=False)
     dns_ecs_enabled = config.getboolean('resolver', 'dns_ecs_enabled', fallback=True)
@@ -367,6 +382,9 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     if doh_version not in ('auto', '1.1', '2', '3'):
         doh_version = 'auto'
     doh_auto_cache_ttl = config.getint('advanced', 'doh_auto_cache_ttl', fallback=3600)
+    load_balancing = config.get('advanced', 'load_balancing', fallback='failover').lower()
+    if load_balancing not in ('failover', 'parallel', 'random', 'roundrobin'):
+        load_balancing = 'failover'
 
     # Security
     dnssec_enabled = config.getboolean('security', 'dnssec_enabled', fallback=False)
@@ -524,6 +542,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
         'pool_idle_timeout': pool_idle_timeout,
         'doh_version': doh_version,
         'doh_auto_cache_ttl': doh_auto_cache_ttl,
+        'load_balancing': load_balancing,
         'bootstrap': bootstrap,
         'blocklists': blocklists,
     }

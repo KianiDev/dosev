@@ -41,6 +41,7 @@ def main() -> None:
         verbose=config.get("verbose", False),
         blocklists=config.get("blocklists"),
         disable_ipv6=config.get("disable_ipv6", False),
+        strip_ipv6_records=config.get("strip_ipv6_records", False),
         dns_cache_ttl=config.get("dns_cache_ttl", 300),
         dns_cache_max_size=config.get("dns_cache_max_size", 1024),
         dns_negative_cache_ttl=config.get("dns_negative_cache_ttl", 5),
@@ -86,6 +87,7 @@ def main() -> None:
         pool_idle_timeout=config.get("pool_idle_timeout", 60.0),
         doh_version=config.get("doh_version", "auto"),
         doh_auto_cache_ttl=config.get("doh_auto_cache_ttl", 3600),
+        load_balancing=config.get("load_balancing", "failover"),
         bootstrap=config.get("bootstrap", {"servers": [], "timeout": 2.0, "retries": 2}),
     )
 

@@ -74,6 +74,7 @@ All upstreams are now defined in the `[upstreams]` section (see below).
 | `pool_idle_timeout` | float | `60.0` | Idle timeout (seconds) for pooled connections. |
 | `doh_version` | string | `auto` | DoH version: `1.1`, `2`, `3`, or `auto`. |
 | `doh_auto_cache_ttl` | int | `3600` | Cache TTL for auto‑detected DoH versions. |
+| `load_balancing` | string | `failover` | Upstream selection strategy: `failover` (try in order), `parallel` (query all, return first success), `random` (pick random), `roundrobin` (cycle through). |
 
 ---
 
@@ -160,7 +161,11 @@ Each upstream section supports:
 | `doh_version` | string | `auto` | `auto`, `1.1`, `2`, `3`. |
 | `ip` | string | `""` | Optional fixed IP address. If set, DNS resolution is skipped entirely. |
 
-**Upstream selection**: Currently only **failover** is implemented – the first upstream in the list is always tried first; if it fails, the next is tried, and so on. There are no health checks or load balancing algorithms (round‑robin, weighted) implemented yet.
+**Upstream selection**: The `load_balancing` option in `[advanced]` controls the strategy:
+- `failover` – try upstreams in the order they appear; fall back to the next on failure.
+- `parallel` – send the query to **all** upstreams concurrently and return the first successful response.
+- `random` – pick a random upstream for each query.
+- `roundrobin` – cycle through the list in order.
 
 ---
 
