@@ -1,19 +1,30 @@
-# v1.5.0 (2026-07-08)
+# [1.6.0] – 2026-07-08
 
-## Features
+## Added
 
-- **Load balancing strategies**: Added `parallel`, `random`, and `roundrobin` upstream selection strategies (in addition to existing `failover`).
-  - `parallel`: query all upstreams concurrently, return first success.
-  - `random`: pick a random upstream for each query.
-  - `roundrobin`: cycle through upstreams in order.
-- **Configuration**: New `load_balancing` option in `[advanced]` section.
+- **TCP fallback** – when a UDP response has the TC (truncation) bit set, dosev now automatically retries the same query over TCP and returns the full response. Enabled by default, configurable via `tcp_fallback_enabled` in the `[advanced]` section.
+- **Upstream health checks** – periodic health checks with circuit‑breaker logic. Upstreams that fail consecutive checks are marked unhealthy and skipped during query routing. They auto‑recover after successful checks. Configurable via the new `[health]` section:
+  - `enabled` – enable/disable
+  - `interval` – check frequency
+  - `timeout` – per‑check timeout
+  - `unhealthy_threshold` – failures to mark unhealthy
+  - `healthy_threshold` – successes to mark healthy again
+  - `cooldown` – wait time before retrying unhealthy upstreams
+  - `domain` – custom domain for health check queries (defaults to `.` for root SOA)
 
-## Bug Fixes
+## Fixed
 
-- **Parallel strategy**: Fixed `asyncio.wait()` usage to pass `Task` objects instead of bare coroutines (required for Python 3.14+).
-- **Tests**: Made `test_load_balancing_parallel` deterministic and fixed cache-related issues in `test_load_balancing_random` and `test_load_balancing_roundrobin`.
+- **Health check task** – now properly started only when an event loop is running (resolver no longer starts background tasks in `__init__`).
+- **`_fetch_root_trust_anchor_from_iana`** – removed incorrect `@staticmethod` decorator that caused `self` reference errors.
+- **`_get_healthy_upstreams`** – now correctly declared as `async` and awaited.
 
-## Other
+## Documentation
 
-- Documentation updated for all new strategies.
-- All 90 tests now pass on Windows, macOS, and Linux (Python 3.10–3.14).
+- Added `[health]` section to `config-reference.md`, `architecture.md`, and the default `dosev.conf` template.
+- Added `tcp_fallback_enabled` to `[advanced]` section documentation.
+
+## Testing
+
+- New test suite: `test_health_checks.py` (8 tests).
+- New test suite: `test_tcp_fallback.py` (4 tests).
+- All 101 tests pass on Windows, macOS, and Linux (Python 3.10–3.14).
