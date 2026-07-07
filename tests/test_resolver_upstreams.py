@@ -134,6 +134,20 @@ async def test_forward_quic_uses_ip_override():
     }
     data = dns.message.make_query("test.com", "A").to_wire()
 
+    # We'll mock the _forward_quic entirely to avoid real connection logic
+    with patch.object(resolver, "_forward_quic", new=AsyncMock(return_value=b"dummy_response")) as mock_forward:
+        # We still want to verify that _resolve_upstream_ip is called with ip_override
+        with patch.object(resolver, "_resolve_upstream_ip") as mock_resolve:
+            mock_resolve.return_value = "192.0.2.1"
+
+            # The actual call to forward_dns_query will call _try_upstream, which calls _forward_quic.
+            # But we are not testing the whole flow; we can directly call _forward_quic.
+            # However, to test the ip_override, we need to ensure that _resolve_upstream_ip is called
+            # with the correct arguments. Since we mocked _forward_quic, we can't test that.
+            # So we'll test _forward_quic's logic by patching the connect and checking the call.
+
+    # Actually, we want to test that _forward_quic calls _resolve_upstream_ip with ip_override.
+    # So we can't mock _forward_quic entirely. Instead, we mock the connect and wait_connected.
     with patch.object(resolver, "_resolve_upstream_ip") as mock_resolve:
         mock_resolve.return_value = "192.0.2.1"
         with patch("aioquic.asyncio.client.connect") as mock_connect:
