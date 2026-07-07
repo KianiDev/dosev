@@ -5,6 +5,7 @@ Advanced tests for dosev.resolver – mocks external dependencies.
 import asyncio
 import os
 import tempfile
+import time  # <-- added
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import dns.message
@@ -14,7 +15,7 @@ import dns.rrset
 import dns.rdataclass
 import pytest
 
-from dosev.resolver import DNSResolver, RateLimiter, AsyncTTLCache
+from dosev.resolver import DNSResolver, RateLimiter, AsyncTTLCache, ConnectionPool  # <-- added ConnectionPool
 
 
 # ---------- Fixtures ----------

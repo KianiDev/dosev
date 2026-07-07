@@ -478,21 +478,17 @@ class DNSResolver:
     def _parse_upstream_url(self) -> None:
         """Parse the upstream_dns URL for DoH."""
         url = self.upstream_dns.strip()
-        # If it doesn't start with http:// or https://, assume https://
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
         try:
             parsed = urlparse(url)
             self._doh_host = parsed.hostname
             self._doh_port = parsed.port or 443
-            # Path: if empty, use '/dns-query'
             path = parsed.path or '/dns-query'
-            # If path ends with '/', remove it? Keep as is.
             self._doh_path = path
             self.logger.debug("Parsed DoH URL: host=%s, port=%s, path=%s", self._doh_host, self._doh_port, self._doh_path)
         except Exception as e:
             self.logger.error("Failed to parse DoH URL '%s': %s", self.upstream_dns, e)
-            # Fallback to raw values
             self._doh_host = self.upstream_dns
             self._doh_port = 443
             self._doh_path = '/dns-query'
@@ -688,7 +684,7 @@ class DNSResolver:
     async def _negative_cache_set(self, key: Tuple[str, int, str], value: bytes, ttl: Optional[int] = None) -> None:
         try:
             if self._cache_is_sync:
-                # TTLCache doesn't support per-item TTL; we'll store with global TTL.
+                # TTLCache does not support per-item TTL, but we can still store it.
                 self._negative_cache[key] = value
             else:
                 await self._negative_cache.set(key, value, ttl=ttl)
@@ -730,9 +726,7 @@ class DNSResolver:
             if self.upstreams:
                 upstream_list = self.upstreams
             else:
-                # Build default upstream list based on protocol
                 if self.protocol == 'https' and self._doh_host:
-                    # Use parsed DoH values
                     host = self._doh_host
                     port = self._doh_port or 443
                     path = self._doh_path or '/dns-query'
@@ -744,7 +738,6 @@ class DNSResolver:
                         'path': path,
                     }]
                 else:
-                    # Use protocol-specific default port for other protocols
                     if self.protocol == 'tls':
                         default_port = 853
                     elif self.protocol == 'https':
@@ -768,7 +761,7 @@ class DNSResolver:
                                 if secure:
                                     dnssec_ok = True
                                 else:
-                                    dnssec_ok = False  # unsigned, but acceptable
+                                    dnssec_ok = False
                             except Exception as e:
                                 self.logger.warning("DNSSEC validation failed for stale refresh %s: %s", key, e)
                                 continue
@@ -821,7 +814,6 @@ class DNSResolver:
 
     @staticmethod
     def _set_query_id(response_bytes: bytes, new_id: int) -> bytes:
-        """Replace the DNS message ID (first two bytes) with a new ID."""
         if len(response_bytes) < 2:
             return response_bytes
         return new_id.to_bytes(2, 'big') + response_bytes[2:]
@@ -959,7 +951,6 @@ class DNSResolver:
         anchors: Dict[dns.name.Name, dns.rrset.RRset] = {}
 
         if self.trust_anchors is None:
-            # Use the bundled default root key.
             try:
                 parts = DEFAULT_ROOT_DNSKEY.split()
                 name = parts[0]
@@ -1321,7 +1312,6 @@ class DNSResolver:
                 try:
                     secure, insecure = await self._dnssec_validate(qname, resp_bytes, dnssec_requested)
                     if secure or insecure:
-                        # Both are acceptable – we can mark as validated (secure or insecure)
                         async with self._lock:
                             entry = await self._wire_cache_get(key)
                             if entry is not None:
@@ -1330,7 +1320,6 @@ class DNSResolver:
                                 await self._wire_cache_set(key, new_val)
                         dnssec_validated = True
                 except Exception as e:
-                    # Bogus – treat as cache miss
                     self.logger.warning("DNSSEC revalidation failed for %s, treating as cache miss", key)
                     async with self._lock:
                         await self._wire_cache_delete(key)
@@ -1349,7 +1338,6 @@ class DNSResolver:
                 upstream_list = list(self.upstreams)
             else:
                 if self.protocol == 'https' and self._doh_host:
-                    # Use parsed DoH values
                     host = self._doh_host
                     port = self._doh_port or 443
                     path = self._doh_path or '/dns-query'
@@ -1361,7 +1349,6 @@ class DNSResolver:
                         'path': path,
                     }]
                 else:
-                    # Use protocol-specific default port for other protocols
                     if self.protocol == 'tls':
                         default_port = 853
                     elif self.protocol == 'https':
@@ -1389,10 +1376,8 @@ class DNSResolver:
                         if secure:
                             dnssec_ok = True
                         else:
-                            # insecure (unsigned) – AD=0
                             dnssec_ok = False
                     except Exception as e:
-                        # bogus – fail this upstream
                         self.logger.warning("DNSSEC validation failed for %s: %s", qname, e)
                         raise
                 if self.rebind_protection_enabled:
@@ -1400,7 +1385,6 @@ class DNSResolver:
                     if resp is None:
                         return self._make_nxdomain_response(data)
                 if self._is_negative_response(resp):
-                    # Extract SOA MINIMUM for negative cache TTL
                     ttl = self._extract_soa_minimum(resp)
                     if ttl is None:
                         ttl = self.negative_cache_ttl
@@ -1592,14 +1576,12 @@ class DNSResolver:
 
     async def _forward_https(self, data: bytes, upstream: Optional[Dict[str, Any]] = None) -> bytes:
         if upstream is None:
-            # Use parsed DoH values if available
             if self._doh_host:
                 host = self._doh_host
                 port = self._doh_port or 443
                 path = self._doh_path or '/dns-query'
                 hostname = self._doh_host
             else:
-                # Fallback to splitting the raw upstream_dns
                 host, port = self._split_hostport(self.upstream_dns, default_port=443)
                 path = "/dns-query"
                 hostname = host
@@ -2209,7 +2191,6 @@ class DNSResolver:
             return response_bytes
 
     def _extract_soa_minimum(self, response: bytes) -> Optional[int]:
-        """Extract the SOA MINIMUM field from the authority section of a negative response."""
         try:
             msg = dns.message.from_wire(response)
             for rrset in msg.authority:
@@ -2221,12 +2202,11 @@ class DNSResolver:
         return None
 
     def _set_tc_bit(self, response_bytes: bytes) -> bytes:
-        """Set the TC flag in the DNS header."""
         if len(response_bytes) < 4:
             return response_bytes
         header = bytearray(response_bytes)
         flags = int.from_bytes(header[2:4], 'big')
-        flags |= 0x0200  # set TC bit
+        flags |= 0x0200
         header[2:4] = flags.to_bytes(2, 'big')
         return bytes(header)
 
@@ -2297,7 +2277,6 @@ class DNSResolver:
             raise
 
     def _dnssec_requested(self, query_data: bytes) -> bool:
-        """Check if the DO bit is set in the EDNS0 OPT record."""
         if not query_data or len(query_data) < 12 or not _HAS_DNSPY:
             return False
         try:
@@ -2318,7 +2297,6 @@ class DNSResolver:
         else:
             tid = int.from_bytes(query_data[0:2], 'big')
             req_flags = int.from_bytes(query_data[2:4], 'big')
-            # Preserve EDNS0; do not cap payload
             try:
                 qpart, qdcount, qend = self._extract_question_section(query_data)
                 extra, arcount = self._extract_additional_section(query_data, qend)
@@ -2346,7 +2324,6 @@ class DNSResolver:
 
         tid = int.from_bytes(query_data[0:2], 'big')
         try:
-            # Preserve EDNS0 as is
             qpart, qdcount, qend = self._extract_question_section(query_data)
             extra, arcount = self._extract_additional_section(query_data, qend)
         except Exception:
