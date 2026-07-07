@@ -47,9 +47,11 @@ async def test_load_balancing_parallel(resolver):
     call_order = []
     async def fake_try_upstream(upstream, data):
         call_order.append(upstream["address"])
-        await asyncio.sleep(0.05)  # simulate work
         if upstream["address"] == "upstream1":
+            # Return immediately – guarantees it finishes first
             return b"success1"
+        # Delay the others so they complete later
+        await asyncio.sleep(0.1)
         return b"success2"
     resolver._try_upstream = fake_try_upstream
 
@@ -57,6 +59,7 @@ async def test_load_balancing_parallel(resolver):
     resolver.load_balancing = "parallel"
     response = await resolver.forward_dns_query(query)
     assert response == b"success1"
+    # All upstreams should have been called
     assert set(call_order) == {"upstream1", "upstream2", "upstream3"}
 
 
