@@ -2,7 +2,6 @@
 
 [![CI](https://github.com/KianiDev/dosev/actions/workflows/ci.yml/badge.svg)](https://github.com/KianiDev/dosev/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/dosev)](https://pypi.org/project/dosev/)
-[![Python versions](https://img.shields.io/pypi/pyversions/dosev)](https://pypi.org/project/dosev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **dosev** is a high‑performance, asynchronous DNS resolver and forwarding server that speaks **all major DNS protocols** – both as a client and as a server.
