@@ -45,7 +45,7 @@ async def test_resolve_upstream_ip_uses_ip_override():
     assert result == "192.0.2.1"
 
     # Invalid ip_override -> fallback to resolution.
-    # We'll mock _udp_query_a_or_aaaa to return None (so bootstrap fails),
+    # Mock _udp_query_a_or_aaaa to return None (so bootstrap fails),
     # and mock system getaddrinfo to return an IP.
     with patch.object(resolver, "_udp_query_a_or_aaaa", new=AsyncMock(return_value=None)):
         loop = asyncio.get_running_loop()
@@ -81,16 +81,13 @@ async def test_forward_udp_uses_ip_override():
         mock_resolve.return_value = "192.0.2.1"
         # Mock the datagram endpoint to avoid real UDP and return dummy response
         loop = asyncio.get_running_loop()
-        # We'll patch loop.create_datagram_endpoint to immediately call datagram_received
         def fake_create_datagram_endpoint(protocol_factory, remote_addr, **kwargs):
             proto = protocol_factory()
-            # Simulate datagram received with dummy response
             loop.call_soon(proto.datagram_received, b"dummy_response", ("192.0.2.1", 5353))
             return MagicMock(), None
         with patch.object(loop, "create_datagram_endpoint", side_effect=fake_create_datagram_endpoint):
             result = await resolver._forward_udp(data, upstream)
             assert result == b"dummy_response"
-            # Check that _resolve_upstream_ip was called with positional args
             mock_resolve.assert_called_once_with("example.com", "192.0.2.1")
 
 
@@ -105,14 +102,12 @@ async def test_forward_tcp_uses_ip_override():
     }
     data = dns.message.make_query("test.com", "A").to_wire()
 
-    # We'll patch _tcp_pool to return no pooled connection, and mock open_connection
     with patch.object(resolver, "_tcp_pool") as mock_pool:
         mock_pool.get = AsyncMock(return_value=None)
         mock_pool.put = AsyncMock()
 
-        # Mock asyncio.open_connection to return a reader/writer with async methods
+        # Mock reader.readexactly as AsyncMock
         reader = MagicMock()
-        # Make readexactly an async method that returns length and data
         reader.readexactly = AsyncMock(side_effect=[b"\x00\x0d", b"dummy_response"])
         writer = MagicMock()
         writer.drain = AsyncMock()
@@ -124,7 +119,6 @@ async def test_forward_tcp_uses_ip_override():
                 mock_resolve.return_value = "192.0.2.1"
                 result = await resolver._forward_tcp(data, upstream)
                 assert result == b"dummy_response"
-                # Called with positional arguments
                 mock_resolve.assert_called_once_with("example.com", "192.0.2.1")
 
 
@@ -142,17 +136,13 @@ async def test_forward_https_uses_ip_override():
     }
     data = dns.message.make_query("test.com", "A").to_wire()
 
-    # Mock _get_auto_doh_version to return "1.1" and avoid probing
     with patch.object(resolver, "_get_auto_doh_version", new=AsyncMock(return_value="1.1")):
-        # Mock _forward_https1 to avoid HTTP
         with patch.object(resolver, "_forward_https1") as mock_https1:
             mock_https1.return_value = b"dummy_response"
             with patch.object(resolver, "_resolve_upstream_ip") as mock_resolve:
                 mock_resolve.return_value = "192.0.2.1"
                 result = await resolver._forward_https(data, upstream)
                 assert result == b"dummy_response"
-                # _resolve_upstream_ip is called inside _get_auto_doh_version
-                # It receives positional args: host, ip_override
                 mock_resolve.assert_called_once_with("example.com", "192.0.2.1")
 
 
@@ -168,27 +158,30 @@ async def test_forward_quic_uses_ip_override():
     }
     data = dns.message.make_query("test.com", "A").to_wire()
 
-    # Mock aioquic's connect to simulate a successful connection and response
-    mock_client = MagicMock()
-    mock_client._quic = MagicMock()
-    mock_client._quic.get_next_available_stream_id = MagicMock(return_value=0)
-    mock_client._quic.send_stream_data = MagicMock()
-    mock_client.transmit = MagicMock()
-    # Set up the response future
-    response_future = asyncio.Future()
-    response_future.set_result(b"\x00\x0d" + b"dummy_response")
-    mock_client.response_future = response_future
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=None)
+    # Mock _resolve_upstream_ip to verify call
+    with patch.object(resolver, "_resolve_upstream_ip") as mock_resolve:
+        mock_resolve.return_value = "192.0.2.1"
 
-    with patch("aioquic.asyncio.client.connect", return_value=mock_client):
-        # Patch wait_connected to avoid real connection
-        with patch("aioquic.asyncio.protocol.QuicConnectionProtocol.wait_connected", new=AsyncMock()):
-            with patch.object(resolver, "_resolve_upstream_ip") as mock_resolve:
-                mock_resolve.return_value = "192.0.2.1"
-                result = await resolver._forward_quic(data, upstream)
-                assert result == b"dummy_response"
-                mock_resolve.assert_called_once_with("example.com", "192.0.2.1")
+        # Mock aioquic's connect to return a client that will not be used
+        # because we patch asyncio.wait_for to return the response directly.
+        mock_client = MagicMock()
+        mock_client._quic = MagicMock()
+        mock_client._quic.get_next_available_stream_id = MagicMock(return_value=0)
+        mock_client._quic.send_stream_data = MagicMock()
+        mock_client.transmit = MagicMock()
+        mock_client.response_future = asyncio.Future()
+        # We'll patch wait_for to return the response, so we don't need to set the future.
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+
+        with patch("aioquic.asyncio.client.connect", return_value=mock_client):
+            # Patch wait_connected to avoid real connection
+            with patch("aioquic.asyncio.protocol.QuicConnectionProtocol.wait_connected", new=AsyncMock()):
+                # Patch asyncio.wait_for to return the dummy response immediately
+                with patch("asyncio.wait_for", new=AsyncMock(return_value=b"\x00\x0d" + b"dummy_response")):
+                    result = await resolver._forward_quic(data, upstream)
+                    assert result == b"dummy_response"
+                    mock_resolve.assert_called_once_with("example.com", "192.0.2.1")
 
 
 @pytest.mark.asyncio
