@@ -169,18 +169,19 @@ async def test_forward_quic_uses_ip_override():
         mock_client._quic.get_next_available_stream_id = MagicMock(return_value=0)
         mock_client._quic.send_stream_data = MagicMock()
         mock_client.transmit = MagicMock()
-        mock_client.response_future = asyncio.Future()
-        # We'll patch wait_for to return the response, so we don't need to set the future.
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=None)
 
         with patch("aioquic.asyncio.client.connect", return_value=mock_client):
             # Patch wait_connected to avoid real connection
             with patch("aioquic.asyncio.protocol.QuicConnectionProtocol.wait_connected", new=AsyncMock()):
-                # Patch asyncio.wait_for to return the dummy response immediately
-                with patch("asyncio.wait_for", new=AsyncMock(return_value=b"\x00\x0d" + b"dummy_response")):
+                # Build a valid DoQ response: 2-byte length prefix + data
+                dummy_response = b"dummy_response"
+                response_data = len(dummy_response).to_bytes(2, "big") + dummy_response
+                # Patch asyncio.wait_for to return the response data directly
+                with patch("asyncio.wait_for", new=AsyncMock(return_value=response_data)):
                     result = await resolver._forward_quic(data, upstream)
-                    assert result == b"dummy_response"
+                    assert result == dummy_response
                     mock_resolve.assert_called_once_with("example.com", "192.0.2.1")
 
 
