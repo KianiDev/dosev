@@ -481,7 +481,7 @@ class DNSResolver:
 
         # Load‑balancing settings
         self.load_balancing: str = load_balancing
-        self._rr_index: int = 0  # for round‑robin
+        self._rr_index: int = 0
 
         # TCP fallback
         self.tcp_fallback_enabled: bool = tcp_fallback_enabled
@@ -497,19 +497,22 @@ class DNSResolver:
         self._health_domain: str = self._health_config.get('domain', '.')
 
         # Upstream health state: key = upstream address + protocol + port (unique enough)
-        # value: dict with healthy, failures, successes, last_check, next_retry
         self._upstream_health: Dict[str, Dict[str, Any]] = {}
         self._health_lock: asyncio.Lock = asyncio.Lock()
         self._health_task: Optional[asyncio.Task] = None
+        # NOTE: health loop is NOT started here – call start_health_checks() after creation
 
         if self.dnssec_enabled:
             self._load_trust_anchors()
             if self.auto_update_trust_anchor:
                 self._trust_anchor_updater_task = asyncio.create_task(self._background_trust_anchor_updater())
-
-        # Start health checks if enabled
-        if self._health_enabled and self.upstreams:
+    
+    async def start_health_checks(self) -> None:
+        """Start the health check background task if enabled and not already running."""
+        if self._health_enabled and self.upstreams and self._health_task is None:
             self._health_task = asyncio.create_task(self._health_check_loop())
+            self.logger.info("Health check loop started")
+        
 
     # ---------- Health check methods ----------
     def _get_upstream_key(self, upstream: Dict[str, Any]) -> str:
@@ -662,6 +665,7 @@ class DNSResolver:
         await self._h2_pool.stop()
         await self._h3_pool.stop()
         await self._quic_pool.stop()
+        
 
     async def stop_background_tasks(self) -> None:
         if self._trust_anchor_updater_task is not None:

@@ -12,7 +12,7 @@ from dosev.resolver import DNSResolver
 
 
 @pytest.fixture
-def resolver_with_health():
+async def resolver_with_health():
     """Resolver with health checks enabled."""
     health_config = {
         'enabled': True,
@@ -23,7 +23,7 @@ def resolver_with_health():
         'cooldown': 1,
         'domain': '.',
     }
-    return DNSResolver(
+    resolver = DNSResolver(
         upstreams=[
             {"address": "upstream1", "protocol": "udp", "port": 53, "ip": "1.1.1.1"},
             {"address": "upstream2", "protocol": "udp", "port": 53, "ip": "8.8.8.8"},
@@ -31,6 +31,9 @@ def resolver_with_health():
         health_config=health_config,
         load_balancing="failover",
     )
+    # Start health checks (but we'll control them manually in tests)
+    await resolver.start_health_checks()
+    return resolver
 
 
 @pytest.mark.asyncio
@@ -38,10 +41,6 @@ async def test_health_check_initialization(resolver_with_health):
     """Health state should be initialized when health checks are enabled."""
     # Wait for health check loop to run at least once
     await asyncio.sleep(0.1)
-    # Check that upstream states exist (they may not be healthy yet)
-    assert resolver_with_health._upstream_health is not None
-    # Since we didn't mock the health checks, they may have failed, but state exists.
-    # We'll just check that the health task is running.
     assert resolver_with_health._health_task is not None
     assert not resolver_with_health._health_task.done()
 
@@ -54,8 +53,6 @@ async def test_health_check_mark_unhealthy(resolver_with_health):
         return False
     resolver_with_health._do_health_check = fake_health_check
 
-    # Manually run a check loop cycle
-    # We'll simulate failures: set failures to threshold
     key = resolver_with_health._get_upstream_key(resolver_with_health.upstreams[0])
     async with resolver_with_health._health_lock:
         resolver_with_health._upstream_health[key] = {
@@ -66,22 +63,14 @@ async def test_health_check_mark_unhealthy(resolver_with_health):
             'next_retry': 0,
         }
 
-    # Run one health check (call the loop iteration directly)
-    await resolver_with_health._health_check_loop()  # This will sleep for interval, but we can override sleep
-    # Actually _health_check_loop sleeps at start, so we can't easily run it.
-    # Instead, we'll directly call the check logic by mocking the loop.
-    # Better: we'll call _do_health_check and then update state manually, then test _get_healthy_upstreams.
-
     # Simulate failure increment
     async with resolver_with_health._health_lock:
         state = resolver_with_health._upstream_health[key]
         state['failures'] = 3  # exceed threshold
         state['healthy'] = False
-        state['next_retry'] = time.time() + 10  # cooldown
+        state['next_retry'] = time.time() + 10
 
-    # Get healthy upstreams
     healthy = await resolver_with_health._get_healthy_upstreams(resolver_with_health.upstreams)
-    # Should exclude the unhealthy one
     assert len(healthy) == 1
     assert healthy[0]['address'] == 'upstream2'
 
@@ -96,29 +85,26 @@ async def test_health_check_recovery(resolver_with_health):
             'failures': 3,
             'successes': 0,
             'last_check': 0,
-            'next_retry': 0,  # no cooldown
+            'next_retry': 0,
         }
 
-    # Override _do_health_check to return True
     async def fake_health_check(upstream):
         return True
     resolver_with_health._do_health_check = fake_health_check
 
-    # Manually increment successes
     async with resolver_with_health._health_lock:
         state = resolver_with_health._upstream_health[key]
-        state['successes'] = 1  # threshold = 1
+        state['successes'] = 1
         state['healthy'] = True
         state['failures'] = 0
 
     healthy = await resolver_with_health._get_healthy_upstreams(resolver_with_health.upstreams)
-    assert len(healthy) == 2  # both healthy
+    assert len(healthy) == 2
 
 
 @pytest.mark.asyncio
 async def test_health_check_all_unhealthy_fallback(resolver_with_health):
     """If all upstreams are unhealthy, fallback to all."""
-    # Mark all unhealthy
     for up in resolver_with_health.upstreams:
         key = resolver_with_health._get_upstream_key(up)
         async with resolver_with_health._health_lock:
@@ -131,7 +117,6 @@ async def test_health_check_all_unhealthy_fallback(resolver_with_health):
             }
 
     healthy = await resolver_with_health._get_healthy_upstreams(resolver_with_health.upstreams)
-    # Should return all upstreams (fallback)
     assert len(healthy) == 2
     assert healthy == resolver_with_health.upstreams
 
@@ -145,13 +130,13 @@ async def test_health_check_disabled(resolver_with_health):
 
 
 @pytest.mark.asyncio
-async def test_health_check_query_success(monkeypatch):
+async def test_health_check_query_success():
     """Test that _do_health_check returns True on successful query."""
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
         health_config={'enabled': True},
     )
-    # Mock _try_upstream to return a success
+    # Override _try_upstream to return success
     async def fake_try_upstream(upstream, data, _health_check=False):
         return b'success'
     resolver._try_upstream = fake_try_upstream
@@ -161,7 +146,7 @@ async def test_health_check_query_success(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_health_check_query_failure(monkeypatch):
+async def test_health_check_query_failure():
     """Test that _do_health_check returns False on failure."""
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
