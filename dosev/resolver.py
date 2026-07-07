@@ -267,10 +267,19 @@ class ClientPool:
                 if hasattr(conn, 'close'):
                     conn.close()
                 return
+            # For aioquic clients, close the QUIC connection
+            if hasattr(client, '_quic') and hasattr(client._quic, 'close'):
+                client._quic.close()
             if hasattr(client, 'aclose'):
                 await client.aclose()
             elif hasattr(client, 'close'):
                 client.close()
+            # If we have a stored context manager, exit it
+            if hasattr(client, '_cm'):
+                try:
+                    await client._cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -1829,7 +1838,7 @@ class DNSResolver:
         if self.disable_ipv6 and self._is_ipv6_address(resolved):
             raise Exception("IPv6 disabled but resolved to IPv6")
 
-        key = (host, port, hostname, resolved)  # cache key
+        key = (host, port, hostname, resolved)
 
         class DoQProtocol(QuicConnectionProtocol):
             def __init__(self, *args, **kwargs):
@@ -1845,38 +1854,38 @@ class DNSResolver:
         # Try to get a pooled client
         client = await self._quic_pool.get(key)
         if client is not None:
-            # Check if the connection is still alive
             if client._quic is None or client._quic.closed:
                 client = None
 
         if client is None:
-            # Create new connection
             config = QuicConfiguration(
                 is_client=True,
                 alpn_protocols=["doq"],
                 verify_mode=ssl.CERT_NONE,
                 server_name=hostname,
             )
-            client = await connect(resolved, port, configuration=config, create_protocol=DoQProtocol)
+            # Enter the async context manually to keep the client alive
+            cm = connect(resolved, port, configuration=config, create_protocol=DoQProtocol)
+            client = await cm.__aenter__()
+            # Store the context manager to properly exit later
+            client._cm = cm
 
-        # Wait for the connection to be ready
         await client.wait_connected()
 
-        # Create a new stream
         stream_id = client._quic.get_next_available_stream_id()
         future = asyncio.get_running_loop().create_future()
+        # Ensure the protocol has _pending
+        if not hasattr(client, '_pending'):
+            client._pending = {}
         client._pending[stream_id] = future
 
-        # Send query (length‑prefixed)
         client._quic.send_stream_data(stream_id, len(data).to_bytes(2, "big") + data, end_stream=True)
         client.transmit()
 
         try:
             response_data = await asyncio.wait_for(future, timeout=self.doh_timeout)
         except asyncio.TimeoutError:
-            # Clean up the pending future
             client._pending.pop(stream_id, None)
-            # Close the connection if it's dead
             if not client._quic.closed:
                 client._quic.close()
             raise TimeoutError(f"DoQ query to {host}:{port} timed out")
@@ -1884,10 +1893,8 @@ class DNSResolver:
             client._pending.pop(stream_id, None)
             raise
         finally:
-            # Remove the future if it's still there
             client._pending.pop(stream_id, None)
 
-        # Parse the response (length‑prefixed)
         if len(response_data) < 2:
             raise Exception("Invalid DoQ response (too short)")
         resp_len = int.from_bytes(response_data[:2], "big")
@@ -1895,7 +1902,6 @@ class DNSResolver:
             raise Exception("DoQ response truncated")
         resp = response_data[2:2+resp_len]
 
-        # Put the client back into the pool for reuse
         if not client._quic.closed:
             await self._quic_pool.put(key, client)
 

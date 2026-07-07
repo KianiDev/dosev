@@ -158,31 +158,22 @@ async def test_forward_quic_uses_ip_override():
     }
     data = dns.message.make_query("test.com", "A").to_wire()
 
-    # Mock _resolve_upstream_ip to verify call
     with patch.object(resolver, "_resolve_upstream_ip") as mock_resolve:
         mock_resolve.return_value = "192.0.2.1"
-
-        # Mock aioquic's connect to return a client that will not be used
-        # because we patch asyncio.wait_for to return the response directly.
-        mock_client = MagicMock()
-        mock_client._quic = MagicMock()
-        mock_client._quic.get_next_available_stream_id = MagicMock(return_value=0)
-        mock_client._quic.send_stream_data = MagicMock()
-        mock_client.transmit = MagicMock()
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=None)
-
-        with patch("aioquic.asyncio.client.connect", return_value=mock_client):
-            # Patch wait_connected to avoid real connection
+        with patch("aioquic.asyncio.client.connect") as mock_connect:
+            class CM:
+                async def __aenter__(self):
+                    return MagicMock()
+                async def __aexit__(self, *args):
+                    pass
+            mock_connect.return_value = CM()
             with patch("aioquic.asyncio.protocol.QuicConnectionProtocol.wait_connected", new=AsyncMock()):
-                # Build a valid DoQ response: 2-byte length prefix + data
                 dummy_response = b"dummy_response"
                 response_data = len(dummy_response).to_bytes(2, "big") + dummy_response
-                # Patch asyncio.wait_for to return the response data directly
                 with patch("asyncio.wait_for", new=AsyncMock(return_value=response_data)):
                     result = await resolver._forward_quic(data, upstream)
                     assert result == dummy_response
-                    mock_resolve.assert_called_once_with("example.com", "192.0.2.1")
+                    mock_resolve.assert_called_once_with("example.com", ip_override="192.0.2.1")
 
 
 @pytest.mark.asyncio
