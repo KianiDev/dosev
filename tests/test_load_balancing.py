@@ -1,117 +1,150 @@
 """
-Tests for DNSSEC CD (Checking Disabled) flag support.
+Tests for upstream selection strategies.
 """
 
+import asyncio
+import random
 import pytest
-import dns.message
-import dns.rdatatype
-import dns.rdataclass
-import dns.rrset
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import dns.message
 from dosev.resolver import DNSResolver
 
 
+def make_dns_response(data: bytes) -> bytes:
+    """Helper to build a valid DNS response from a query."""
+    try:
+        msg = dns.message.from_wire(data)
+        resp = dns.message.make_response(msg)
+        return resp.to_wire()
+    except Exception:
+        return b"dummy"
+
+
 @pytest.fixture
-def resolver_with_dnssec():
-    """Resolver with DNSSEC enabled and a mock trust anchor."""
-    resolver = DNSResolver(
-        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
-        dnssec_enabled=True,
-        auto_update_trust_anchor=False,  # prevent background task creation
+def resolver():
+    return DNSResolver(
+        upstreams=[
+            {"address": "upstream1", "protocol": "udp", "port": 53, "ip": "1.1.1.1"},
+            {"address": "upstream2", "protocol": "udp", "port": 53, "ip": "8.8.8.8"},
+            {"address": "upstream3", "protocol": "udp", "port": 53, "ip": "9.9.9.9"},
+        ],
+        load_balancing="failover",  # will be overridden in tests
     )
-    # Mock trust anchors to avoid real validation
-    resolver._dnssec_raw_anchors = {dns.name.root: b"dummy"}
-    return resolver
 
 
 @pytest.mark.asyncio
-async def test_cd_flag_skips_validation(resolver_with_dnssec):
-    """If CD flag is set, DNSSEC validation should be skipped."""
-    query = dns.message.make_query("example.com", "A")
-    query.flags |= 0x0010  # CD flag
-    qwire = query.to_wire()
+async def test_load_balancing_failover(resolver):
+    """Failover: try upstreams in order until one succeeds."""
+    call_order = []
+    async def fake_try_upstream(upstream, data):
+        call_order.append(upstream["address"])
+        if upstream["address"] == "upstream1":
+            raise Exception("fail")
+        return make_dns_response(data)
+    resolver._try_upstream = fake_try_upstream
 
-    resp = dns.message.make_response(query)
-    rr = dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "93.184.216.34")
-    resp.answer.append(rr)
-    resp_wire = resp.to_wire()
-
-    async def fake_try_upstream(upstream, data, _health_check=False):
-        return resp_wire
-    resolver_with_dnssec._try_upstream = fake_try_upstream
-
-    validate_called = False
-    async def fake_validate(qname, wire, requested):
-        nonlocal validate_called
-        validate_called = True
-        return False, True
-    resolver_with_dnssec._dnssec_validate = fake_validate
-
-    result = await resolver_with_dnssec.forward_dns_query(qwire)
-    msg = dns.message.from_wire(result)
-    assert msg.rcode() == 0
-    assert len(msg.answer) == 1
-    assert validate_called is False
+    query = dns.message.make_query("example.com", "A").to_wire()
+    resolver.load_balancing = "failover"
+    response = await resolver.forward_dns_query(query)
+    assert response is not None
+    assert len(response) > 0
+    assert call_order == ["upstream1", "upstream2"]
 
 
 @pytest.mark.asyncio
-async def test_no_cd_flag_triggers_validation(resolver_with_dnssec):
-    """If CD flag is not set, validation should be attempted."""
-    query = dns.message.make_query("example.com", "A")
-    query.flags &= ~0x0010
-    # Set EDNS payload and DO flag manually (works across dnspython versions)
-    query.use_edns(payload=1232)
-    # Set DO flag on the OPT RRset's first RR
-    if query.opt:
-        for rr in query.opt:
-            rr.flags = dns.flags.DO
-    qwire = query.to_wire()
+async def test_load_balancing_parallel(resolver):
+    """Parallel: query all upstreams, return first success."""
+    call_order = []
+    async def fake_try_upstream(upstream, data):
+        call_order.append(upstream["address"])
+        if upstream["address"] == "upstream1":
+            # Return immediately – guarantees it finishes first
+            return make_dns_response(data)
+        # Delay the others so they complete later
+        await asyncio.sleep(0.1)
+        return make_dns_response(data)
+    resolver._try_upstream = fake_try_upstream
 
-    resp = dns.message.make_response(query)
-    rr = dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "93.184.216.34")
-    resp.answer.append(rr)
-    resp_wire = resp.to_wire()
-
-    async def fake_try_upstream(upstream, data, _health_check=False):
-        return resp_wire
-    resolver_with_dnssec._try_upstream = fake_try_upstream
-
-    validate_called = False
-    async def fake_validate(qname, wire, requested):
-        nonlocal validate_called
-        validate_called = True
-        return False, True
-    resolver_with_dnssec._dnssec_validate = fake_validate
-
-    result = await resolver_with_dnssec.forward_dns_query(qwire)
-    msg = dns.message.from_wire(result)
-    assert msg.rcode() == 0
-    assert len(msg.answer) == 1
-    assert validate_called is True
+    query = dns.message.make_query("example.com", "A").to_wire()
+    resolver.load_balancing = "parallel"
+    response = await resolver.forward_dns_query(query)
+    assert response is not None
+    assert len(response) > 0
+    # All upstreams should have been called
+    assert set(call_order) == {"upstream1", "upstream2", "upstream3"}
 
 
 @pytest.mark.asyncio
-async def test_cd_flag_passthrough_ignores_bogus(resolver_with_dnssec):
-    """Even if response is bogus, CD flag should return it without validation."""
-    query = dns.message.make_query("example.com", "A")
-    query.flags |= 0x0010
-    qwire = query.to_wire()
+async def test_load_balancing_parallel_all_fail(resolver):
+    """Parallel: if all fail, raise the last exception."""
+    async def fake_try_upstream(upstream, data):
+        raise Exception(f"fail {upstream['address']}")
+    resolver._try_upstream = fake_try_upstream
 
-    resp = dns.message.make_response(query)
-    rr = dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "93.184.216.34")
-    resp.answer.append(rr)
-    resp_wire = resp.to_wire()
+    query = dns.message.make_query("example.com", "A").to_wire()
+    resolver.load_balancing = "parallel"
+    with pytest.raises(Exception) as exc:
+        await resolver.forward_dns_query(query)
+    assert "fail" in str(exc.value)
 
-    async def fake_try_upstream(upstream, data, _health_check=False):
-        return resp_wire
-    resolver_with_dnssec._try_upstream = fake_try_upstream
 
-    async def fake_validate(*args, **kwargs):
-        raise Exception("Should not be called")
-    resolver_with_dnssec._dnssec_validate = fake_validate
+@pytest.mark.asyncio
+async def test_load_balancing_random(resolver):
+    """Random: pick a random upstream for each query."""
+    original_choice = random.choice
+    try:
+        choices = resolver.upstreams.copy()  # list of dicts
+        def mock_choice(seq):
+            return choices.pop(0)
+        random.choice = mock_choice
 
-    result = await resolver_with_dnssec.forward_dns_query(qwire)
-    msg = dns.message.from_wire(result)
-    assert msg.rcode() == 0
-    assert len(msg.answer) == 1
+        resolver.load_balancing = "random"
+        used = []
+        async def fake_try_upstream(upstream, data):
+            used.append(upstream["address"])
+            return make_dns_response(data)
+        resolver._try_upstream = fake_try_upstream
+
+        # Use different query names to avoid caching
+        query1 = dns.message.make_query("example1.com", "A").to_wire()
+        query2 = dns.message.make_query("example2.com", "A").to_wire()
+
+        response = await resolver.forward_dns_query(query1)
+        assert response is not None
+        assert used == ["upstream1"]
+
+        response = await resolver.forward_dns_query(query2)
+        assert response is not None
+        assert used == ["upstream1", "upstream2"]
+    finally:
+        random.choice = original_choice
+
+
+@pytest.mark.asyncio
+async def test_load_balancing_roundrobin(resolver):
+    """Round‑robin: cycle through upstreams."""
+    resolver.load_balancing = "roundrobin"
+    used = []
+    async def fake_try_upstream(upstream, data):
+        used.append(upstream["address"])
+        return make_dns_response(data)
+    resolver._try_upstream = fake_try_upstream
+
+    query1 = dns.message.make_query("example.com", "A").to_wire()
+    query2 = dns.message.make_query("example.org", "A").to_wire()
+    query3 = dns.message.make_query("example.net", "A").to_wire()
+    query4 = dns.message.make_query("example.info", "A").to_wire()
+
+    response = await resolver.forward_dns_query(query1)
+    assert response is not None
+    assert used == ["upstream1"]
+
+    response = await resolver.forward_dns_query(query2)
+    assert used == ["upstream1", "upstream2"]
+
+    response = await resolver.forward_dns_query(query3)
+    assert used == ["upstream1", "upstream2", "upstream3"]
+
+    response = await resolver.forward_dns_query(query4)
+    assert used == ["upstream1", "upstream2", "upstream3", "upstream1"]
