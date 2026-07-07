@@ -1829,40 +1829,77 @@ class DNSResolver:
         if self.disable_ipv6 and self._is_ipv6_address(resolved):
             raise Exception("IPv6 disabled but resolved to IPv6")
 
-        config = QuicConfiguration(
-            is_client=True,
-            alpn_protocols=["doq"],
-            verify_mode=ssl.CERT_NONE,
-            server_name=hostname,
-        )
+        key = (host, port, hostname, resolved)  # cache key
 
         class DoQProtocol(QuicConnectionProtocol):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
-                self.response_future: Optional[asyncio.Future[bytes]] = None
+                self._pending: Dict[int, asyncio.Future[bytes]] = {}
 
             def quic_event_received(self, event):
                 if isinstance(event, StreamDataReceived):
-                    if self.response_future and not self.response_future.done():
-                        self.response_future.set_result(event.data)
+                    fut = self._pending.get(event.stream_id)
+                    if fut and not fut.done():
+                        fut.set_result(event.data)
 
-        async with connect(resolved, port, configuration=config, create_protocol=DoQProtocol) as client:
-            client.response_future = asyncio.get_running_loop().create_future()
-            stream_id = client._quic.get_next_available_stream_id()
-            client._quic.send_stream_data(stream_id, len(data).to_bytes(2, "big") + data, end_stream=True)
-            client.transmit()
+        # Try to get a pooled client
+        client = await self._quic_pool.get(key)
+        if client is not None:
+            # Check if the connection is still alive
+            if client._quic is None or client._quic.closed:
+                client = None
 
-            try:
-                response_data = await asyncio.wait_for(client.response_future, timeout=self.doh_timeout)
-            except asyncio.TimeoutError:
-                raise TimeoutError(f"DoQ query to {host}:{port} timed out")
+        if client is None:
+            # Create new connection
+            config = QuicConfiguration(
+                is_client=True,
+                alpn_protocols=["doq"],
+                verify_mode=ssl.CERT_NONE,
+                server_name=hostname,
+            )
+            client = await connect(resolved, port, configuration=config, create_protocol=DoQProtocol)
 
-            if len(response_data) < 2:
-                raise Exception("Invalid DoQ response (too short)")
-            resp_len = int.from_bytes(response_data[:2], "big")
-            if resp_len + 2 > len(response_data):
-                raise Exception("DoQ response truncated")
-            return response_data[2:2+resp_len]
+        # Wait for the connection to be ready
+        await client.wait_connected()
+
+        # Create a new stream
+        stream_id = client._quic.get_next_available_stream_id()
+        future = asyncio.get_running_loop().create_future()
+        client._pending[stream_id] = future
+
+        # Send query (length‑prefixed)
+        client._quic.send_stream_data(stream_id, len(data).to_bytes(2, "big") + data, end_stream=True)
+        client.transmit()
+
+        try:
+            response_data = await asyncio.wait_for(future, timeout=self.doh_timeout)
+        except asyncio.TimeoutError:
+            # Clean up the pending future
+            client._pending.pop(stream_id, None)
+            # Close the connection if it's dead
+            if not client._quic.closed:
+                client._quic.close()
+            raise TimeoutError(f"DoQ query to {host}:{port} timed out")
+        except Exception:
+            client._pending.pop(stream_id, None)
+            raise
+        finally:
+            # Remove the future if it's still there
+            client._pending.pop(stream_id, None)
+
+        # Parse the response (length‑prefixed)
+        if len(response_data) < 2:
+            raise Exception("Invalid DoQ response (too short)")
+        resp_len = int.from_bytes(response_data[:2], "big")
+        if resp_len + 2 > len(response_data):
+            raise Exception("DoQ response truncated")
+        resp = response_data[2:2+resp_len]
+
+        # Put the client back into the pool for reuse
+        if not client._quic.closed:
+            await self._quic_pool.put(key, client)
+
+        return resp
 
     def _get_quic_cert_der(self, client: Any) -> Optional[bytes]:
         try:
