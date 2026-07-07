@@ -799,7 +799,6 @@ class DNSResolver:
                         new_rr = dns.rrset.RRset(rrset.name, rrset.rdclass, rrset.rdtype)
                         new_rr.ttl = ttl
                         for rd in rrset:
-                            rd.ttl = ttl
                             new_rr.add(rd)
                         new_list.append(new_rr)
                     return new_list

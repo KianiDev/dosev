@@ -5,7 +5,7 @@ Advanced tests for dosev.resolver – mocks external dependencies.
 import asyncio
 import os
 import tempfile
-import time  # <-- added
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import dns.message
@@ -15,7 +15,7 @@ import dns.rrset
 import dns.rdataclass
 import pytest
 
-from dosev.resolver import DNSResolver, RateLimiter, AsyncTTLCache, ConnectionPool  # <-- added ConnectionPool
+from dosev.resolver import DNSResolver, RateLimiter, AsyncTTLCache, ConnectionPool
 
 
 # ---------- Fixtures ----------
@@ -110,21 +110,29 @@ async def test_dnssec_unsigned_domain_is_insecure(resolver):
 async def test_dnssec_bogus_raises(resolver):
     """Invalid signature should raise ValidationFailure."""
     resolver.dnssec_enabled = True
-    # We need a real RRset with RRSIG but a bad signature.
-    # Since we can't easily mock dnspython validation, we'll patch dns.dnssec.validate.
-    with patch("dns.dnssec.validate", side_effect=dns.dnssec.ValidationFailure("bad")):
-        resolver._dnssec_raw_anchors = {dns.name.root: b"dummy"}
-        msg = dns.message.make_response(dns.message.make_query("example.com", "A"))
-        # Add a fake RRSIG
-        rrsig = dns.rrset.from_text(
-            "example.com.", 300, dns.rdataclass.IN, dns.rdatatype.RRSIG,
-            "A 8 2 3600 20260101000000 20251231000000 12345 example.com. ABCDEF=="
-        )
-        msg.answer.append(rrsig)
-        wire = msg.to_wire()
 
-        with pytest.raises(dns.dnssec.ValidationFailure):
-            await resolver._dnssec_validate("example.com", wire, dnssec_requested=True)
+    # Patch the exact reference used inside resolver.py
+    with patch("dosev.resolver.dns.dnssec.validate", side_effect=dns.dnssec.ValidationFailure("bad")):
+        # Force run_in_executor to run synchronously so the patch is visible
+        loop = asyncio.get_running_loop()
+        original_executor = loop.run_in_executor
+
+        async def fake_run_in_executor(executor, func, *args):
+            return func(*args)
+
+        with patch.object(loop, "run_in_executor", new=fake_run_in_executor):
+            resolver._dnssec_raw_anchors = {dns.name.root: b"dummy"}
+            msg = dns.message.make_response(dns.message.make_query("example.com", "A"))
+            # Add a fake RRSIG (doesn't need to be valid; we're mocking validate)
+            rrsig = dns.rrset.from_text(
+                "example.com.", 300, dns.rdataclass.IN, dns.rdatatype.RRSIG,
+                "A 8 2 3600 20260101000000 20251231000000 12345 example.com. ABCDEF=="
+            )
+            msg.answer.append(rrsig)
+            wire = msg.to_wire()
+
+            with pytest.raises(dns.dnssec.ValidationFailure):
+                await resolver._dnssec_validate("example.com", wire, dnssec_requested=True)
 
 
 # ---------- Negative Caching with SOA MINIMUM ----------
