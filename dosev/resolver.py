@@ -1855,7 +1855,7 @@ class DNSResolver:
             try:
                 response_data = await asyncio.wait_for(client.response_future, timeout=self.doh_timeout)
             except asyncio.TimeoutError:
-                raise QueryTimeout(f"DoQ query to {host}:{port} timed out")
+                raise TimeoutError(f"DoQ query to {host}:{port} timed out")
 
             if len(response_data) < 2:
                 raise Exception("Invalid DoQ response (too short)")
