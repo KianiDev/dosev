@@ -22,32 +22,48 @@ pip install -e .
 
 ---
 
-## Minimal Configuration
+## First Run
 
-Create a configuration file:
+Run `dosev` without any arguments – it will create a default configuration file in the OS‑specific user config directory and exit with instructions:
 
 ```bash
-mkdir -p config
-cat > config/dosev.conf <<EOF
+dosev
+```
+
+Output:
+```
+Default configuration file created at:
+  /home/user/.config/dosev/dosev.conf
+Please edit it to your needs and restart dosev.
+```
+
+Edit the file to suit your needs, then run `dosev` again.
+
+---
+
+## Minimal Configuration
+
+If you prefer to write your own, here’s a minimal working config:
+
+```ini
 [server]
 listen_ip = 0.0.0.0
 listen_port = 53
 
-[resolver]
-upstream_dns = 1.1.1.1
+[upstreams]
+servers = default
+
+[upstreams.default]
+address = 1.1.1.1
 protocol = udp
-EOF
+ip = 1.1.1.1
 ```
 
----
-
-## Starting the Server
+Save it as `dosev.conf` and start the server:
 
 ```bash
-dosev --config config/dosev.conf
+dosev --config /path/to/dosev.conf
 ```
-
-You should see log output indicating that UDP and TCP listeners are running.
 
 ---
 
@@ -97,11 +113,14 @@ Blocklists will be downloaded and refreshed automatically.
 For encrypted server endpoints, add:
 
 ```ini
-[server]
-listen_tls_port = 853
-listen_https_port = 443
-https_cert_file = /path/to/cert.pem
-https_key_file = /path/to/key.pem
+[resolver]
+dns_enable_dot = true
+dns_dot_port = 853
+dns_enable_doh = true
+dns_doh_port = 443
+dns_doh_cert_file = /path/to/cert.pem
+dns_doh_key_file = /path/to/key.pem
+dns_doh_path = /dns-query
 ```
 
 Then clients can query via `tls://` or `https://`.
@@ -110,12 +129,13 @@ Then clients can query via `tls://` or `https://`.
 
 ## Using DoH or DoT (Client Side)
 
-To forward queries over an encrypted transport:
+To forward queries over an encrypted transport, define an upstream with the appropriate `protocol`:
 
 ```ini
-[resolver]
-upstream_dns = 1.1.1.1
-protocol = tls     # or https, quic
+[upstreams.secure]
+address = cloudflare-dns.com
+protocol = tls    # or https, quic
+port = 853        # or 443 for https
 ```
 
 ---
@@ -125,14 +145,14 @@ protocol = tls     # or https, quic
 Check your config without starting the server:
 
 ```bash
-dosev --check-config --config config/dosev.conf
+dosev --check-config --config /path/to/dosev.conf
 ```
 
 ---
 
 ## Next Steps
 
-- Read the [Configuration Reference](configuration.md) to explore all options.
+- Read the [Configuration Reference](config-reference.md) to explore all options.
 - Check the [Deployment Tips](deployment-tips.md) for production setups.
 - Review the [Architecture](architecture.md) to understand how dosev works.
 

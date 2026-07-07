@@ -34,8 +34,8 @@ Resolver.forward_dns_query()
    ├── Cache hit?
    │       └── (positive / negative / stale)
    ├── EDNS0 processing
-   ├── Load balancer → select upstream
-   ├── Forward via transport
+   ├── Upstream selection (failover – try each in order until one succeeds)
+   ├── Forward via transport (UDP/TCP/TLS/DoH/DoQ)
    ├── DNSSEC validation
    ├── Cache response
    └── Return to client
@@ -51,12 +51,12 @@ The heart of the system. It manages:
 
 - **Caches**: positive cache (TTL‑based), negative cache (NXDOMAIN/NODATA), and stale‑serve logic.
 - **Blocklists & Hosts**: exact‑match and suffix‑based domain filtering; static A/AAAA overrides.
-- **Upstream management**: health checks, load balancing (failover, round‑robin, weighted).
+- **Upstream management**: failover – tries upstreams in order until one responds.
 - **DNSSEC**: validates responses using a trust anchor (bundled or IANA‑fetched); caches validation results.
 - **EDNS0**: parses client subnet and forwards it to upstreams.
 - **Rate limiting**: token‑bucket per client IP.
 - **Rebinding protection**: strips or blocks private IPs.
-- **Metrics**: collects request counts, errors, latency, and cache statistics.
+- **Metrics**: collects request counts, errors, and latency.
 
 **Key Methods**:
 
@@ -80,15 +80,15 @@ Each listener accepts a query, passes it to the resolver, and sends back the res
 
 ### 3. Transports (client‑side)
 
-Each transport implements the `Transport` interface (from early design; now integrated into `DNSResolver` methods):
+Each transport implements the protocol‑specific forwarding logic:
 
 - `_forward_udp()`
 - `_forward_tcp()`
 - `_forward_tls()`
 - `_forward_https1()`, `_forward_https2()`, `_forward_https3()`
-- `_forward_quic()`
+- `_forward_quic()` – now uses a connection pool (`_quic_pool`) to reuse QUIC connections across multiple queries, reducing handshake overhead.
 
-These handle connection pooling, timeouts, retries, and certificate pinning.
+These handle connection pooling, timeouts, retries, certificate pinning, and the `ip` field to skip DNS resolution.
 
 ### 4. Caching
 
@@ -101,7 +101,8 @@ Both support TTL expiration and size limits. The wire cache includes a `dnssec_v
 
 ### 5. Configuration (dosev/config.py)
 
-Loads an INI file and returns a flat dictionary with sensible defaults. Supports all sections documented in the configuration reference.
+Loads an INI file and returns a flat dictionary with sensible defaults. Supports all sections documented in the configuration reference.  
+On first run, a default configuration file is created in the OS‑specific user config directory (`~/.config/dosev/`, `~/Library/Application Support/dosev/`, or `%APPDATA%\dosev\`).
 
 ### 6. Utilities (dosev/utils.py)
 
@@ -122,7 +123,6 @@ Loads an INI file and returns a flat dictionary with sensible defaults. Supports
 - Connection pool cleanup.
 - Blocklist refresh.
 - DNSSEC trust anchor update.
-- Upstream health checks.
 
 ---
 
@@ -140,10 +140,9 @@ Loads an INI file and returns a flat dictionary with sensible defaults. Supports
 ## Performance Optimizations
 
 - **Asynchronous I/O**: All network operations are non‑blocking.
-- **Connection pooling**: Reuses TCP/TLS/HTTP/QUIC connections to reduce handshake overhead.
+- **Connection pooling**: Reuses TCP/TLS/HTTP/DoQ connections to reduce handshake overhead.
 - **Caching**: Reduces upstream load and latency.
 - **Optimistic caching**: Serves stale responses while refreshing in the background.
-- **Load balancing**: Distributes load across upstreams.
 - **uvloop**: Optional faster event loop (Unix).
 
 ---
@@ -176,7 +175,7 @@ The modular design makes it easy to add:
 ## Testing
 
 - **Unit tests**: cover all core logic with mocked network calls.
-- **Integration tests**: (planned) test against real upstreams using a local stub server.
+- **Integration tests**: test against real upstreams (using `dig` or stub servers).
 - **CI**: runs on Linux, macOS, and Windows for Python 3.10–3.14.
 
 ---
@@ -185,6 +184,7 @@ The modular design makes it easy to add:
 
 - Full RFC 5011 trust anchor management.
 - DNSCrypt and ODoH client/server support.
-- Web‑based status dashboard.
 - More advanced EDNS0 options.
-- Enhanced load balancing with latency‑based routing.
+- Enhanced load balancing (round‑robin, weighted).
+- Health checks for upstreams.
+- Web‑based status dashboard.

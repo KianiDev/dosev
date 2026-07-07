@@ -1,6 +1,6 @@
 # dosev/resolver.py – final production version with DoH URL parsing
 # RFC compliance fixes applied: EDNS0, DNSSEC unsigned, negative cache TTL, TC bit
-# Added: upstream 'ip' field, removed upstream_dns/protocol, uses bootstrap for resolution
+# Added: DoQ connection pooling, IPv6 stripping, HTTP/3 client (already present)
 
 import asyncio
 import logging
@@ -267,19 +267,18 @@ class ClientPool:
                 if hasattr(conn, 'close'):
                     conn.close()
                 return
-            # For aioquic clients, close the QUIC connection
+            # For aioquic clients, close the QUIC connection and exit context manager
             if hasattr(client, '_quic') and hasattr(client._quic, 'close'):
                 client._quic.close()
-            if hasattr(client, 'aclose'):
-                await client.aclose()
-            elif hasattr(client, 'close'):
-                client.close()
-            # If we have a stored context manager, exit it
             if hasattr(client, '_cm'):
                 try:
                     await client._cm.__aexit__(None, None, None)
                 except Exception:
                     pass
+            if hasattr(client, 'aclose'):
+                await client.aclose()
+            elif hasattr(client, 'close'):
+                client.close()
         except Exception:
             pass
 
@@ -303,12 +302,14 @@ class DNSResolver:
       - DNSSEC validation cache (store validation result per RRset)
       - Automatic trust anchor management (bundled root key + optional IANA fetch)
       - DoH URL parsing (full https://host/path support)
+      - IPv6 stripping (strip AAAA records from responses)
     """
 
     def __init__(self,
                   upstreams: Optional[List[Dict[str, Any]]] = None,
                   verbose: bool = False,
                   disable_ipv6: bool = False,
+                  strip_ipv6_records: bool = False,
                   cache_ttl: int = 300,
                   cache_max_size: int = 2048,
                   negative_cache_ttl: int = 5,
@@ -348,6 +349,7 @@ class DNSResolver:
         self.bootstrap_retries: int = bootstrap.get('retries', 2)
 
         self.disable_ipv6: bool = bool(disable_ipv6)
+        self.strip_ipv6_records: bool = bool(strip_ipv6_records)
         self.verbose: bool = bool(verbose)
         self.logger: logging.Logger = logging.getLogger("dosev.DNSResolver")
         if not self.logger.handlers:
@@ -705,7 +707,6 @@ class DNSResolver:
         try:
             upstream_list = self.upstreams
             if not upstream_list:
-                # Fallback to a default upstream if none configured
                 upstream_list = [{
                     'address': '1.1.1.1',
                     'protocol': 'udp',
@@ -781,6 +782,20 @@ class DNSResolver:
         if len(response_bytes) < 2:
             return response_bytes
         return new_id.to_bytes(2, 'big') + response_bytes[2:]
+
+    # ---------- IPv6 stripping ----------
+    def _strip_ipv6_records(self, response_bytes: bytes) -> bytes:
+        """Strip AAAA records from the response if strip_ipv6_records is enabled."""
+        if not self.strip_ipv6_records:
+            return response_bytes
+        try:
+            msg = dns.message.from_wire(response_bytes)
+            # Filter AAAA from answer and additional sections
+            msg.answer = [rrset for rrset in msg.answer if rrset.rdtype != dns.rdatatype.AAAA]
+            msg.additional = [rrset for rrset in msg.additional if rrset.rdtype != dns.rdatatype.AAAA]
+            return msg.to_wire()
+        except Exception:
+            return response_bytes
 
     # ---------- parsing helpers ----------
     @staticmethod
@@ -865,7 +880,7 @@ class DNSResolver:
             opt_bytes = data[question_end:]
         except Exception:
             opt_bytes = b''
-        return (qname, qtype, 'unknown', opt_bytes)  # protocol no longer used
+        return (qname, qtype, 'unknown', opt_bytes)
 
     def _strip_ecs(self, data: bytes) -> bytes:
         try:
@@ -1295,10 +1310,9 @@ class DNSResolver:
                         return self._make_nxdomain_response(data)
                 return self._set_query_id(resp_bytes, orig_id)
 
-        # Use upstreams list
+        # Build upstream list
         upstream_list = upstreams
         if not upstream_list:
-            # Fallback default
             upstream_list = [{
                 'address': '1.1.1.1',
                 'protocol': 'udp',
@@ -1331,6 +1345,9 @@ class DNSResolver:
                     resp = self._apply_rebind_protection(resp)
                     if resp is None:
                         return self._make_nxdomain_response(data)
+                # Apply IPv6 stripping
+                if self.strip_ipv6_records:
+                    resp = self._strip_ipv6_records(resp)
                 if self._is_negative_response(resp):
                     ttl = self._extract_soa_minimum(resp)
                     if ttl is None:
@@ -1524,7 +1541,6 @@ class DNSResolver:
         ip_override = upstream.get('ip')
 
         if version == 'auto':
-            # We need to resolve the host for probing; but if IP is given, use it.
             resolved_ip = await self._resolve_upstream_ip(host, ip_override)
             version = await self._get_auto_doh_version(hostname, port, resolved_ip, path)
 
@@ -1821,6 +1837,7 @@ class DNSResolver:
             await self._h3_pool.put(key, (connection, h3))
             return bytes(response_data)
 
+    # ---------- DOQ with connection pooling ----------
     async def _forward_quic(self, data: bytes, upstream: Dict[str, Any]) -> bytes:
         if not _HAS_AIOQUIC:
             raise RuntimeError("aioquic not available for DoQ")
@@ -1864,19 +1881,16 @@ class DNSResolver:
                 verify_mode=ssl.CERT_NONE,
                 server_name=hostname,
             )
-            # Enter the async context manually to keep the client alive
             cm = connect(resolved, port, configuration=config, create_protocol=DoQProtocol)
             client = await cm.__aenter__()
-            # Store the context manager to properly exit later
             client._cm = cm
+            # Ensure pending dict exists
+            client._pending = {}
 
         await client.wait_connected()
 
         stream_id = client._quic.get_next_available_stream_id()
         future = asyncio.get_running_loop().create_future()
-        # Ensure the protocol has _pending
-        if not hasattr(client, '_pending'):
-            client._pending = {}
         client._pending[stream_id] = future
 
         client._quic.send_stream_data(stream_id, len(data).to_bytes(2, "big") + data, end_stream=True)
@@ -2344,9 +2358,9 @@ class DNSResolver:
         return self._parse_dns_name(response, offset)
 
     async def update_config(self, *,
-                            # removed upstream_dns and protocol
                             verbose: Optional[bool] = None,
                             disable_ipv6: Optional[bool] = None,
+                            strip_ipv6_records: Optional[bool] = None,
                             cache_ttl: Optional[int] = None,
                             cache_max_size: Optional[int] = None,
                             negative_cache_ttl: Optional[int] = None,
@@ -2383,6 +2397,8 @@ class DNSResolver:
                 self.logger.setLevel(logging.DEBUG if self.verbose else logging.INFO)
             if disable_ipv6 is not None:
                 self.disable_ipv6 = bool(disable_ipv6)
+            if strip_ipv6_records is not None:
+                self.strip_ipv6_records = bool(strip_ipv6_records)
             if cache_ttl is not None:
                 pass
             if cache_max_size is not None:
@@ -2475,9 +2491,9 @@ class DNSResolver:
                 self.bootstrap_retries = bootstrap.get('retries', 2)
 
             self.logger.info("DNSResolver configuration updated: "
-                             "disable_ipv6=%s, verbose=%s, rate_limit=%s/%s, optimistic_cache=%s, "
+                             "disable_ipv6=%s, strip_ipv6_records=%s, verbose=%s, rate_limit=%s/%s, optimistic_cache=%s, "
                              "rebind_protection=%s/%s, doh_version=%s, bootstrap_servers=%s",
-                             self.disable_ipv6, self.verbose,
+                             self.disable_ipv6, self.strip_ipv6_records, self.verbose,
                              self.rate_limit_rps, self.rate_limit_burst,
                              self.optimistic_cache_enabled,
                              self.rebind_protection_enabled, self.rebind_action,

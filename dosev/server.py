@@ -1,4 +1,4 @@
-# dosev/server.py – FINAL with all fixes and new resolver signature
+# dosev/server.py – FINAL with HTTP/3 support, IPv6 stripping, and all fixes
 
 import asyncio
 import base64
@@ -7,6 +7,7 @@ import os
 import signal
 import ssl
 import sys
+import urllib.parse
 from typing import Dict, Set, Tuple, Optional, Any, List
 
 from aiohttp import web
@@ -22,6 +23,14 @@ import dns.rdatatype
 import dns.rrset
 import dns.rcode
 import dns.resolver
+
+# HTTP/3 imports
+from aioquic.asyncio import serve
+from aioquic.asyncio.protocol import QuicConnectionProtocol
+from aioquic.h3.connection import H3_ALPN, H3Connection
+from aioquic.h3.events import HeadersReceived, DataReceived
+from aioquic.quic.configuration import QuicConfiguration
+from aioquic.quic.events import QuicEvent
 
 
 class ResolverHolder:
@@ -102,14 +111,9 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
             if len(response) > client_payload:
                 response = resolver._set_tc_bit(response)
 
-            if resolver.disable_ipv6:
-                try:
-                    resp_msg = dns.message.from_wire(response)
-                    resp_msg.answer = [rr for rr in resp_msg.answer if rr.rdtype != dns.rdatatype.AAAA]
-                    resp_msg.additional = [rr for rr in resp_msg.additional if rr.rdtype != dns.rdatatype.AAAA]
-                    response = resp_msg.to_wire()
-                except Exception:
-                    pass
+            # Apply IPv6 stripping if configured
+            if resolver.strip_ipv6_records:
+                response = resolver._strip_ipv6_records(response)
 
             if self.transport:
                 self.transport.sendto(response, addr)
@@ -182,14 +186,8 @@ async def _tcp_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 
         response = await resolver.forward_dns_query(data)
 
-        if resolver.disable_ipv6:
-            try:
-                resp_msg = dns.message.from_wire(response)
-                resp_msg.answer = [rr for rr in resp_msg.answer if rr.rdtype != dns.rdatatype.AAAA]
-                resp_msg.additional = [rr for rr in resp_msg.additional if rr.rdtype != dns.rdatatype.AAAA]
-                response = resp_msg.to_wire()
-            except Exception:
-                pass
+        if resolver.strip_ipv6_records:
+            response = resolver._strip_ipv6_records(response)
 
         try:
             resolver.log_dns_event('Processed', qname, f"{peer[0]}:{peer[1]}")
@@ -218,6 +216,7 @@ async def reload_resolver(holder: ResolverHolder,
     await current_resolver.update_config(
         verbose=config.get("verbose", False),
         disable_ipv6=config.get("disable_ipv6", False),
+        strip_ipv6_records=config.get("strip_ipv6_records", False),
         udp_timeout=config.get("upstream_udp_timeout"),
         tcp_timeout=config.get("upstream_tcp_timeout"),
         doh_timeout=config.get("upstream_doh_timeout"),
@@ -364,14 +363,8 @@ async def _handle_doh_request(request: web.Request, holder: ResolverHolder) -> w
             return web.Response(body=resp_wire, content_type='application/dns-message')
 
         response = await resolver.forward_dns_query(raw_query)
-        if resolver.disable_ipv6:
-            try:
-                resp_msg = dns.message.from_wire(response)
-                resp_msg.answer = [rr for rr in resp_msg.answer if rr.rdtype != dns.rdatatype.AAAA]
-                resp_msg.additional = [rr for rr in resp_msg.additional if rr.rdtype != dns.rdatatype.AAAA]
-                response = resp_msg.to_wire()
-            except Exception:
-                pass
+        if resolver.strip_ipv6_records:
+            response = resolver._strip_ipv6_records(response)
 
         try:
             if qname:
@@ -398,10 +391,123 @@ async def _start_doh_server(holder: ResolverHolder, listen_ip: str, listen_port:
     return runner
 
 
+# ---------- HTTP/3 Server ----------
+class Http3ServerProtocol(QuicConnectionProtocol):
+    """HTTP/3 server protocol for DNS over HTTPS."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._http = H3Connection(self._quic)
+        self._request_data: Dict[int, bytearray] = {}
+        self._request_headers: Dict[int, dict] = {}
+        self._holder: Optional[ResolverHolder] = None
+
+    def set_holder(self, holder: ResolverHolder) -> None:
+        self._holder = holder
+
+    def quic_event_received(self, event: QuicEvent) -> None:
+        for http_event in self._http.handle_event(event):
+            if isinstance(http_event, HeadersReceived):
+                headers = {k.decode(): v.decode() for k, v in http_event.headers}
+                self._request_headers[http_event.stream_id] = headers
+            elif isinstance(http_event, DataReceived):
+                if http_event.stream_id not in self._request_data:
+                    self._request_data[http_event.stream_id] = bytearray()
+                self._request_data[http_event.stream_id].extend(http_event.data)
+                if http_event.stream_ended:
+                    asyncio.create_task(self._handle_request(http_event.stream_id))
+
+    async def _handle_request(self, stream_id: int):
+        headers = self._request_headers.get(stream_id, {})
+        body = bytes(self._request_data.get(stream_id, b""))
+        self._request_headers.pop(stream_id, None)
+        self._request_data.pop(stream_id, None)
+
+        if not self._holder:
+            return
+
+        resolver = self._holder.resolver
+        method = headers.get(":method", "GET")
+        path = headers.get(":path", "/dns-query")
+
+        raw_query = None
+        if method == "GET":
+            parsed = urllib.parse.urlparse(path)
+            query_params = urllib.parse.parse_qs(parsed.query)
+            dns_param = query_params.get("dns", [None])[0]
+            if dns_param:
+                try:
+                    padding = '=' * (-len(dns_param) % 4)
+                    raw_query = base64.urlsafe_b64decode(dns_param + padding)
+                except Exception:
+                    await self._send_response(stream_id, 400, b"Invalid dns parameter")
+                    return
+        elif method == "POST":
+            content_type = headers.get("content-type", "")
+            if content_type != "application/dns-message":
+                await self._send_response(stream_id, 415, b"Unsupported content type")
+                return
+            raw_query = body
+
+        if raw_query is None:
+            await self._send_response(stream_id, 400, b"Missing dns query")
+            return
+
+        try:
+            response = await resolver.forward_dns_query(raw_query)
+            if resolver.strip_ipv6_records:
+                response = resolver._strip_ipv6_records(response)
+            await self._send_response(stream_id, 200, response, content_type="application/dns-message")
+        except Exception as e:
+            logging.error(f"HTTP/3 request failed: {e}")
+            await self._send_response(stream_id, 500, b"Internal Server Error")
+
+    async def _send_response(self, stream_id: int, status: int, body: bytes, content_type: str = "text/plain"):
+        headers = [
+            (b":status", str(status).encode()),
+            (b"content-type", content_type.encode()),
+            (b"content-length", str(len(body)).encode()),
+        ]
+        self._http.send_headers(stream_id, headers, end_stream=False)
+        if body:
+            self._http.send_data(stream_id, body, end_stream=True)
+        else:
+            self._http.send_data(stream_id, b"", end_stream=True)
+        self.transmit()
+
+    def transmit(self):
+        self._quic.transmit()
+
+
+async def _start_http3_server(holder: ResolverHolder, listen_ip: str, listen_port: int,
+                                cert_file: str, key_file: str, doh_path: str = "/dns-query") -> None:
+    """Start HTTP/3 server using aioquic."""
+    with open(cert_file, 'rb') as f:
+        cert_data = f.read()
+    with open(key_file, 'rb') as f:
+        key_data = f.read()
+
+    config = QuicConfiguration(
+        is_client=False,
+        alpn_protocols=H3_ALPN,
+        certificate=cert_data,
+        private_key=key_data,
+    )
+
+    def create_protocol(*args, **kwargs):
+        proto = Http3ServerProtocol(*args, **kwargs)
+        proto.set_holder(holder)
+        return proto
+
+    await serve(host=listen_ip, port=listen_port, configuration=config,
+                create_protocol=create_protocol)
+
+
+# ---------- Main Server ----------
 async def run_server(listen_ip: str, listen_port: int,
                      verbose: bool = False,
                      blocklists: Optional[Dict[str, Any]] = None,
                      disable_ipv6: bool = False,
+                     strip_ipv6_records: bool = False,
                      dns_cache_ttl: int = 300,
                      dns_cache_max_size: int = 1024,
                      dns_negative_cache_ttl: int = 5,
@@ -447,14 +553,16 @@ async def run_server(listen_ip: str, listen_port: int,
                      pool_idle_timeout: float = 60.0,
                      doh_version: str = 'auto',
                      doh_auto_cache_ttl: int = 3600,
-                     bootstrap: Optional[Dict[str, Any]] = None) -> None:
-    """Start the DNS server (UDP + TCP) with graceful shutdown and DNSSEC auto‑update."""
+                     bootstrap: Optional[Dict[str, Any]] = None,
+                     dns_enable_http3: bool = False) -> None:
+    """Start the DNS server with full protocol support (UDP, TCP, TLS, DoH, HTTP/3)."""
     logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
 
     resolver = DNSResolver(
         upstreams=upstreams,
         verbose=verbose,
         disable_ipv6=disable_ipv6,
+        strip_ipv6_records=strip_ipv6_records,
         cache_ttl=dns_cache_ttl,
         cache_max_size=dns_cache_max_size,
         negative_cache_ttl=dns_negative_cache_ttl,
@@ -546,6 +654,8 @@ async def run_server(listen_ip: str, listen_port: int,
 
     dot_server = None
     doh_runner = None
+    http3_task = None
+
     if dns_enable_dot:
         dot_ssl = _create_ssl_context(dns_dot_cert_file, dns_dot_key_file)
         dot_server = await asyncio.start_server(
@@ -557,7 +667,16 @@ async def run_server(listen_ip: str, listen_port: int,
     if dns_enable_doh:
         doh_ssl = _create_ssl_context(dns_doh_cert_file, dns_doh_key_file)
         doh_runner = await _start_doh_server(holder, listen_ip, dns_doh_port, dns_doh_path, doh_ssl)
-        logging.info(f"DNS-over-HTTPS listener running on {listen_ip}:{dns_doh_port}{dns_doh_path}")
+        logging.info(f"DNS-over-HTTPS (HTTP/1.1 & HTTP/2) listener running on {listen_ip}:{dns_doh_port}{dns_doh_path}")
+
+    if dns_enable_http3:
+        if not dns_doh_cert_file or not dns_doh_key_file:
+            logging.warning("HTTP/3 requires cert_file and key_file; skipping")
+        else:
+            http3_task = asyncio.create_task(
+                _start_http3_server(holder, listen_ip, dns_doh_port, dns_doh_cert_file, dns_doh_key_file, dns_doh_path)
+            )
+            logging.info(f"DNS-over-HTTPS (HTTP/3) listener starting on {listen_ip}:{dns_doh_port}{dns_doh_path}")
 
     if dns_privilege_drop_user:
         _drop_dns_privileges(
@@ -599,6 +718,12 @@ async def run_server(listen_ip: str, listen_port: int,
             await dot_server.wait_closed()
         if doh_runner is not None:
             await doh_runner.cleanup()
+        if http3_task is not None:
+            http3_task.cancel()
+            try:
+                await http3_task
+            except asyncio.CancelledError:
+                pass
         server.close()
         await server.wait_closed()
         logging.info("Shutdown complete.")
@@ -608,6 +733,7 @@ def run_server_sync(listen_ip: str, listen_port: int,
                     verbose: bool = False,
                     blocklists: Optional[Dict[str, Any]] = None,
                     disable_ipv6: bool = False,
+                    strip_ipv6_records: bool = False,
                     dns_cache_ttl: int = 300,
                     dns_cache_max_size: int = 1024,
                     dns_negative_cache_ttl: int = 5,
@@ -653,12 +779,14 @@ def run_server_sync(listen_ip: str, listen_port: int,
                     pool_idle_timeout: float = 60.0,
                     doh_version: str = 'auto',
                     doh_auto_cache_ttl: int = 3600,
-                    bootstrap: Optional[Dict[str, Any]] = None) -> None:
+                    bootstrap: Optional[Dict[str, Any]] = None,
+                    dns_enable_http3: bool = False) -> None:
     asyncio.run(run_server(
         listen_ip, listen_port,
         verbose=verbose,
         blocklists=blocklists,
         disable_ipv6=disable_ipv6,
+        strip_ipv6_records=strip_ipv6_records,
         dns_cache_ttl=dns_cache_ttl,
         dns_cache_max_size=dns_cache_max_size,
         dns_negative_cache_ttl=dns_negative_cache_ttl,
@@ -705,4 +833,5 @@ def run_server_sync(listen_ip: str, listen_port: int,
         doh_version=doh_version,
         doh_auto_cache_ttl=doh_auto_cache_ttl,
         bootstrap=bootstrap,
+        dns_enable_http3=dns_enable_http3,
     ))

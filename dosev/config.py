@@ -340,6 +340,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     dns_doh_cert_file = config.get('resolver', 'dns_doh_cert_file', fallback='')
     dns_doh_key_file = config.get('resolver', 'dns_doh_key_file', fallback='')
     dns_doh_path = config.get('resolver', 'dns_doh_path', fallback='/dns-query')
+    dns_enable_http3 = config.getboolean('resolver', 'dns_enable_http3', fallback=False)
     strip_ipv6_records_raw = config.get('resolver', 'strip_ipv6_records', fallback=None)
     strip_ipv6_records = None if strip_ipv6_records_raw is None else config.getboolean('resolver', 'strip_ipv6_records', fallback=None)
 
@@ -485,6 +486,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
         'dns_doh_cert_file': dns_doh_cert_file,
         'dns_doh_key_file': dns_doh_key_file,
         'dns_doh_path': dns_doh_path,
+        'dns_enable_http3': dns_enable_http3,
         'verbose': verbose,
         'disable_ipv6': disable_ipv6,
         'strip_ipv6_records': strip_ipv6_records,

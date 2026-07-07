@@ -81,6 +81,7 @@ def main() -> None:
         dns_doh_cert_file=config.get("dns_doh_cert_file", ""),
         dns_doh_key_file=config.get("dns_doh_key_file", ""),
         dns_doh_path=config.get("dns_doh_path", "/dns-query"),
+        dns_enable_http3=config.get("dns_enable_http3", False),
         pool_max_size=config.get("pool_max_size", 5),
         pool_idle_timeout=config.get("pool_idle_timeout", 60.0),
         doh_version=config.get("doh_version", "auto"),

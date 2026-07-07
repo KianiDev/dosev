@@ -1,5 +1,5 @@
 """
-Tests for DoQ (DNS over QUIC) connection pooling.
+Tests for DoQ connection pooling.
 """
 
 import asyncio
@@ -38,7 +38,7 @@ def resolver():
 
 @pytest.fixture
 def mock_connect():
-    """Mock aioquic.asyncio.client.connect to return a context manager that yields a MockQuicClient."""
+    """Mock aioquic.asyncio.client.connect to return a context manager."""
     with patch("aioquic.asyncio.client.connect") as mock:
         class MockCM:
             def __init__(self, client):
@@ -53,7 +53,6 @@ def mock_connect():
 
 @pytest.mark.asyncio
 async def test_doq_connection_pool_reuse(resolver, mock_connect):
-    """Verify that DoQ connections are reused from the pool."""
     dummy_response = b"\x00\x0d" + b"dummy_response"
     with patch("asyncio.wait_for", new=AsyncMock(return_value=dummy_response)):
         query = dns.message.make_query("example.com", "A").to_wire()
@@ -70,7 +69,6 @@ async def test_doq_connection_pool_reuse(resolver, mock_connect):
 
 @pytest.mark.asyncio
 async def test_doq_connection_pool_closed_connection(resolver, mock_connect):
-    """If a pooled connection is closed, a new one should be created."""
     client_open = MockQuicClient(closed=False)
     client_closed = MockQuicClient(closed=True)
 
@@ -104,7 +102,6 @@ async def test_doq_connection_pool_closed_connection(resolver, mock_connect):
 
 @pytest.mark.asyncio
 async def test_doq_connection_pool_handles_timeout(resolver, mock_connect):
-    """If a DoQ query times out, the connection should not be put back into the pool."""
     with patch("asyncio.wait_for", new=AsyncMock(side_effect=asyncio.TimeoutError)):
         query = dns.message.make_query("example.com", "A").to_wire()
         upstream = resolver.upstreams[0]
@@ -117,7 +114,6 @@ async def test_doq_connection_pool_handles_timeout(resolver, mock_connect):
 
 @pytest.mark.asyncio
 async def test_doq_pool_handles_connection_error_during_handshake(resolver, mock_connect):
-    """If the QUIC handshake fails (wait_connected raises), the connection should not be pooled."""
     with patch("aioquic.asyncio.client.connect") as mock_connect:
         client_fail = MockQuicClient()
         client_fail._connected = False

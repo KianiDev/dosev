@@ -12,23 +12,31 @@
 |--------|------|---------|-------------|
 | `listen_ip` | string | `0.0.0.0` | IP address to bind to. |
 | `listen_port` | int | `53` | Port for UDP and TCP (plain DNS). |
-| `listen_tls_port` | int | `853` | Port for DNS‑over‑TLS (DoT). |
-| `listen_https_port` | int | `443` | Port for DNS‑over‑HTTPS (DoH). |
-| `https_cert_file` | string | `""` | Path to TLS certificate file (required for DoT/DoH). |
-| `https_key_file` | string | `""` | Path to TLS private key file (required for DoT/DoH). |
-| `https_ca_file` | string | `""` | Path to CA bundle for client certificate verification (optional). |
 
 ---
 
 ### `[resolver]`
 
+**Note:** `upstream_dns` and `protocol` are **deprecated** and have been removed.  
+All upstreams are now defined in the `[upstreams]` section (see below).
+
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `upstream_dns` | string | `1.1.1.1` | Upstream DNS server (host or IP; optional port). |
-| `protocol` | string | `udp` | Protocol to use: `udp`, `tcp`, `tls`, `https`, `quic`. |
 | `verbose` | bool | `false` | Enable debug logging. |
 | `disable_ipv6` | bool | `false` | Do not query AAAA records. |
 | `strip_ipv6_records` | bool | `false` | Strip AAAA records from responses. |
+| `dns_ecs_enabled` | bool | `true` | Enable EDNS Client Subnet. |
+| `dns_max_payload` | int | `4096` | Maximum EDNS payload size (512–4096). |
+| `dns_enable_dot` | bool | `false` | Enable DNS‑over‑TLS server listener. |
+| `dns_dot_port` | int | `853` | Port for DoT server. |
+| `dns_dot_cert_file` | string | `""` | Certificate file for DoT server. |
+| `dns_dot_key_file` | string | `""` | Private key file for DoT server. |
+| `dns_enable_doh` | bool | `false` | Enable DNS‑over‑HTTPS (HTTP/1.1 & HTTP/2) server listener. |
+| `dns_enable_http3` | bool | `false` | Enable DNS‑over‑HTTPS (HTTP/3) server listener. Requires the same certificate and key files as DoH. |
+| `dns_doh_port` | int | `443` | Port for DoH/HTTP/3 server. |
+| `dns_doh_cert_file` | string | `""` | Certificate file for DoH/HTTP/3 server. |
+| `dns_doh_key_file` | string | `""` | Private key file for DoH/HTTP/3 server. |
+| `dns_doh_path` | string | `/dns-query` | URL path for DoH/HTTP/3 server. |
 
 ---
 
@@ -38,7 +46,7 @@
 |--------|------|---------|-------------|
 | `ttl` | int | `300` | TTL (seconds) for positive cache entries. |
 | `max_size` | int | `1024` | Maximum number of cache entries. |
-| `negative_ttl` | int | `60` | TTL for negative (NXDOMAIN) cache entries. |
+| `negative_ttl` | int | `5` | TTL for negative (NXDOMAIN) cache entries (used when SOA MINIMUM is not available). |
 
 ---
 
@@ -66,9 +74,6 @@
 | `pool_idle_timeout` | float | `60.0` | Idle timeout (seconds) for pooled connections. |
 | `doh_version` | string | `auto` | DoH version: `1.1`, `2`, `3`, or `auto`. |
 | `doh_auto_cache_ttl` | int | `3600` | Cache TTL for auto‑detected DoH versions. |
-| `load_balancing` | string | `failover` | Strategy: `failover`, `roundrobin`, `weighted`. |
-| `health_check_interval` | int | `60` | Interval (seconds) between upstream health checks. |
-| `health_check_timeout` | float | `2.0` | Timeout for a health check query. |
 
 ---
 
@@ -96,7 +101,8 @@
 | `log_dir` | string | `/var/log/dosev` or `%LOCALAPPDATA%/dosev/logs` | Directory for log files. |
 | `retention_days` | int | `7` | Number of days to keep log files. |
 | `log_prefix` | string | `dns-log` | Prefix for log filenames. |
-| `format` | string | `text` | Log format: `text` or `json`. |
+
+**Note:** Only plain text logging is supported; JSON output is not implemented.
 
 ---
 
@@ -132,23 +138,29 @@ servers = primary,secondary
 address = 1.1.1.1
 protocol = udp
 port = 53
-hostname = one.one.one.one
+# optional fixed IP – if provided, no DNS resolution is performed for this upstream
+ip = 1.1.1.1
 
 [upstreams.secondary]
-address = 8.8.8.8
+address = dns.google
 protocol = tls
 port = 853
-hostname = dns.google
+hostname = dns.google         # SNI (defaults to 'address')
 ```
 
 Each upstream section supports:
-- `address`: IP or hostname.
-- `protocol`: `udp`, `tcp`, `tls`, `https`, `quic`.
-- `port`: optional (defaults to standard port for the protocol).
-- `hostname`: used for SNI (TLS/DoH).
-- `path`: DoH path (default `/dns-query`).
-- `doh_version`: `auto`, `1.1`, `2`, `3`.
-- `weight`: for weighted load balancing (default `1`).
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `address` | string | **required** | IP or hostname of the upstream server. |
+| `protocol` | string | `udp` | `udp`, `tcp`, `tls`, `https`, `quic`. |
+| `port` | int | auto | Port number (defaults to standard port for the protocol: 53 for UDP/TCP, 853 for TLS/DoQ, 443 for HTTPS). |
+| `hostname` | string | `address` | SNI for TLS/DoH/DoQ and HTTP Host header. |
+| `path` | string | `/dns-query` | DoH URL path (only for `https` protocol). |
+| `doh_version` | string | `auto` | `auto`, `1.1`, `2`, `3`. |
+| `ip` | string | `""` | Optional fixed IP address. If set, DNS resolution is skipped entirely. |
+
+**Upstream selection**: Currently only **failover** is implemented – the first upstream in the list is always tried first; if it fails, the next is tried, and so on. There are no health checks or load balancing algorithms (round‑robin, weighted) implemented yet.
 
 ---
 
@@ -165,18 +177,6 @@ Each upstream section supports:
 
 ---
 
-### `[hosts]`
-
-Define static A/AAAA records.
-
-```ini
-[hosts]
-# Format: domain = ip
-myinternal.local = 192.168.1.10
-```
-
----
-
 ## Example Full Configuration
 
-See `examples/dosev.conf.example` in the source repository for a complete example covering all sections.
+See the default configuration file created on first run for a complete example covering all sections.

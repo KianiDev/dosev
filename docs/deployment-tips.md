@@ -37,39 +37,21 @@ sudo systemctl start dosev
 
 ---
 
-## Docker
+## Running as Non‑Root User
 
-### Using the official image
+If you don't want to use systemd, you can run dosev manually as a non‑root user after binding to privileged ports:
 
 ```bash
-docker run -d \
-  --name dosev \
-  -p 53:53/udp \
-  -p 53:53/tcp \
-  -p 853:853/tcp \
-  -p 443:443/tcp \
-  -v ./config:/etc/dosev \
-  ghcr.io/kianidev/dosev:latest \
-  --config /etc/dosev/dosev.conf
+# Bind to port 53 (requires root)
+sudo dosev --config /etc/dosev/dosev.conf --user dosev --group dosev
 ```
 
-### Docker Compose
+Or use the built‑in privilege dropping (Linux/Unix):
 
-```yaml
-version: '3'
-services:
-  dosev:
-    image: ghcr.io/kianidev/dosev:latest
-    restart: unless-stopped
-    ports:
-      - "53:53/udp"
-      - "53:53/tcp"
-      - "853:853/tcp"
-      - "443:443/tcp"
-    volumes:
-      - ./config:/etc/dosev
-      - ./blocklists:/var/lib/dosev/blocklists
-    command: ["--config", "/etc/dosev/dosev.conf"]
+```ini
+[security]
+dns_privilege_drop_user = dosev
+dns_privilege_drop_group = dosev
 ```
 
 ---
@@ -80,8 +62,7 @@ services:
 - **Enable uvloop**: Set `uvloop_enable = true` in `[metrics]` (Unix only).
 - **Adjust pool sizes**: Increase `pool_max_size` for high‑throughput environments.
 - **Enable optimistic caching**: `optimistic_cache_enabled = true` reduces latency during upstream failures.
-- **Load balancing**: Use `roundrobin` or `weighted` to distribute load.
-- **Health checks**: Set `health_check_interval` to 30–60 seconds for timely failure detection.
+- **Use fixed IPs**: Specify `ip` for upstreams to avoid DNS resolution overhead.
 
 ---
 
@@ -95,16 +76,19 @@ Key metrics:
 - `dosev_dns_requests_total{proto}` – requests per protocol.
 - `dosev_dns_request_errors_total{proto}` – errors per protocol.
 - `dosev_dns_request_latency_seconds{proto}` – latency histogram.
-- `dosev_cache_hits_total` / `dosev_cache_misses_total` – cache efficiency.
 
 ### Logging
 
-Enable structured JSON logging for easier ingestion:
+Enable request logging to file:
 
 ```ini
 [logging]
-format = json
+enabled = true
+log_dir = /var/log/dosev
+retention_days = 7
 ```
+
+**Note:** Only plain text logging is supported.
 
 ---
 
@@ -144,7 +128,5 @@ Always test the new version with `--check-config` before restarting.
 - **Test upstream connectivity**: Ensure upstream DNS servers are reachable.
 - **Firewall**: Verify required ports are open.
 - **File permissions**: Ensure log and blocklist directories are writable by the `dosev` user.
-
----
 
 For further assistance, please open an issue on GitHub.
