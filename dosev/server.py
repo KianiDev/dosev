@@ -607,6 +607,9 @@ async def run_server(listen_ip: str, listen_port: int,
     holder = ResolverHolder(resolver)
     loop = asyncio.get_running_loop()
 
+    # Start background tasks (trust anchor updater, health checks)
+    await resolver.start_background_tasks()
+
     if blocklists is None:
         blocklists = {}
 
@@ -736,7 +739,6 @@ async def run_server(listen_ip: str, listen_port: int,
         server.close()
         await server.wait_closed()
         logging.info("Shutdown complete.")
-
 
 def run_server_sync(listen_ip: str, listen_port: int,
                     verbose: bool = False,

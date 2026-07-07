@@ -504,11 +504,6 @@ class DNSResolver:
         self._health_lock: asyncio.Lock = asyncio.Lock()
         self._health_task: Optional[asyncio.Task] = None
 
-        if self.dnssec_enabled:
-            self._load_trust_anchors()
-            if self.auto_update_trust_anchor:
-                self._trust_anchor_updater_task = asyncio.create_task(self._background_trust_anchor_updater())
-
     # ---------- Health check methods ----------
     def _get_upstream_key(self, upstream: Dict[str, Any]) -> str:
         addr = upstream.get('address', '')
@@ -565,6 +560,15 @@ class DNSResolver:
                 self.logger.warning("Health check loop error: %s", e)
 
     async def start_health_checks(self) -> None:
+        if self._health_enabled and self.upstreams and self._health_task is None:
+            self._health_task = asyncio.create_task(self._health_check_loop())
+            self.logger.info("Health check loop started")
+            
+    async def start_background_tasks(self) -> None:
+        """Start background tasks: DNSSEC trust anchor updater and health checks."""
+        if self.dnssec_enabled and self.auto_update_trust_anchor and self._trust_anchor_updater_task is None:
+            self._trust_anchor_updater_task = asyncio.create_task(self._background_trust_anchor_updater())
+            self.logger.info("Trust anchor updater started")
         if self._health_enabled and self.upstreams and self._health_task is None:
             self._health_task = asyncio.create_task(self._health_check_loop())
             self.logger.info("Health check loop started")

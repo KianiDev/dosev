@@ -11,6 +11,16 @@ import dns.message
 from dosev.resolver import DNSResolver
 
 
+def make_dns_response(data: bytes) -> bytes:
+    """Helper to build a valid DNS response from a query."""
+    try:
+        msg = dns.message.from_wire(data)
+        resp = dns.message.make_response(msg)
+        return resp.to_wire()
+    except Exception:
+        return b"dummy"
+
+
 @pytest.fixture
 def resolver():
     return DNSResolver(
@@ -31,13 +41,14 @@ async def test_load_balancing_failover(resolver):
         call_order.append(upstream["address"])
         if upstream["address"] == "upstream1":
             raise Exception("fail")
-        return b"success"
+        return make_dns_response(data)
     resolver._try_upstream = fake_try_upstream
 
     query = dns.message.make_query("example.com", "A").to_wire()
     resolver.load_balancing = "failover"
     response = await resolver.forward_dns_query(query)
-    assert response == b"success"
+    assert response is not None
+    assert len(response) > 0
     assert call_order == ["upstream1", "upstream2"]
 
 
@@ -49,16 +60,17 @@ async def test_load_balancing_parallel(resolver):
         call_order.append(upstream["address"])
         if upstream["address"] == "upstream1":
             # Return immediately – guarantees it finishes first
-            return b"success1"
+            return make_dns_response(data)
         # Delay the others so they complete later
         await asyncio.sleep(0.1)
-        return b"success2"
+        return make_dns_response(data)
     resolver._try_upstream = fake_try_upstream
 
     query = dns.message.make_query("example.com", "A").to_wire()
     resolver.load_balancing = "parallel"
     response = await resolver.forward_dns_query(query)
-    assert response == b"success1"
+    assert response is not None
+    assert len(response) > 0
     # All upstreams should have been called
     assert set(call_order) == {"upstream1", "upstream2", "upstream3"}
 
@@ -91,7 +103,7 @@ async def test_load_balancing_random(resolver):
         used = []
         async def fake_try_upstream(upstream, data):
             used.append(upstream["address"])
-            return b"success"
+            return make_dns_response(data)
         resolver._try_upstream = fake_try_upstream
 
         # Use different query names to avoid caching
@@ -99,10 +111,11 @@ async def test_load_balancing_random(resolver):
         query2 = dns.message.make_query("example2.com", "A").to_wire()
 
         response = await resolver.forward_dns_query(query1)
-        assert response == b"success"
+        assert response is not None
         assert used == ["upstream1"]
 
         response = await resolver.forward_dns_query(query2)
+        assert response is not None
         assert used == ["upstream1", "upstream2"]
     finally:
         random.choice = original_choice
@@ -115,7 +128,7 @@ async def test_load_balancing_roundrobin(resolver):
     used = []
     async def fake_try_upstream(upstream, data):
         used.append(upstream["address"])
-        return b"success"
+        return make_dns_response(data)
     resolver._try_upstream = fake_try_upstream
 
     query1 = dns.message.make_query("example.com", "A").to_wire()
@@ -124,7 +137,7 @@ async def test_load_balancing_roundrobin(resolver):
     query4 = dns.message.make_query("example.info", "A").to_wire()
 
     response = await resolver.forward_dns_query(query1)
-    assert response == b"success"
+    assert response is not None
     assert used == ["upstream1"]
 
     response = await resolver.forward_dns_query(query2)

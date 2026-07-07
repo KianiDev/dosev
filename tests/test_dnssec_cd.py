@@ -18,6 +18,7 @@ def resolver_with_dnssec():
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
         dnssec_enabled=True,
+        auto_update_trust_anchor=False,  # prevent background task creation
     )
     # Mock trust anchors to avoid real validation
     resolver._dnssec_raw_anchors = {dns.name.root: b"dummy"}
