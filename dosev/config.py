@@ -151,8 +151,6 @@ retries = 2
 #
 # Each upstream is a named section under [upstreams].
 # The list of active upstreams is defined in the "servers" option below.
-# The load‑balancing strategy (failover, round‑robin, weighted) is not yet
-# implemented; the first available upstream is used.
 #
 # Fields:
 #   address   – domain name or IP address (required)
@@ -161,9 +159,9 @@ retries = 2
 #   hostname  – SNI for TLS/DoH; defaults to address
 #   path      – DoH URL path (default: /dns-query)
 #   ip        – optional fixed IP address to avoid DNS resolution
-#   doh_version – 1.1, 2, 3, or auto
+#   doh_version – 1.1, 2, 3, or auto (default: auto)
 #
-# Example:
+# Example with fixed IP (no DNS resolution needed):
 # [upstreams.cloudflare]
 # address = cloudflare-dns.com
 # protocol = https
@@ -171,12 +169,15 @@ retries = 2
 # ip = 1.1.1.1
 # doh_version = auto
 #
+# Example without fixed IP (uses bootstrap servers to resolve):
 # [upstreams.google]
 # address = dns.google
 # protocol = https
 # port = 443
+# doh_version = auto
 #
 [upstreams]
+# List the active upstreams (comma‑separated names from sections above)
 servers = 
 
 # ============================================================================
@@ -238,10 +239,6 @@ def _validate_and_warn(config: Dict[str, Any]) -> None:
     dns_max_payload = config.get('dns_max_payload', 4096)
     if not isinstance(dns_max_payload, int) or not 512 <= dns_max_payload <= 4096:
         raise ValueError('dns_max_payload must be between 512 and 4096')
-
-    protocol = config.get('protocol', 'udp')
-    if protocol not in {'udp', 'tcp', 'tls', 'https', 'quic'}:
-        raise ValueError('protocol must be one of: udp, tcp, tls, https, quic')
 
     if config.get('dns_enable_dot', False) and not (config.get('dns_dot_cert_file') and config.get('dns_dot_key_file')):
         raise ValueError('dns_enable_dot requires dns_dot_cert_file and dns_dot_key_file')
@@ -329,7 +326,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     listen_ip = config.get('server', 'listen_ip', fallback='0.0.0.0')
     listen_port = config.getint('server', 'listen_port', fallback=53)
 
-    # Resolver (ignore upstream_dns and protocol)
+    # Resolver (ignore upstream_dns and protocol if present for backwards compat)
     verbose = config.getboolean('resolver', 'verbose', fallback=False)
     disable_ipv6 = config.getboolean('resolver', 'disable_ipv6', fallback=False)
     dns_ecs_enabled = config.getboolean('resolver', 'dns_ecs_enabled', fallback=True)
@@ -442,7 +439,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
             us_doh_version = config.get(section, 'doh_version', fallback=doh_version).lower()
             if us_doh_version not in ('auto', '1.1', '2', '3'):
                 us_doh_version = doh_version
-            ip = config.get(section, 'ip', fallback=None)  # new field
+            ip = config.get(section, 'ip', fallback=None)
             upstreams.append({
                 'address': address,
                 'protocol': proto,
@@ -450,7 +447,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
                 'hostname': hostname,
                 'doh_version': us_doh_version,
                 'path': path,
-                'ip': ip,  # optional fixed IP
+                'ip': ip,
             })
 
     # If no upstreams defined, use a default (1.1.1.1 over UDP)
@@ -462,7 +459,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
             'hostname': '1.1.1.1',
             'doh_version': 'auto',
             'path': '',
-            'ip': '1.1.1.1',  # fixed IP to avoid resolution
+            'ip': '1.1.1.1',
         })
         warnings.warn('No upstreams defined in [upstreams]; using default 1.1.1.1 over UDP.', RuntimeWarning)
 
