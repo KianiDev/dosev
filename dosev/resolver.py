@@ -2021,7 +2021,7 @@ class DNSResolver:
         configuration.server_name = hostname
 
         class H3Protocol:
-            def __init__(self, conn):
+            def __init__(self, conn, *args, **kwargs):
                 self.conn = conn
                 self.h3 = H3Connection(conn)
 
@@ -2030,7 +2030,7 @@ class DNSResolver:
                     pass
 
         async with quic_connect(resolved, port, configuration=configuration,
-                                create_protocol=lambda conn: H3Protocol(conn)) as client:
+                                create_protocol=lambda conn, *args, **kwargs: H3Protocol(conn)) as client:
             proto = client._protocol
             connection = client._quic
             h3 = proto.h3
@@ -2076,7 +2076,6 @@ class DNSResolver:
             await asyncio.wait_for(handle_events(), timeout=self.doh_timeout + 5)
             await self._h3_pool.put(key, (connection, h3))
             return bytes(response_data)
-
     # ---------- DOQ with connection pooling ----------
     async def _forward_quic(self, data: bytes, upstream: Dict[str, Any]) -> bytes:
         if not _HAS_AIOQUIC:
