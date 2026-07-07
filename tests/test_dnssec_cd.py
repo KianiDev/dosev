@@ -34,30 +34,26 @@ async def test_cd_flag_skips_validation(resolver_with_dnssec):
     query.flags |= 0x0010
     qwire = query.to_wire()
 
-    # Mock _try_upstream to return a response that would normally be bogus
-    # We'll return a response without RRSIGs
+    # Mock _try_upstream to return a response without RRSIGs
     resp = dns.message.make_response(query)
     rr = dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "93.184.216.34")
     resp.answer.append(rr)
     resp_wire = resp.to_wire()
 
-    # Mock _try_upstream to return this response
     async def fake_try_upstream(upstream, data, _health_check=False):
         return resp_wire
     resolver_with_dnssec._try_upstream = fake_try_upstream
 
-    # Also mock _dnssec_validate to ensure it's NOT called
+    # Mock _dnssec_validate to ensure it's NOT called
     validate_called = False
-    original_validate = resolver_with_dnssec._dnssec_validate
     async def fake_validate(qname, wire, requested):
         nonlocal validate_called
         validate_called = True
-        return await original_validate(qname, wire, requested)
+        return False, True
     resolver_with_dnssec._dnssec_validate = fake_validate
 
     result = await resolver_with_dnssec.forward_dns_query(qwire)
     msg = dns.message.from_wire(result)
-    # Should return the response without validation error
     assert msg.rcode() == 0
     assert len(msg.answer) == 1
     # validate should NOT have been called because CD flag is set
@@ -71,8 +67,10 @@ async def test_no_cd_flag_triggers_validation(resolver_with_dnssec):
     query = dns.message.make_query("example.com", "A")
     # Ensure CD flag is not set
     query.flags &= ~0x0010
-    # Set DO bit to request DNSSEC
-    query.use_edns(flags=dns.flags.DO)
+    # Set DO bit using proper EDNS
+    query.use_edns(payload=1232)
+    if query.opt:
+        query.opt.flags |= dns.flags.DO
     qwire = query.to_wire()
 
     # Mock _try_upstream to return a response without RRSIGs (insecure)
@@ -87,12 +85,11 @@ async def test_no_cd_flag_triggers_validation(resolver_with_dnssec):
 
     # Mock _dnssec_validate to track call
     validate_called = False
-    original_validate = resolver_with_dnssec._dnssec_validate
     async def fake_validate(qname, wire, requested):
         nonlocal validate_called
         validate_called = True
         # Return insecure (unsigned) to simulate validation result
-        return False, True  # secure=False, insecure=True
+        return False, True
     resolver_with_dnssec._dnssec_validate = fake_validate
 
     result = await resolver_with_dnssec.forward_dns_query(qwire)

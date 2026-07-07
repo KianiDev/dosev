@@ -1573,7 +1573,8 @@ class DNSResolver:
                 pass
 
         dnssec_ok = False
-        if self.dnssec_enabled and qname:
+        # Only validate if DNSSEC is enabled AND the client requested it (CD flag not set)
+        if self.dnssec_enabled and qname and dnssec_requested:
             try:
                 secure, insecure = await self._dnssec_validate(qname, resp, dnssec_requested)
                 if secure:
