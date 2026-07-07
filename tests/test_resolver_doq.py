@@ -49,8 +49,8 @@ async def test_doq_connection_pool_reuse(resolver):
         async def __aexit__(self, *args):
             pass
 
-    # Patch the connect function directly
-    with patch("aioquic.asyncio.client.connect", return_value=CM()) as mock_connect:
+    # Patch the connect function at the correct import location
+    with patch("aioquic.asyncio.connect", return_value=CM()) as mock_connect:
         dummy_response = b"\x00\x0d" + b"dummy_response"
         with patch("asyncio.wait_for", new=AsyncMock(return_value=dummy_response)):
             query = dns.message.make_query("example.com", "A").to_wire()
@@ -95,8 +95,8 @@ async def test_doq_connection_pool_closed_connection(resolver):
     def connect_side_effect(*args, **kwargs):
         return connect_returns.pop(0)
 
-    # Patch the connect function
-    with patch("aioquic.asyncio.client.connect", side_effect=connect_side_effect) as mock_connect:
+    # Patch the connect function at the correct import location
+    with patch("aioquic.asyncio.connect", side_effect=connect_side_effect) as mock_connect:
         # Mock pool.get to return closed client on second call
         with patch.object(resolver._quic_pool, "get") as mock_pool_get:
             mock_pool_get.side_effect = [None, client_closed]
@@ -127,7 +127,7 @@ async def test_doq_connection_pool_handles_timeout(resolver):
         async def __aexit__(self, *args):
             pass
 
-    with patch("aioquic.asyncio.client.connect", return_value=CM()) as mock_connect:
+    with patch("aioquic.asyncio.connect", return_value=CM()) as mock_connect:
         with patch("asyncio.wait_for", new=AsyncMock(side_effect=asyncio.TimeoutError)):
             query = dns.message.make_query("example.com", "A").to_wire()
             upstream = resolver.upstreams[0]
@@ -151,7 +151,7 @@ async def test_doq_pool_handles_connection_error_during_handshake(resolver):
         async def __aexit__(self, *args):
             pass
 
-    with patch("aioquic.asyncio.client.connect", return_value=CM()) as mock_connect:
+    with patch("aioquic.asyncio.connect", return_value=CM()) as mock_connect:
         query = dns.message.make_query("example.com", "A").to_wire()
         upstream = resolver.upstreams[0]
 
