@@ -1,15 +1,124 @@
 import os
+import sys
 import configparser
 import warnings
 from typing import Dict, Any, List, Optional
 
+# ---------- Default configuration content ----------
+DEFAULT_CONFIG_CONTENT = """[server]
+listen_ip = 0.0.0.0
+listen_port = 53
 
+[resolver]
+upstream_dns = 1.1.1.1
+protocol = udp
+verbose = false
+disable_ipv6 = false
+dns_ecs_enabled = true
+dns_max_payload = 4096
+dns_enable_dot = false
+dns_dot_port = 853
+dns_dot_cert_file = 
+dns_dot_key_file = 
+dns_enable_doh = false
+dns_doh_port = 443
+dns_doh_cert_file = 
+dns_doh_key_file = 
+dns_doh_path = /dns-query
+strip_ipv6_records = 
+
+[cache]
+ttl = 300
+max_size = 1024
+negative_ttl = 5
+
+[timeouts]
+udp = 2.0
+tcp = 5.0
+doh = 5.0
+
+[advanced]
+retries = 2
+rate_limit_rps = 0.0
+rate_limit_burst = 0.0
+optimistic_cache_enabled = false
+optimistic_stale_max_age = 86400
+optimistic_stale_response_ttl = 30
+pool_max_size = 5
+pool_idle_timeout = 60.0
+doh_version = auto
+doh_auto_cache_ttl = 3600
+
+[security]
+dnssec_enabled = false
+auto_update_trust_anchor = true
+trust_anchors_file = 
+pinned_certs = 
+rebind_protection = false
+rebind_action = strip
+dns_privilege_drop_user = 
+dns_privilege_drop_group = 
+dns_chroot_dir = 
+
+[logging]
+enabled = false
+retention_days = 7
+log_dir = 
+log_prefix = dns-log
+
+[metrics]
+enabled = false
+port = 8000
+uvloop_enable = false
+
+[bootstrap]
+servers = 1.1.1.1:53,8.8.8.8:53
+timeout = 2.0
+retries = 2
+
+[upstreams]
+servers = 
+
+[blocklists]
+enabled = false
+urls = 
+interval_seconds = 86400
+action = NXDOMAIN
+local_blocklist_dir = blocklists
+reload_on_change = true
+"""
+
+# ---------- OS‑specific config directory ----------
 def _default_log_dir() -> str:
     if os.name == 'nt':
         return os.path.join(os.getenv('LOCALAPPDATA') or os.path.expanduser('~'), 'dosev', 'logs')
     return '/var/log/dosev'
 
+def get_user_config_dir() -> str:
+    """Return the OS‑specific user configuration directory for dosev."""
+    if os.name == 'nt':
+        base = os.getenv('APPDATA')
+        if not base:
+            base = os.path.expanduser('~')
+        return os.path.join(base, 'dosev')
+    elif sys.platform == 'darwin':
+        return os.path.join(os.path.expanduser('~/Library/Application Support'), 'dosev')
+    else:
+        return os.path.join(os.path.expanduser('~/.config'), 'dosev')
 
+def get_default_config_path() -> str:
+    """Return the full path to the default configuration file."""
+    return os.path.join(get_user_config_dir(), 'dosev.conf')
+
+def write_default_config(path: str) -> None:
+    """Write the default configuration content to the given path."""
+    dirname = os.path.dirname(path)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(DEFAULT_CONFIG_CONTENT)
+
+# ---------- Validation and loading ----------
 def _validate_and_warn(config: Dict[str, Any]) -> None:
     listen_port = config.get('listen_port', 53)
     if not isinstance(listen_port, int) or not 1 <= listen_port <= 65535:
@@ -47,7 +156,6 @@ def _validate_and_warn(config: Dict[str, Any]) -> None:
     if config.get('doh_version', 'auto') not in {'auto', '1.1', '2', '3'}:
         raise ValueError('doh_version must be auto, 1.1, 2, or 3')
 
-
 def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     config = configparser.ConfigParser()
     if not os.path.exists(path):
@@ -58,7 +166,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
             'protocol': 'udp',
             'verbose': False,
             'disable_ipv6': False,
-            'strip_ipv6_records': None,  # None = use disable_ipv6 value
+            'strip_ipv6_records': None,
             'dns_cache_ttl': 300,
             'dns_cache_max_size': 1024,
             'dns_negative_cache_ttl': 5,

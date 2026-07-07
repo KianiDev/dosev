@@ -1,19 +1,34 @@
 import os
 import sys
 import argparse
-from .config import load_config, _default_log_dir
+from .config import load_config, _default_log_dir, get_default_config_path, write_default_config
 from .server import run_server_sync
 
 def main() -> None:
+    default_config = get_default_config_path()
     parser = argparse.ArgumentParser(description="dosev DNS server")
-    parser.add_argument("--config", "-c", default="config/dosev.conf",
-                        help="Path to configuration file (default: config/dosev.conf)")
+    parser.add_argument("--config", "-c", default=default_config,
+                        help=f"Path to configuration file (default: {default_config})")
     parser.add_argument("--check-config", action="store_true",
                         help="Validate the configuration and exit without starting the server")
     args = parser.parse_args()
 
+    config_path = args.config
+
+    # If this is the default config path and the file does not exist, create it and exit
+    if config_path == default_config and not os.path.exists(config_path):
+        try:
+            write_default_config(config_path)
+            print(f"Default configuration file created at:\n  {config_path}", file=sys.stderr)
+            print("Please edit it to your needs and restart dosev.", file=sys.stderr)
+            sys.exit(0)
+        except Exception as e:
+            print(f"Error creating default config: {e}", file=sys.stderr)
+            print("Falling back to built‑in defaults.", file=sys.stderr)
+            # Continue with default config (load_config will return defaults)
+
     try:
-        config = load_config(args.config)
+        config = load_config(config_path)
     except Exception as e:
         print(f"Failed to load config: {e}", file=sys.stderr)
         sys.exit(1)
@@ -39,7 +54,7 @@ def main() -> None:
         dns_log_prefix=config.get("dns_log_prefix", "dns-log"),
         dns_pinned_certs=config.get("dns_pinned_certs", {}),
         dnssec_enabled=config.get("dnssec_enabled", False),
-        auto_update_trust_anchor=config.get("auto_update_trust_anchor", True),  # NEW
+        auto_update_trust_anchor=config.get("auto_update_trust_anchor", True),
         trust_anchors_file=config.get("trust_anchors_file", ""),
         metrics_enabled=config.get("metrics_enabled", False),
         metrics_port=config.get("metrics_port", 8000),
