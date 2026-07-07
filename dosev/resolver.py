@@ -516,8 +516,9 @@ class DNSResolver:
             qname = self._health_domain
             query = dns.message.make_query(qname, dns.rdatatype.SOA)
             data = query.to_wire()
+            # Use a single attempt without retries for health checks
             result = await asyncio.wait_for(
-                self._try_upstream(upstream, data, _health_check=True),
+                self._try_upstream(upstream, data, _health_check=True, _no_retry=True),
                 timeout=self._health_timeout
             )
             return True
@@ -1327,12 +1328,12 @@ class DNSResolver:
                 pass
 
     # ---------- _try_upstream with health checks and TCP fallback ----------
-    async def _try_upstream(self, upstream: Dict[str, Any], data: bytes, _health_check: bool = False) -> bytes:
+    async def _try_upstream(self, upstream: Dict[str, Any], data: bytes, _health_check: bool = False, _no_retry: bool = False) -> bytes:
         proto = upstream.get('protocol', 'udp')
         if proto == 'udp':
             try:
                 response = await self._with_retries(
-                    lambda d: self._forward_udp(d, upstream), data, timeout=self.udp_timeout)
+                    lambda d: self._forward_udp(d, upstream), data, timeout=self.udp_timeout, no_retry=_no_retry)
                 if self.tcp_fallback_enabled and not _health_check:
                     if len(response) >= 4:
                         flags = int.from_bytes(response[2:4], 'big')
@@ -1344,28 +1345,28 @@ class DNSResolver:
                             if 'port' not in tcp_upstream:
                                 tcp_upstream['port'] = 53
                             return await self._with_retries(
-                                lambda d: self._forward_tcp(d, tcp_upstream), data, timeout=self.tcp_timeout)
+                                lambda d: self._forward_tcp(d, tcp_upstream), data, timeout=self.tcp_timeout, no_retry=_no_retry)
                 return response
             except Exception as e:
                 # If UDP fails, we don't fallback to TCP; only on truncation
                 raise
         elif proto == 'tcp':
             return await self._with_retries(
-                lambda d: self._forward_tcp(d, upstream), data, timeout=self.tcp_timeout)
+                lambda d: self._forward_tcp(d, upstream), data, timeout=self.tcp_timeout, no_retry=_no_retry)
         elif proto == 'tls':
             return await self._with_retries(
-                lambda d: self._forward_tls(d, upstream), data, timeout=self.tcp_timeout)
+                lambda d: self._forward_tls(d, upstream), data, timeout=self.tcp_timeout, no_retry=_no_retry)
         elif proto == 'https':
             return await self._with_retries(
-                lambda d: self._forward_https(d, upstream), data, timeout=self.doh_timeout)
+                lambda d: self._forward_https(d, upstream), data, timeout=self.doh_timeout, no_retry=_no_retry)
         elif proto == 'quic':
             if not _HAS_AIOQUIC:
                 raise RuntimeError("aioquic not available for DoQ")
             return await self._with_retries(
-                lambda d: self._forward_quic(d, upstream), data, timeout=self.doh_timeout)
+                lambda d: self._forward_quic(d, upstream), data, timeout=self.doh_timeout, no_retry=_no_retry)
         else:
             raise ValueError(f"Unsupported upstream protocol: {proto}")
-
+        
     # ---------- Refactored forward_dns_query with CD flag ----------
     async def forward_dns_query(self, data: bytes) -> bytes:
         # Extract query details and cache key
@@ -1503,30 +1504,28 @@ class DNSResolver:
             raise last_exc or Exception("All upstreams failed")
 
         elif strategy == 'parallel':
-            tasks = [asyncio.create_task(self._process_upstream_response(
-                upstream, data, qname, dnssec_requested, key, orig_id))
-                     for upstream in upstream_list]
-            pending = set(tasks)
+            # Limit concurrency to avoid overwhelming the upstream/system
+            semaphore = asyncio.Semaphore(5)  # max 5 concurrent tasks per query
+            async def bounded_task(upstream):
+                async with semaphore:
+                    return await self._process_upstream_response(
+                        upstream, data, qname, dnssec_requested, key, orig_id)
+            tasks = [asyncio.create_task(bounded_task(upstream)) for upstream in upstream_list]
             try:
-                while pending:
-                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                    for task in done:
-                        if not task.cancelled():
-                            try:
-                                result = task.result()
-                                # Cancel remaining tasks
-                                for t in pending:
-                                    t.cancel()
-                                return result
-                            except Exception as e:
-                                if not pending:
-                                    raise e
-                                continue
-                    break
-                if pending:
-                    for t in pending:
-                        t.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
+                # Wait for the first success
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for t in done:
+                    if not t.cancelled():
+                        try:
+                            result = t.result()
+                            # Cancel remaining
+                            for p in pending:
+                                p.cancel()
+                            return result
+                        except Exception as e:
+                            # If the first completed task failed, wait for others
+                            pass
+                # If all failed, raise
                 raise last_exc or Exception("All upstreams failed in parallel")
             except Exception as e:
                 for t in tasks:
@@ -1534,7 +1533,7 @@ class DNSResolver:
                         t.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
                 raise e
-
+            
         elif strategy == 'random':
             import random
             upstream = random.choice(upstream_list)
@@ -1801,17 +1800,28 @@ class DNSResolver:
                 version, expiry = self._doh_auto_cache[hostname]
                 if now < expiry and version != '_probing':
                     return version
-            self._doh_auto_cache[hostname] = ('_probing', now + 60)
+            # If previous probe failed recently, don't retry immediately
+            if hostname in self._doh_auto_cache:
+                version, expiry = self._doh_auto_cache[hostname]
+                if version == '_failed' and now < expiry:
+                    return '1.1'  # default fallback
+            self._doh_auto_cache[hostname] = ('_probing', now + 10)
 
         probe_data = dns.message.make_query('probe.invalid', 'A').to_wire()
+        # Try HTTP/3 with a single attempt and no retries
         try:
-            await self._with_retries(
-                lambda d: self._forward_https3(d, hostname, port, host, path, None), probe_data, timeout=self.doh_timeout)
+            await asyncio.wait_for(
+                self._forward_https3(probe_data, hostname, port, host, path, None),
+                timeout=self.doh_timeout
+            )
             version = '3'
         except Exception:
+            # Try HTTP/2
             try:
-                await self._with_retries(
-                    lambda d: self._forward_https2(d, hostname, port, host, path, None), probe_data, timeout=self.doh_timeout)
+                await asyncio.wait_for(
+                    self._forward_https2(probe_data, hostname, port, host, path, None),
+                    timeout=self.doh_timeout
+                )
                 version = '2'
             except Exception:
                 version = '1.1'
@@ -1819,6 +1829,9 @@ class DNSResolver:
         async with self._doh_auto_lock:
             if self._doh_auto_cache.get(hostname, ('', 0))[0] == '_probing':
                 self._doh_auto_cache[hostname] = (version, time.time() + self.doh_auto_cache_ttl)
+            elif version == '1.1':
+                # Cache failure to avoid repeated probing
+                self._doh_auto_cache[hostname] = ('_failed', time.time() + self.doh_auto_cache_ttl // 2)
         return version
 
     async def _forward_https1(self, data: bytes, hostname: str, port: int, host: str, path: str, ip_override: Optional[str]) -> bytes:
@@ -2399,7 +2412,14 @@ class DNSResolver:
         header[2:4] = flags.to_bytes(2, 'big')
         return bytes(header)
 
-    async def _with_retries(self, fn: Callable[[bytes], Coroutine[Any, Any, bytes]], data: bytes, timeout: float) -> bytes:
+    async def _with_retries(self, fn: Callable[[bytes], Coroutine[Any, Any, bytes]], data: bytes, timeout: float, no_retry: bool = False) -> bytes:
+        if no_retry:
+            # Single attempt, no backoff
+            try:
+                return await asyncio.wait_for(fn(data), timeout=timeout)
+            except Exception as e:
+                raise e
+
         backoff = 0.1
         last_exc: Optional[Exception] = None
         for attempt in range(self.retries):
@@ -2421,9 +2441,10 @@ class DNSResolver:
             except Exception as e:
                 last_exc = e
                 self.logger.debug("attempt %d failed for %s: %s", attempt + 1, fn.__name__, e)
-            await asyncio.sleep(backoff)
-            self.logger.debug("backing off %.3fs before next attempt", backoff)
-            backoff *= 2
+            if attempt < self.retries - 1:
+                await asyncio.sleep(backoff)
+                self.logger.debug("backing off %.3fs before next attempt", backoff)
+                backoff *= 2
         self.logger.error("all %d attempts failed for %s", self.retries, fn.__name__)
         if self.metrics_enabled and self._metrics:
             try:
