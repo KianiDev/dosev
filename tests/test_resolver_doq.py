@@ -16,6 +16,7 @@ class MockQuicClient:
     """Mock aioquic client for testing."""
     def __init__(self, closed=False):
         self._quic = MagicMock()
+        # Add closed property
         self._quic.closed = closed
         self._quic.get_next_available_stream_id = MagicMock(return_value=0)
         self._quic.send_stream_data = MagicMock()

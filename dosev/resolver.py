@@ -1871,7 +1871,8 @@ class DNSResolver:
         # Try to get a pooled client
         client = await self._quic_pool.get(key)
         if client is not None:
-            if client._quic is None or client._quic.closed:
+            # Check if the connection is still alive – use getattr for safety
+            if client._quic is None or getattr(client._quic, 'closed', False):
                 client = None
 
         if client is None:
@@ -1881,6 +1882,7 @@ class DNSResolver:
                 verify_mode=ssl.CERT_NONE,
                 server_name=hostname,
             )
+            # Enter the async context manually to keep the client alive
             cm = connect(resolved, port, configuration=config, create_protocol=DoQProtocol)
             client = await cm.__aenter__()
             client._cm = cm
@@ -1900,7 +1902,7 @@ class DNSResolver:
             response_data = await asyncio.wait_for(future, timeout=self.doh_timeout)
         except asyncio.TimeoutError:
             client._pending.pop(stream_id, None)
-            if not client._quic.closed:
+            if not getattr(client._quic, 'closed', False):
                 client._quic.close()
             raise TimeoutError(f"DoQ query to {host}:{port} timed out")
         except Exception:
@@ -1916,11 +1918,11 @@ class DNSResolver:
             raise Exception("DoQ response truncated")
         resp = response_data[2:2+resp_len]
 
-        if not client._quic.closed:
+        # Put the client back into the pool if it's still open
+        if not getattr(client._quic, 'closed', False):
             await self._quic_pool.put(key, client)
 
         return resp
-
     def _get_quic_cert_der(self, client: Any) -> Optional[bytes]:
         try:
             if hasattr(client, 'get_peer_certificate'):

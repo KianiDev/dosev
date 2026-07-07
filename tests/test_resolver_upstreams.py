@@ -123,27 +123,40 @@ async def test_forward_tcp_uses_ip_override():
 
 
 @pytest.mark.asyncio
-async def test_forward_https_uses_ip_override():
+async def test_forward_quic_uses_ip_override():
     resolver = DNSResolver()
     upstream = {
         "address": "example.com",
-        "protocol": "https",
-        "port": 443,
+        "protocol": "quic",
+        "port": 853,
         "ip": "192.0.2.1",
-        "hostname": "example.com",
-        "path": "/dns-query",
-        "doh_version": "auto"
+        "hostname": "example.com"
     }
     data = dns.message.make_query("test.com", "A").to_wire()
 
-    with patch.object(resolver, "_get_auto_doh_version", new=AsyncMock(return_value="1.1")):
-        with patch.object(resolver, "_forward_https1") as mock_https1:
-            mock_https1.return_value = b"dummy_response"
-            with patch.object(resolver, "_resolve_upstream_ip") as mock_resolve:
-                mock_resolve.return_value = "192.0.2.1"
-                result = await resolver._forward_https(data, upstream)
-                assert result == b"dummy_response"
-                mock_resolve.assert_called_once_with("example.com", "192.0.2.1")
+    with patch.object(resolver, "_resolve_upstream_ip") as mock_resolve:
+        mock_resolve.return_value = "192.0.2.1"
+        with patch("aioquic.asyncio.client.connect") as mock_connect:
+            class CM:
+                async def __aenter__(self):
+                    client = MagicMock()
+                    client._quic = MagicMock()
+                    client._quic.closed = False
+                    client._quic.get_next_available_stream_id = MagicMock(return_value=0)
+                    client._quic.send_stream_data = MagicMock()
+                    client.transmit = MagicMock()
+                    client.wait_connected = AsyncMock()
+                    return client
+                async def __aexit__(self, *args):
+                    pass
+            mock_connect.return_value = CM()
+            with patch("aioquic.asyncio.protocol.QuicConnectionProtocol.wait_connected", new=AsyncMock()):
+                dummy_response = b"dummy_response"
+                response_data = len(dummy_response).to_bytes(2, "big") + dummy_response
+                with patch("asyncio.wait_for", new=AsyncMock(return_value=response_data)):
+                    result = await resolver._forward_quic(data, upstream)
+                    assert result == dummy_response
+                    mock_resolve.assert_called_once_with("example.com", ip_override="192.0.2.1")
 
 
 @pytest.mark.asyncio
