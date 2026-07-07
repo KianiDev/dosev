@@ -51,12 +51,20 @@ The heart of the system. It manages:
 
 - **Caches**: positive cache (TTL‑based), negative cache (NXDOMAIN/NODATA), and stale‑serve logic.
 - **Blocklists & Hosts**: exact‑match and suffix‑based domain filtering; static A/AAAA overrides.
-- **Upstream management**: supports `failover`, `parallel`, `random`, and `roundrobin` strategies; configured via `load_balancing` in the config.
+- **Upstream management**: supports `failover`, `parallel`, `random`, and `roundrobin` strategies; configured via `load_balancing` in the config. Also includes health checks (circuit breaker) and TCP fallback on truncated UDP responses.
 - **DNSSEC**: validates responses using a trust anchor (bundled or IANA‑fetched); caches validation results.
 - **EDNS0**: parses client subnet and forwards it to upstreams.
 - **Rate limiting**: token‑bucket per client IP.
 - **Rebinding protection**: strips or blocks private IPs.
 - **Metrics**: collects request counts, errors, and latency.
+
+### Health Checks
+
+The resolver periodically tests each upstream using a DNS query (default: SOA for root). If an upstream fails `unhealthy_threshold` consecutive checks, it is marked unhealthy and skipped during query routing. After `cooldown` seconds and `healthy_threshold` successful checks, it is restored. If all upstreams are unhealthy, the resolver uses all of them as a fallback.
+
+### TCP Fallback
+
+If an upstream returns a UDP response with the TC (truncation) bit set, the resolver automatically retries the same query over TCP to that upstream, returning the full response.
 
 **Key Methods**:
 

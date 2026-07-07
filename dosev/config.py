@@ -27,6 +27,8 @@ listen_port = 53
 verbose = false
 # If true, all IPv6 answers will be stripped (AAAA records removed).
 disable_ipv6 = false
+# Strip AAAA records from responses (applied after resolution).
+strip_ipv6_records = false
 # Enable EDNS Client Subnet (ECS) – helps CDNs but may reduce privacy.
 dns_ecs_enabled = true
 # Maximum EDNS payload size (512–4096).
@@ -34,22 +36,20 @@ dns_max_payload = 4096
 
 # ---------- DNS over TLS (DoT) server listener ----------
 dns_enable_dot = false
-dns_dot_port = 853
-dns_dot_cert_file = 
-dns_dot_key_file = 
+# dns_dot_port = 853
+# dns_dot_cert_file = /path/to/cert.pem
+# dns_dot_key_file = /path/to/key.pem
 
 # ---------- DNS over HTTPS (DoH) server listener ----------
+# HTTP/1.1 and HTTP/2 are provided by aiohttp.
 dns_enable_doh = false
-dns_doh_port = 443
-dns_doh_cert_file = 
-dns_doh_key_file = 
-dns_doh_path = /dns-query
+# dns_doh_port = 443
+# dns_doh_cert_file = /path/to/cert.pem
+# dns_doh_key_file = /path/to/key.pem
+# dns_doh_path = /dns-query
 
 # ---------- DNS over HTTPS (HTTP/3) server listener ----------
 dns_enable_http3 = false
-
-# If true, strip all AAAA records (IPv6) from responses.
-strip_ipv6_records = false
 
 # ============================================================================
 # CACHE – local caching settings
@@ -103,6 +103,28 @@ doh_auto_cache_ttl = 3600
 # - roundrobin: cycle through upstreams in order.
 load_balancing = failover
 
+# Automatically retry a UDP query over TCP if the response has the TC (truncation) bit set.
+tcp_fallback_enabled = true
+
+# ============================================================================
+# HEALTH – upstream health checks (circuit breaker)
+# ============================================================================
+[health]
+# Enable periodic health checks for upstream servers.
+enabled = false
+# Interval between health checks (seconds).
+interval = 30
+# Timeout for each health check query.
+timeout = 2.0
+# Number of consecutive failures before marking an upstream unhealthy.
+unhealthy_threshold = 3
+# Number of consecutive successes before marking an upstream healthy again.
+healthy_threshold = 2
+# Cooldown period (seconds) before retrying a previously unhealthy upstream.
+cooldown = 60
+# Optional custom domain to query for health checks (default: "." for root SOA).
+# domain = .
+
 # ============================================================================
 # SECURITY – DNSSEC, certificate pinning, rebind protection, privilege drop
 # ============================================================================
@@ -112,10 +134,10 @@ dnssec_enabled = false
 # Automatically fetch the latest root trust anchor from IANA.
 auto_update_trust_anchor = true
 # Path to a file containing additional trust anchors (DNSKEY or DS records).
-trust_anchors_file = 
+trust_anchors_file =
 
 # Certificate pinning: comma‑separated list of host=sha256(der) pairs.
-pinned_certs = 
+pinned_certs =
 
 # Rebinding protection: prevent responses containing private IPs.
 rebind_protection = false
@@ -123,9 +145,9 @@ rebind_protection = false
 rebind_action = strip
 
 # Privilege drop (only works on Unix when run as root).
-dns_privilege_drop_user = 
-dns_privilege_drop_group = 
-dns_chroot_dir = 
+dns_privilege_drop_user =
+dns_privilege_drop_group =
+dns_chroot_dir =
 
 # ============================================================================
 # LOGGING – DNS request logging (file rotation)
@@ -134,7 +156,7 @@ dns_chroot_dir =
 enabled = false
 retention_days = 7
 # Directory to store log files. If empty, uses OS‑specific default.
-log_dir = 
+log_dir =
 log_prefix = dns-log
 
 # ============================================================================
@@ -188,7 +210,7 @@ retries = 2
 #
 [upstreams]
 # List the active upstreams (comma‑separated names from sections above)
-servers = 
+servers =
 
 # ============================================================================
 # BLOCKLISTS – domain filtering
@@ -200,7 +222,7 @@ servers =
 [blocklists]
 enabled = false
 # Comma‑separated URLs of blocklist files (hosts‑format or domain‑per‑line).
-urls = 
+urls =
 interval_seconds = 86400
 # Action: NXDOMAIN, REFUSED, or ZEROIP.
 action = NXDOMAIN
@@ -278,6 +300,25 @@ def _validate_and_warn(config: Dict[str, Any]) -> None:
     if load_balancing not in ('failover', 'parallel', 'random', 'roundrobin'):
         raise ValueError('load_balancing must be failover, parallel, random, or roundrobin')
 
+    # Health checks
+    health = config.get('health', {})
+    if health.get('enabled', False):
+        interval = health.get('interval', 30)
+        if interval <= 0:
+            raise ValueError('health.interval must be positive')
+        timeout = health.get('timeout', 2.0)
+        if timeout <= 0:
+            raise ValueError('health.timeout must be positive')
+        unhealthy_threshold = health.get('unhealthy_threshold', 3)
+        if unhealthy_threshold <= 0:
+            raise ValueError('health.unhealthy_threshold must be positive')
+        healthy_threshold = health.get('healthy_threshold', 2)
+        if healthy_threshold <= 0:
+            raise ValueError('health.healthy_threshold must be positive')
+        cooldown = health.get('cooldown', 60)
+        if cooldown < 0:
+            raise ValueError('health.cooldown must be non‑negative')
+
 def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     config = configparser.ConfigParser()
     if not os.path.exists(path):
@@ -324,6 +365,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
             'doh_version': 'auto',
             'doh_auto_cache_ttl': 3600,
             'load_balancing': 'failover',
+            'tcp_fallback_enabled': True,
             'bootstrap': {'servers': ['1.1.1.1:53', '8.8.8.8:53'], 'timeout': 2.0, 'retries': 2},
             'blocklists': {
                 'enabled': False,
@@ -332,6 +374,15 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
                 'action': 'NXDOMAIN',
                 'local_blocklist_dir': 'blocklists',
                 'reload_on_change': True,
+            },
+            'health': {
+                'enabled': False,
+                'interval': 30,
+                'timeout': 2.0,
+                'unhealthy_threshold': 3,
+                'healthy_threshold': 2,
+                'cooldown': 60,
+                'domain': '.',
             },
         }
 
@@ -385,6 +436,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     load_balancing = config.get('advanced', 'load_balancing', fallback='failover').lower()
     if load_balancing not in ('failover', 'parallel', 'random', 'roundrobin'):
         load_balancing = 'failover'
+    tcp_fallback_enabled = config.getboolean('advanced', 'tcp_fallback_enabled', fallback=True)
 
     # Security
     dnssec_enabled = config.getboolean('security', 'dnssec_enabled', fallback=False)
@@ -482,6 +534,17 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
         })
         warnings.warn('No upstreams defined in [upstreams]; using default 1.1.1.1 over UDP.', RuntimeWarning)
 
+    # Health checks
+    health = {
+        'enabled': config.getboolean('health', 'enabled', fallback=False),
+        'interval': config.getint('health', 'interval', fallback=30),
+        'timeout': config.getfloat('health', 'timeout', fallback=2.0),
+        'unhealthy_threshold': config.getint('health', 'unhealthy_threshold', fallback=3),
+        'healthy_threshold': config.getint('health', 'healthy_threshold', fallback=2),
+        'cooldown': config.getint('health', 'cooldown', fallback=60),
+        'domain': config.get('health', 'domain', fallback='.'),
+    }
+
     # Blocklists
     blocklists = {
         'enabled': config.getboolean('blocklists', 'enabled', fallback=False),
@@ -520,6 +583,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
         'dns_max_payload': dns_max_payload,
         'dnssec_enabled': dnssec_enabled,
         'auto_update_trust_anchor': auto_update_trust_anchor,
+        'trust_anchors_file': trust_anchors_file,
         'metrics_enabled': metrics_enabled,
         'metrics_port': metrics_port,
         'uvloop_enable': uvloop_enable,
@@ -543,8 +607,10 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
         'doh_version': doh_version,
         'doh_auto_cache_ttl': doh_auto_cache_ttl,
         'load_balancing': load_balancing,
+        'tcp_fallback_enabled': tcp_fallback_enabled,
         'bootstrap': bootstrap,
         'blocklists': blocklists,
+        'health': health,
     }
 
     _validate_and_warn(validated_config)

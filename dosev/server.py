@@ -1,4 +1,4 @@
-# dosev/server.py – FINAL with HTTP/3 support, IPv6 stripping, load balancing, and all fixes
+# dosev/server.py – FINAL with HTTP/3 support, IPv6 stripping, load balancing, health checks, TCP fallback
 
 import asyncio
 import base64
@@ -243,6 +243,8 @@ async def reload_resolver(holder: ResolverHolder,
         doh_auto_cache_ttl=config.get("doh_auto_cache_ttl"),
         load_balancing=config.get("load_balancing", "failover"),
         bootstrap=config.get("bootstrap"),
+        tcp_fallback_enabled=config.get("tcp_fallback_enabled", True),
+        health_config=config.get("health"),
     )
 
     if blocklists:
@@ -556,7 +558,9 @@ async def run_server(listen_ip: str, listen_port: int,
                      doh_auto_cache_ttl: int = 3600,
                      load_balancing: str = 'failover',
                      bootstrap: Optional[Dict[str, Any]] = None,
-                     dns_enable_http3: bool = False) -> None:
+                     dns_enable_http3: bool = False,
+                     tcp_fallback_enabled: bool = True,
+                     health_config: Optional[Dict[str, Any]] = None) -> None:
     """Start the DNS server with full protocol support (UDP, TCP, TLS, DoH, HTTP/3)."""
     logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
 
@@ -596,6 +600,8 @@ async def run_server(listen_ip: str, listen_port: int,
         doh_auto_cache_ttl=doh_auto_cache_ttl,
         load_balancing=load_balancing,
         bootstrap=bootstrap,
+        tcp_fallback_enabled=tcp_fallback_enabled,
+        health_config=health_config,
     )
 
     holder = ResolverHolder(resolver)
@@ -784,7 +790,9 @@ def run_server_sync(listen_ip: str, listen_port: int,
                     doh_auto_cache_ttl: int = 3600,
                     load_balancing: str = 'failover',
                     bootstrap: Optional[Dict[str, Any]] = None,
-                    dns_enable_http3: bool = False) -> None:
+                    dns_enable_http3: bool = False,
+                    tcp_fallback_enabled: bool = True,
+                    health_config: Optional[Dict[str, Any]] = None) -> None:
     asyncio.run(run_server(
         listen_ip, listen_port,
         verbose=verbose,
@@ -839,4 +847,6 @@ def run_server_sync(listen_ip: str, listen_port: int,
         load_balancing=load_balancing,
         bootstrap=bootstrap,
         dns_enable_http3=dns_enable_http3,
+        tcp_fallback_enabled=tcp_fallback_enabled,
+        health_config=health_config,
     ))

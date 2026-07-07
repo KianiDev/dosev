@@ -75,8 +75,23 @@ All upstreams are now defined in the `[upstreams]` section (see below).
 | `doh_version` | string | `auto` | DoH version: `1.1`, `2`, `3`, or `auto`. |
 | `doh_auto_cache_ttl` | int | `3600` | Cache TTL for auto‑detected DoH versions. |
 | `load_balancing` | string | `failover` | Upstream selection strategy: `failover` (try in order), `parallel` (query all, return first success), `random` (pick random), `roundrobin` (cycle through). |
+| `tcp_fallback_enabled` | bool | `true` | Automatically retry truncated UDP responses over TCP. |
 
 ---
+
+### `[health]`
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable periodic health checks for upstreams. |
+| `interval` | int | `30` | Interval between health checks (seconds). |
+| `timeout` | float | `2.0` | Timeout for each health check query. |
+| `unhealthy_threshold` | int | `3` | Consecutive failures to mark upstream unhealthy. |
+| `healthy_threshold` | int | `2` | Consecutive successes to mark upstream healthy again. |
+| `cooldown` | int | `60` | Seconds to wait before retrying a failed upstream. |
+| `domain` | string | `.` | Domain name to query for health checks (default: root SOA). |
+
+**Note:** Health checks are performed using the same protocol as the upstream (UDP for UDP, TCP for TCP, etc.). If all upstreams are unhealthy, the resolver falls back to using all upstreams (to avoid complete service failure).
 
 ### `[security]`
 

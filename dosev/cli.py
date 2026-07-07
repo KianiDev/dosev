@@ -89,6 +89,8 @@ def main() -> None:
         doh_auto_cache_ttl=config.get("doh_auto_cache_ttl", 3600),
         load_balancing=config.get("load_balancing", "failover"),
         bootstrap=config.get("bootstrap", {"servers": [], "timeout": 2.0, "retries": 2}),
+        tcp_fallback_enabled=config.get("tcp_fallback_enabled", True),
+        health_config=config.get("health", {}),
     )
 
 if __name__ == "__main__":
