@@ -42,40 +42,39 @@ async def test_doq_connection_pool_reuse(resolver):
     mock_client = MockQuicClient(closed=False)
     mock_client.wait_connected = AsyncMock(return_value=None)
 
-    # Define a context manager that returns the mock client
     class CM:
         async def __aenter__(self):
             return mock_client
         async def __aexit__(self, *args):
             pass
 
-    # Patch the connect function at the correct import location
+    # Patch connect at the correct import location
     with patch("aioquic.asyncio.connect", return_value=CM()) as mock_connect:
-        dummy_response = b"\x00\x0d" + b"dummy_response"
-        with patch("asyncio.wait_for", new=AsyncMock(return_value=dummy_response)):
+        # Build a valid DoQ response: length prefix + actual data
+        response_data = b"dummy_response"
+        prefixed_response = len(response_data).to_bytes(2, "big") + response_data
+        with patch("asyncio.wait_for", new=AsyncMock(return_value=prefixed_response)):
             query = dns.message.make_query("example.com", "A").to_wire()
             upstream = resolver.upstreams[0]
 
             result1 = await resolver._forward_quic(query, upstream)
-            assert result1 == b"dummy_response"
+            assert result1 == response_data
             assert mock_connect.call_count == 1
 
             result2 = await resolver._forward_quic(query, upstream)
-            assert result2 == b"dummy_response"
+            assert result2 == response_data
             assert mock_connect.call_count == 1  # Reused
 
 
 @pytest.mark.asyncio
 async def test_doq_connection_pool_closed_connection(resolver):
     """If a pooled connection is closed, a new one should be created."""
-    # Create two clients: one open, one closed
     client_open = MockQuicClient(closed=False)
     client_open.wait_connected = AsyncMock(return_value=None)
 
     client_closed = MockQuicClient(closed=True)
     client_closed.wait_connected = AsyncMock(return_value=None)
 
-    # Define context managers that yield these clients
     class CMOpen:
         async def __aenter__(self):
             return client_open
@@ -88,30 +87,26 @@ async def test_doq_connection_pool_closed_connection(resolver):
         async def __aexit__(self, *args):
             pass
 
-    # We'll simulate two connect calls: first returns open client, second returns closed
-    # but the closed one will be discarded and a new one created.
-    # We'll set up the side_effect to return CMOpen then CMClosed.
     connect_returns = [CMOpen(), CMClosed()]
     def connect_side_effect(*args, **kwargs):
         return connect_returns.pop(0)
 
-    # Patch the connect function at the correct import location
     with patch("aioquic.asyncio.connect", side_effect=connect_side_effect) as mock_connect:
-        # Mock pool.get to return closed client on second call
         with patch.object(resolver._quic_pool, "get") as mock_pool_get:
             mock_pool_get.side_effect = [None, client_closed]
 
-            dummy_response = b"\x00\x0d" + b"dummy_response"
-            with patch("asyncio.wait_for", new=AsyncMock(return_value=dummy_response)):
+            response_data = b"dummy_response"
+            prefixed_response = len(response_data).to_bytes(2, "big") + response_data
+            with patch("asyncio.wait_for", new=AsyncMock(return_value=prefixed_response)):
                 query = dns.message.make_query("example.com", "A").to_wire()
                 upstream = resolver.upstreams[0]
 
                 result1 = await resolver._forward_quic(query, upstream)
-                assert result1 == b"dummy_response"
+                assert result1 == response_data
                 assert mock_connect.call_count == 1
 
                 result2 = await resolver._forward_quic(query, upstream)
-                assert result2 == b"dummy_response"
+                assert result2 == response_data
                 assert mock_connect.call_count == 2  # New connection created
 
 
