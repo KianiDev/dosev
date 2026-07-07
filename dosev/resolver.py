@@ -1957,6 +1957,7 @@ class DNSResolver:
             from aioquic.h3.connection import H3Connection
             from aioquic.h3.events import HeadersReceived, DataReceived
             from aioquic.asyncio.client import connect as quic_connect
+            from aioquic.asyncio.protocol import QuicConnectionProtocol
         except ImportError:
             raise RuntimeError("aioquic.h3 not available; upgrade aioquic to the latest version")
 
@@ -2020,62 +2021,53 @@ class DNSResolver:
         configuration = QuicConfiguration(is_client=True, alpn_protocols=["h3"], verify_mode=ssl.CERT_REQUIRED)
         configuration.server_name = hostname
 
-        class H3Protocol:
-            def __init__(self, conn, *args, **kwargs):
-                self.conn = conn
-                self.h3 = H3Connection(conn)
+        # Correct: H3Protocol must inherit from QuicConnectionProtocol
+        class H3Protocol(QuicConnectionProtocol):
+            def __init__(self, quic, stream_handler=None):
+                super().__init__(quic, stream_handler)
+                self.h3 = H3Connection(self._quic)
+                self._response_data = bytearray()
+                self._response_complete = asyncio.Event()
+                self._response_stream_id = None
 
             def quic_event_received(self, event):
                 for h3_event in self.h3.handle_event(event):
-                    pass
+                    if isinstance(h3_event, DataReceived):
+                        if h3_event.stream_id == self._response_stream_id:
+                            self._response_data.extend(h3_event.data)
+                            if h3_event.stream_ended:
+                                self._response_complete.set()
+                    elif isinstance(h3_event, HeadersReceived):
+                        if h3_event.stream_ended:
+                            self._response_complete.set()
+
+            async def send_request(self, data: bytes, stream_id: int) -> bytes:
+                self._response_stream_id = stream_id
+                self.h3.send_headers(
+                    stream_id=stream_id,
+                    headers=[
+                        (b":method", b"POST"),
+                        (b":scheme", b"https"),
+                        (b":authority", hostname.encode()),
+                        (b":path", path.encode()),
+                        (b"content-type", b"application/dns-message"),
+                        (b"accept", b"application/dns-message"),
+                        (b"content-length", str(len(data)).encode()),
+                    ],
+                    end_stream=False
+                )
+                self.h3.send_data(stream_id, data, end_stream=True)
+                self.transmit()
+
+                # Wait for response
+                await asyncio.wait_for(self._response_complete.wait(), timeout=self.doh_timeout + 5)
+                return bytes(self._response_data)
 
         async with quic_connect(resolved, port, configuration=configuration,
-                                create_protocol=lambda conn, *args, **kwargs: H3Protocol(conn)) as client:
-            proto = client._protocol
-            connection = client._quic
-            h3 = proto.h3
-
-            stream_id = h3.get_next_available_stream_id()
-            h3.send_headers(
-                stream_id=stream_id,
-                headers=[
-                    (b":method", b"POST"),
-                    (b":scheme", b"https"),
-                    (b":authority", hostname.encode()),
-                    (b":path", path.encode()),
-                    (b"content-type", b"application/dns-message"),
-                    (b"accept", b"application/dns-message"),
-                    (b"content-length", str(len(data)).encode()),
-                ],
-                end_stream=False
-            )
-            h3.send_data(stream_id, data, end_stream=True)
-
-            response_data = bytearray()
-            response_complete = asyncio.Event()
-
-            async def handle_events():
-                iterations_without_data = 0
-                max_idle_iterations = int(self.doh_timeout * 10)
-                while not response_complete.is_set():
-                    try:
-                        event = await asyncio.wait_for(connection.next_event(), timeout=0.1)
-                        iterations_without_data = 0
-                        for h3_event in h3.handle_event(event):
-                            if isinstance(h3_event, DataReceived) and h3_event.stream_id == stream_id:
-                                response_data.extend(h3_event.data)
-                                if h3_event.stream_ended:
-                                    response_complete.set()
-                            elif isinstance(h3_event, HeadersReceived) and h3_event.stream_ended:
-                                response_complete.set()
-                    except asyncio.TimeoutError:
-                        iterations_without_data += 1
-                        if iterations_without_data > max_idle_iterations:
-                            raise asyncio.TimeoutError("HTTP/3 response timeout")
-
-            await asyncio.wait_for(handle_events(), timeout=self.doh_timeout + 5)
-            await self._h3_pool.put(key, (connection, h3))
-            return bytes(response_data)
+                                create_protocol=lambda *args, **kwargs: H3Protocol(*args, **kwargs)) as client:
+            stream_id = client._quic.get_next_available_stream_id()
+            response_data = await client.send_request(data, stream_id)
+            return response_data
     # ---------- DOQ with connection pooling ----------
     async def _forward_quic(self, data: bytes, upstream: Dict[str, Any]) -> bytes:
         if not _HAS_AIOQUIC:
