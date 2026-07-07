@@ -200,7 +200,7 @@ async def test_forward_quic_uses_ip_override():
                 with patch("asyncio.wait_for", new=AsyncMock(return_value=response_data)):
                     result = await resolver._forward_quic(data, upstream)
                     assert result == dummy_response
-                    mock_resolve.assert_called_once_with("example.com", ip_override="192.0.2.1")
+                    mock_resolve.assert_called_once_with("example.com", "192.0.2.1")
 
 
 @pytest.mark.asyncio

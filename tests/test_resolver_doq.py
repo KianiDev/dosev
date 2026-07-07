@@ -22,7 +22,6 @@ class MockQuicClient:
         self.transmit = MagicMock()
         self._pending = {}
         self._connected = True
-        self.close = MagicMock()
         self._cm = None
 
     async def wait_connected(self):
@@ -38,37 +37,29 @@ def resolver():
 
 @pytest.fixture
 def mock_connect():
-    """Mock aioquic.asyncio.client.connect to return a context manager."""
+    """Mock aioquic.asyncio.client.connect to return a context manager that yields a MockQuicClient."""
     with patch("aioquic.asyncio.client.connect") as mock:
+        # Store the last created client so tests can verify
+        mock._client = None
+
         class MockCM:
             def __init__(self, client):
                 self.client = client
+                mock._client = client
             async def __aenter__(self):
                 return self.client
             async def __aexit__(self, *args):
                 pass
-        # We'll not set side_effect here; tests will set as needed
+
+        def side_effect(*args, **kwargs):
+            return MockCM(MockQuicClient(closed=False))
+
+        mock.side_effect = side_effect
         yield mock
 
 
 @pytest.mark.asyncio
 async def test_doq_connection_pool_reuse(resolver, mock_connect):
-    """Verify that DoQ connections are reused from the pool."""
-    # Create a mock client that will be returned by the first connect call
-    mock_client = MockQuicClient(closed=False)
-    mock_client.wait_connected = AsyncMock()
-    mock_client._quic.get_next_available_stream_id = MagicMock(return_value=0)
-    mock_client._quic.send_stream_data = MagicMock()
-    mock_client.transmit = MagicMock()
-
-    # Patch the connect to return the mock client
-    class CM:
-        async def __aenter__(self):
-            return mock_client
-        async def __aexit__(self, *args):
-            pass
-    mock_connect.return_value = CM()
-
     dummy_response = b"\x00\x0d" + b"dummy_response"
     with patch("asyncio.wait_for", new=AsyncMock(return_value=dummy_response)):
         query = dns.message.make_query("example.com", "A").to_wire()
@@ -78,27 +69,21 @@ async def test_doq_connection_pool_reuse(resolver, mock_connect):
         assert result1 == b"dummy_response"
         assert mock_connect.call_count == 1
 
-        # Second call should reuse the same client (no new connect)
         result2 = await resolver._forward_quic(query, upstream)
         assert result2 == b"dummy_response"
-        assert mock_connect.call_count == 1
+        assert mock_connect.call_count == 1  # reused
 
 
 @pytest.mark.asyncio
 async def test_doq_connection_pool_closed_connection(resolver, mock_connect):
-    """If a pooled connection is closed, a new one should be created."""
+    # We need to simulate that the pool.get returns a closed client on the second call.
+    # We'll patch the pool.get to return a closed client.
     client_open = MockQuicClient(closed=False)
     client_closed = MockQuicClient(closed=True)
 
-    # First call: no pooled connection, create a new one (open)
-    # Second call: pool.get returns the closed client, so it will be discarded and a new one created
-    # We'll set up the mock to return the closed client on the second call.
-
-    # Patch the pool.get to return the closed client on second call
-    with patch.object(resolver._quic_pool, "get") as mock_pool_get:
-        mock_pool_get.side_effect = [None, client_closed]
-
-        # Mock connect to return a new client each time
+    # Override the mock_connect to return different clients on each call
+    clients = [client_open, MockQuicClient(closed=False)]
+    def connect_side_effect(*args, **kwargs):
         class CM:
             def __init__(self, client):
                 self.client = client
@@ -106,12 +91,12 @@ async def test_doq_connection_pool_closed_connection(resolver, mock_connect):
                 return self.client
             async def __aexit__(self, *args):
                 pass
+        return CM(clients.pop(0))
+    mock_connect.side_effect = connect_side_effect
 
-        # We'll create a simple counter to return different clients
-        clients = [client_open, MockQuicClient(closed=False)]
-        def connect_side_effect(*args, **kwargs):
-            return CM(clients.pop(0))
-        mock_connect.side_effect = connect_side_effect
+    # Mock pool.get to return closed client on second call
+    with patch.object(resolver._quic_pool, "get") as mock_pool_get:
+        mock_pool_get.side_effect = [None, client_closed]
 
         dummy_response = b"\x00\x0d" + b"dummy_response"
         with patch("asyncio.wait_for", new=AsyncMock(return_value=dummy_response)):
@@ -124,20 +109,15 @@ async def test_doq_connection_pool_closed_connection(resolver, mock_connect):
 
             result2 = await resolver._forward_quic(query, upstream)
             assert result2 == b"dummy_response"
-            assert mock_connect.call_count == 2
+            assert mock_connect.call_count == 2  # new connection created
 
 
 @pytest.mark.asyncio
 async def test_doq_connection_pool_handles_timeout(resolver, mock_connect):
-    """If a DoQ query times out, the connection should not be put back into the pool."""
     mock_client = MockQuicClient(closed=False)
-    mock_client.wait_connected = AsyncMock()
-    class CM:
-        async def __aenter__(self):
-            return mock_client
-        async def __aexit__(self, *args):
-            pass
-    mock_connect.return_value = CM()
+    mock_connect.side_effect = lambda *args, **kwargs: type(
+        "CM", (), {"__aenter__": AsyncMock(return_value=mock_client), "__aexit__": AsyncMock(return_value=None)}
+    )()
 
     with patch("asyncio.wait_for", new=AsyncMock(side_effect=asyncio.TimeoutError)):
         query = dns.message.make_query("example.com", "A").to_wire()
@@ -151,15 +131,11 @@ async def test_doq_connection_pool_handles_timeout(resolver, mock_connect):
 
 @pytest.mark.asyncio
 async def test_doq_pool_handles_connection_error_during_handshake(resolver, mock_connect):
-    """If the QUIC handshake fails (wait_connected raises), the connection should not be pooled."""
-    client_fail = MockQuicClient()
-    client_fail._connected = False
-    class CM:
-        async def __aenter__(self):
-            return client_fail
-        async def __aexit__(self, *args):
-            pass
-    mock_connect.return_value = CM()
+    mock_client = MockQuicClient()
+    mock_client._connected = False
+    mock_connect.side_effect = lambda *args, **kwargs: type(
+        "CM", (), {"__aenter__": AsyncMock(return_value=mock_client), "__aexit__": AsyncMock(return_value=None)}
+    )()
 
     query = dns.message.make_query("example.com", "A").to_wire()
     upstream = resolver.upstreams[0]
