@@ -91,6 +91,17 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
 
             response = await resolver.forward_dns_query(data)
 
+            # Apply TC bit if response exceeds client's EDNS payload
+            client_payload = 512
+            try:
+                req_msg = dns.message.from_wire(data)
+                if req_msg.opt:
+                    client_payload = req_msg.payload
+            except:
+                pass
+            if len(response) > client_payload:
+                response = resolver._set_tc_bit(response)
+
             if resolver.disable_ipv6:
                 try:
                     resp_msg = dns.message.from_wire(response)
@@ -250,7 +261,6 @@ async def reload_resolver(holder: ResolverHolder,
         try:
             exact_set, suffix_set, hosts_map = current_resolver.load_blocklists_from_dir(local_dir)
             domains = list(exact_set) + ['.' + s for s in suffix_set]
-            # FIXED: Added await
             async with current_resolver._config_lock:
                 await current_resolver.set_blocklist(domains)
                 await current_resolver.set_hosts_map(hosts_map)
@@ -573,7 +583,6 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
     except NotImplementedError:
         logging.warning("Signal handlers are not supported on this platform")
 
-    # FIXED: Convert coroutines to tasks
     serve_task = asyncio.create_task(server.serve_forever())
     shutdown_task = asyncio.create_task(shutdown_event.wait())
 
