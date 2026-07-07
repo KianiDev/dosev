@@ -4,87 +4,198 @@ import configparser
 import warnings
 from typing import Dict, Any, List, Optional
 
-# ---------- Default configuration content ----------
-DEFAULT_CONFIG_CONTENT = """[server]
+# ---------- Default configuration content with comments ----------
+DEFAULT_CONFIG_CONTENT = """#
+# dosev configuration file
+# All paths can be absolute or relative to the working directory.
+#
+
+# ============================================================================
+# SERVER – local listener settings
+# ============================================================================
+[server]
+# IP address to listen on. Use 0.0.0.0 for all interfaces.
 listen_ip = 0.0.0.0
+# UDP and TCP port for DNS (standard is 53).
 listen_port = 53
 
+# ============================================================================
+# RESOLVER – general resolver behaviour
+# ============================================================================
 [resolver]
-upstream_dns = 1.1.1.1
-protocol = udp
+# Enable verbose logging (debug level).
 verbose = false
+# If true, all IPv6 answers will be stripped (AAAA records removed).
 disable_ipv6 = false
+# Enable EDNS Client Subnet (ECS) – helps CDNs but may reduce privacy.
 dns_ecs_enabled = true
+# Maximum EDNS payload size (512–4096).
 dns_max_payload = 4096
+
+# ---------- DNS over TLS (DoT) server listener ----------
 dns_enable_dot = false
 dns_dot_port = 853
 dns_dot_cert_file = 
 dns_dot_key_file = 
+
+# ---------- DNS over HTTPS (DoH) server listener ----------
 dns_enable_doh = false
 dns_doh_port = 443
 dns_doh_cert_file = 
 dns_doh_key_file = 
 dns_doh_path = /dns-query
-strip_ipv6_records = 
 
+# If true, strip all AAAA records (IPv6) from responses.
+strip_ipv6_records = false
+
+# ============================================================================
+# CACHE – local caching settings
+# ============================================================================
 [cache]
+# Positive cache TTL (seconds)
 ttl = 300
+# Maximum number of entries in the cache.
 max_size = 1024
+# Negative cache TTL (seconds) – used when SOA MINIMUM is not available.
 negative_ttl = 5
 
+# ============================================================================
+# TIMEOUTS – upstream communication timeouts (seconds)
+# ============================================================================
 [timeouts]
 udp = 2.0
 tcp = 5.0
 doh = 5.0
 
+# ============================================================================
+# ADVANCED – performance and experimental features
+# ============================================================================
 [advanced]
+# Number of retries per upstream before failing over.
 retries = 2
+# Rate limiting (queries per second per client IP). 0 = unlimited.
 rate_limit_rps = 0.0
+# Burst size for rate limiter (token bucket).
 rate_limit_burst = 0.0
+# Serve stale responses (RFC 8767) when a fresh answer is unavailable.
 optimistic_cache_enabled = false
+# How long (seconds) a stale entry can be kept.
 optimistic_stale_max_age = 86400
+# TTL to set on stale responses (to prevent client caching).
 optimistic_stale_response_ttl = 30
+
+# Connection pooling for TCP/TLS/HTTP/2/HTTP/3/DoQ.
 pool_max_size = 5
 pool_idle_timeout = 60.0
+
+# DoH version preference: auto, 1.1, 2, or 3.
 doh_version = auto
+# TTL for caching the DoH version auto‑detection result.
 doh_auto_cache_ttl = 3600
 
+# ============================================================================
+# SECURITY – DNSSEC, certificate pinning, rebind protection, privilege drop
+# ============================================================================
 [security]
+# Enable DNSSEC validation (requires trust anchors).
 dnssec_enabled = false
+# Automatically fetch the latest root trust anchor from IANA.
 auto_update_trust_anchor = true
+# Path to a file containing additional trust anchors (DNSKEY or DS records).
 trust_anchors_file = 
+
+# Certificate pinning: comma‑separated list of host=sha256(der) pairs.
 pinned_certs = 
+
+# Rebinding protection: prevent responses containing private IPs.
 rebind_protection = false
+# Action: strip (remove private IPs) or block (return NXDOMAIN).
 rebind_action = strip
+
+# Privilege drop (only works on Unix when run as root).
 dns_privilege_drop_user = 
 dns_privilege_drop_group = 
 dns_chroot_dir = 
 
+# ============================================================================
+# LOGGING – DNS request logging (file rotation)
+# ============================================================================
 [logging]
 enabled = false
 retention_days = 7
+# Directory to store log files. If empty, uses OS‑specific default.
 log_dir = 
 log_prefix = dns-log
 
+# ============================================================================
+# METRICS – Prometheus metrics endpoint
+# ============================================================================
 [metrics]
 enabled = false
 port = 8000
+# Use uvloop for better performance (requires uvloop installed).
 uvloop_enable = false
 
+# ============================================================================
+# BOOTSTRAP – DNS servers used to resolve upstream hostnames
+# ============================================================================
 [bootstrap]
+# Comma‑separated list of DNS servers (IP:port) to use for bootstrapping.
 servers = 1.1.1.1:53,8.8.8.8:53
 timeout = 2.0
 retries = 2
 
+# ============================================================================
+# UPSTREAMS – define your DNS upstreams
+# ============================================================================
+#
+# Each upstream is a named section under [upstreams].
+# The list of active upstreams is defined in the "servers" option below.
+# The load‑balancing strategy (failover, round‑robin, weighted) is not yet
+# implemented; the first available upstream is used.
+#
+# Fields:
+#   address   – domain name or IP address (required)
+#   protocol  – udp, tcp, tls, https, or quic (default: udp)
+#   port      – optional, default depends on protocol
+#   hostname  – SNI for TLS/DoH; defaults to address
+#   path      – DoH URL path (default: /dns-query)
+#   ip        – optional fixed IP address to avoid DNS resolution
+#   doh_version – 1.1, 2, 3, or auto
+#
+# Example:
+# [upstreams.cloudflare]
+# address = cloudflare-dns.com
+# protocol = https
+# port = 443
+# ip = 1.1.1.1
+# doh_version = auto
+#
+# [upstreams.google]
+# address = dns.google
+# protocol = https
+# port = 443
+#
 [upstreams]
 servers = 
 
+# ============================================================================
+# BLOCKLISTS – domain filtering
+# ============================================================================
+#
+# Blocklists can be loaded from local files or downloaded from URLs.
+# The list is refreshed periodically.
+#
 [blocklists]
 enabled = false
+# Comma‑separated URLs of blocklist files (hosts‑format or domain‑per‑line).
 urls = 
 interval_seconds = 86400
+# Action: NXDOMAIN, REFUSED, or ZEROIP.
 action = NXDOMAIN
+# Local directory where blocklist files are stored.
 local_blocklist_dir = blocklists
+# Reload on change (inotify on Linux, periodic check on other OS).
 reload_on_change = true
 """
 
@@ -159,11 +270,10 @@ def _validate_and_warn(config: Dict[str, Any]) -> None:
 def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     config = configparser.ConfigParser()
     if not os.path.exists(path):
+        # Return defaults without upstream_dns/protocol – they are now in upstreams.
         return {
             'listen_ip': '0.0.0.0',
             'listen_port': 53,
-            'upstream_dns': '1.1.1.1',
-            'protocol': 'udp',
             'verbose': False,
             'disable_ipv6': False,
             'strip_ipv6_records': None,
@@ -176,6 +286,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
             'dns_log_prefix': 'dns-log',
             'dns_pinned_certs': {},
             'dns_ecs_enabled': True,
+            'dns_max_payload': 4096,
             'dnssec_enabled': False,
             'auto_update_trust_anchor': True,
             'trust_anchors_file': '',
@@ -188,7 +299,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
             'upstream_doh_timeout': 5.0,
             'rate_limit_rps': 0.0,
             'rate_limit_burst': 0.0,
-            'upstreams': [],
+            'upstreams': [],  # will be populated if needed
             'optimistic_cache_enabled': False,
             'optimistic_stale_max_age': 86400,
             'optimistic_stale_response_ttl': 30,
@@ -214,11 +325,11 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
 
     config.read(path)
 
+    # Server
     listen_ip = config.get('server', 'listen_ip', fallback='0.0.0.0')
     listen_port = config.getint('server', 'listen_port', fallback=53)
 
-    upstream_dns = config.get('resolver', 'upstream_dns', fallback='1.1.1.1')
-    protocol = config.get('resolver', 'protocol', fallback='udp').lower()
+    # Resolver (ignore upstream_dns and protocol)
     verbose = config.getboolean('resolver', 'verbose', fallback=False)
     disable_ipv6 = config.getboolean('resolver', 'disable_ipv6', fallback=False)
     dns_ecs_enabled = config.getboolean('resolver', 'dns_ecs_enabled', fallback=True)
@@ -233,19 +344,19 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     dns_doh_key_file = config.get('resolver', 'dns_doh_key_file', fallback='')
     dns_doh_path = config.get('resolver', 'dns_doh_path', fallback='/dns-query')
     strip_ipv6_records_raw = config.get('resolver', 'strip_ipv6_records', fallback=None)
-    if strip_ipv6_records_raw is None:
-        strip_ipv6_records = None
-    else:
-        strip_ipv6_records = config.getboolean('resolver', 'strip_ipv6_records', fallback=None)
+    strip_ipv6_records = None if strip_ipv6_records_raw is None else config.getboolean('resolver', 'strip_ipv6_records', fallback=None)
 
+    # Cache
     dns_cache_ttl = config.getint('cache', 'ttl', fallback=300)
     dns_cache_max_size = config.getint('cache', 'max_size', fallback=1024)
     dns_negative_cache_ttl = config.getint('cache', 'negative_ttl', fallback=5)
 
+    # Timeouts
     upstream_udp_timeout = config.getfloat('timeouts', 'udp', fallback=2.0)
     upstream_tcp_timeout = config.getfloat('timeouts', 'tcp', fallback=5.0)
     upstream_doh_timeout = config.getfloat('timeouts', 'doh', fallback=5.0)
 
+    # Advanced
     upstream_retries = config.getint('advanced', 'retries', fallback=2)
     rate_limit_rps = config.getfloat('advanced', 'rate_limit_rps', fallback=0.0)
     rate_limit_burst = config.getfloat('advanced', 'rate_limit_burst', fallback=0.0)
@@ -259,6 +370,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
         doh_version = 'auto'
     doh_auto_cache_ttl = config.getint('advanced', 'doh_auto_cache_ttl', fallback=3600)
 
+    # Security
     dnssec_enabled = config.getboolean('security', 'dnssec_enabled', fallback=False)
     auto_update_trust_anchor = config.getboolean('security', 'auto_update_trust_anchor', fallback=True)
     trust_anchors_file = config.get('security', 'trust_anchors_file', fallback='')
@@ -279,15 +391,18 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     dns_privilege_drop_group = config.get('security', 'dns_privilege_drop_group', fallback='')
     dns_chroot_dir = config.get('security', 'dns_chroot_dir', fallback='')
 
+    # Logging
     dns_logging_enabled = config.getboolean('logging', 'enabled', fallback=False)
     dns_log_dir = config.get('logging', 'log_dir', fallback=_default_log_dir())
     dns_log_retention_days = config.getint('logging', 'retention_days', fallback=7)
     dns_log_prefix = config.get('logging', 'log_prefix', fallback='dns-log')
 
+    # Metrics
     metrics_enabled = config.getboolean('metrics', 'enabled', fallback=False)
     metrics_port = config.getint('metrics', 'port', fallback=8000)
     uvloop_enable = config.getboolean('metrics', 'uvloop_enable', fallback=False)
 
+    # Bootstrap
     bootstrap_servers_raw = config.get('bootstrap', 'servers', fallback='')
     if bootstrap_servers_raw.strip():
         bootstrap_servers = [s.strip() for s in bootstrap_servers_raw.split(',') if s.strip()]
@@ -301,6 +416,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
         'retries': bootstrap_retries,
     }
 
+    # Upstreams
     upstreams = []
     if config.has_section('upstreams') and config.has_option('upstreams', 'servers'):
         server_names = [s.strip() for s in config.get('upstreams', 'servers').split(',') if s.strip()]
@@ -326,6 +442,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
             us_doh_version = config.get(section, 'doh_version', fallback=doh_version).lower()
             if us_doh_version not in ('auto', '1.1', '2', '3'):
                 us_doh_version = doh_version
+            ip = config.get(section, 'ip', fallback=None)  # new field
             upstreams.append({
                 'address': address,
                 'protocol': proto,
@@ -333,8 +450,23 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
                 'hostname': hostname,
                 'doh_version': us_doh_version,
                 'path': path,
+                'ip': ip,  # optional fixed IP
             })
 
+    # If no upstreams defined, use a default (1.1.1.1 over UDP)
+    if not upstreams:
+        upstreams.append({
+            'address': '1.1.1.1',
+            'protocol': 'udp',
+            'port': 53,
+            'hostname': '1.1.1.1',
+            'doh_version': 'auto',
+            'path': '',
+            'ip': '1.1.1.1',  # fixed IP to avoid resolution
+        })
+        warnings.warn('No upstreams defined in [upstreams]; using default 1.1.1.1 over UDP.', RuntimeWarning)
+
+    # Blocklists
     blocklists = {
         'enabled': config.getboolean('blocklists', 'enabled', fallback=False),
         'urls': [u.strip() for u in config.get('blocklists', 'urls', fallback='').split(',') if u.strip()],
@@ -347,8 +479,6 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     validated_config = {
         'listen_ip': listen_ip,
         'listen_port': listen_port,
-        'upstream_dns': upstream_dns,
-        'protocol': protocol,
         'dns_enable_dot': dns_enable_dot,
         'dns_dot_port': dns_dot_port,
         'dns_dot_cert_file': dns_dot_cert_file,

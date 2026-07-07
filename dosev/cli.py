@@ -25,7 +25,6 @@ def main() -> None:
         except Exception as e:
             print(f"Error creating default config: {e}", file=sys.stderr)
             print("Falling back to built‑in defaults.", file=sys.stderr)
-            # Continue with default config (load_config will return defaults)
 
     try:
         config = load_config(config_path)
@@ -40,8 +39,7 @@ def main() -> None:
     run_server_sync(
         listen_ip=config["listen_ip"],
         listen_port=config["listen_port"],
-        upstream_dns=config["upstream_dns"],
-        protocol=config["protocol"],
+        # Removed upstream_dns and protocol – now use upstreams
         verbose=config.get("verbose", False),
         blocklists=config.get("blocklists"),
         disable_ipv6=config.get("disable_ipv6", False),
