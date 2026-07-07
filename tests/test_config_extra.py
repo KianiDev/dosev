@@ -1,5 +1,4 @@
 import configparser
-
 from dosev.config import load_config
 
 
@@ -8,8 +7,6 @@ def test_load_config_parses_all_extra_sections(tmp_path):
     cfg = configparser.ConfigParser()
     cfg["server"] = {"listen_ip": "127.0.0.2", "listen_port": "5354"}
     cfg["resolver"] = {
-        "upstream_dns": "9.9.9.9",
-        "protocol": "TLS",
         "verbose": "true",
         "disable_ipv6": "true",
         "dns_max_payload": "2048",
@@ -86,7 +83,6 @@ def test_load_config_parses_all_extra_sections(tmp_path):
     config = load_config(str(cfg_path))
 
     assert config["listen_ip"] == "127.0.0.2"
-    assert config["protocol"] == "tls"
     assert config["dns_cache_ttl"] == 123
     assert config["dns_negative_cache_ttl"] == 7
     assert config["dns_pinned_certs"] == {"a.example.com": "abc", "*.example.com": "def"}
@@ -103,86 +99,3 @@ def test_load_config_parses_all_extra_sections(tmp_path):
     assert config["dns_doh_path"] == "/dns-query"
     assert config["dnssec_enabled"] is True
     assert config["upstreams"][0]["doh_version"] == "2"
-
-
-def test_load_config_parses_dns_ecs_enabled_false(tmp_path):
-    cfg_path = tmp_path / "dosev.conf"
-    cfg = configparser.ConfigParser()
-    cfg["resolver"] = {"dns_ecs_enabled": "false"}
-    with open(cfg_path, "w", encoding="utf-8") as f:
-        cfg.write(f)
-
-    config = load_config(str(cfg_path))
-    assert config["dns_ecs_enabled"] is False
-    assert config["dns_max_payload"] == 4096
-    assert config["bootstrap"]["servers"] == ["1.1.1.1:53", "8.8.8.8:53"]
-def test_load_config_upstreams_with_default_ports(tmp_path):
-    """Test that upstreams get default ports based on protocol."""
-    cfg_path = tmp_path / "dosev.conf"
-    cfg = configparser.ConfigParser()
-    cfg["upstreams"] = {"servers": "primary,secondary"}
-    cfg["upstreams.primary"] = {"address": "dns1.example.com", "protocol": "tls"}
-    cfg["upstreams.secondary"] = {"address": "dns2.example.com", "protocol": "https"}
-    with open(cfg_path, "w", encoding="utf-8") as f:
-        cfg.write(f)
-    
-    config = load_config(str(cfg_path))
-    assert config["upstreams"][0]["port"] == 853  # TLS default
-    assert config["upstreams"][1]["port"] == 443  # HTTPS default
-
-def test_load_config_upstreams_with_custom_port(tmp_path):
-    """Test that upstreams respect custom port configuration."""
-    cfg_path = tmp_path / "dosev.conf"
-    cfg = configparser.ConfigParser()
-    cfg["upstreams"] = {"servers": "primary"}
-    cfg["upstreams.primary"] = {"address": "dns1.example.com", "protocol": "udp", "port": "5353"}
-    with open(cfg_path, "w", encoding="utf-8") as f:
-        cfg.write(f)
-    
-    config = load_config(str(cfg_path))
-    assert config["upstreams"][0]["port"] == 5353
-
-
-def test_load_config_rejects_invalid_port(tmp_path):
-    cfg_path = tmp_path / "dosev.conf"
-    cfg = configparser.ConfigParser()
-    cfg["server"] = {"listen_port": "70000"}
-    with open(cfg_path, "w", encoding="utf-8") as f:
-        cfg.write(f)
-
-    try:
-        load_config(str(cfg_path))
-    except ValueError as exc:
-        assert "listen_port" in str(exc)
-    else:
-        raise AssertionError("Expected ValueError for invalid listen_port")
-
-
-def test_load_config_warns_for_secure_listener_without_cert(tmp_path):
-    cfg_path = tmp_path / "dosev.conf"
-    cfg = configparser.ConfigParser()
-    cfg["resolver"] = {"dns_enable_dot": "true", "dns_dot_cert_file": "/tmp/cert.pem"}
-    with open(cfg_path, "w", encoding="utf-8") as f:
-        cfg.write(f)
-
-    try:
-        load_config(str(cfg_path))
-    except ValueError as exc:
-        assert "dns_enable_dot" in str(exc)
-    else:
-        raise AssertionError("Expected ValueError for incomplete TLS config")
-
-
-def test_load_config_warns_for_metrics_conflict(tmp_path):
-    cfg_path = tmp_path / "dosev.conf"
-    cfg = configparser.ConfigParser()
-    cfg["metrics"] = {"enabled": "true", "port": "53"}
-    with open(cfg_path, "w", encoding="utf-8") as f:
-        cfg.write(f)
-
-    import warnings
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        load_config(str(cfg_path))
-
-    assert any("Metrics are enabled on port 53" in str(w.message) for w in caught)

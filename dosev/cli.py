@@ -15,7 +15,6 @@ def main() -> None:
 
     config_path = args.config
 
-    # If this is the default config path and the file does not exist, create it and exit
     if config_path == default_config and not os.path.exists(config_path):
         try:
             write_default_config(config_path)
@@ -39,7 +38,6 @@ def main() -> None:
     run_server_sync(
         listen_ip=config["listen_ip"],
         listen_port=config["listen_port"],
-        # Removed upstream_dns and protocol – now use upstreams
         verbose=config.get("verbose", False),
         blocklists=config.get("blocklists"),
         disable_ipv6=config.get("disable_ipv6", False),

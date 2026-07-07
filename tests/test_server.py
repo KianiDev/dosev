@@ -1,12 +1,12 @@
 import dns.message
 import dns.rdatatype
-import dns.rcode          # <-- ADDED
+import dns.rcode
 import pytest
 from dosev.resolver import DNSResolver
 
 
 def test_split_hostport_ipv6_and_host():
-    resolver = DNSResolver("1.1.1.1", protocol="udp")
+    resolver = DNSResolver(upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}])
     host, port = resolver._split_hostport("[2001:db8::1]:853", default_port=53)
     assert host == "2001:db8::1"
     assert port == 853
@@ -21,7 +21,7 @@ def test_split_hostport_ipv6_and_host():
 
 
 def test_private_ip_detection():
-    resolver = DNSResolver("1.1.1.1", protocol="udp")
+    resolver = DNSResolver(upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}])
     assert resolver._is_private_ip("10.0.0.1") is True
     assert resolver._is_private_ip("192.168.1.1") is True
     assert resolver._is_private_ip("8.8.8.8") is False
@@ -30,7 +30,10 @@ def test_private_ip_detection():
 
 
 def test_build_block_response_zeroip_aaaa_disabled():
-    resolver = DNSResolver("1.1.1.1", protocol="udp", disable_ipv6=True)
+    resolver = DNSResolver(
+        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
+        disable_ipv6=True
+    )
     query = dns.message.make_query("example.com", "AAAA").to_wire()
     response = resolver.build_block_response(query, action="ZEROIP")
     msg = dns.message.from_wire(response)
@@ -40,7 +43,11 @@ def test_build_block_response_zeroip_aaaa_disabled():
 
 @pytest.mark.asyncio
 async def test_update_config_changes_values():
-    resolver = DNSResolver("1.1.1.1", protocol="udp", rate_limit_rps=0.0, rate_limit_burst=0.0)
+    resolver = DNSResolver(
+        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
+        rate_limit_rps=0.0,
+        rate_limit_burst=0.0
+    )
     assert resolver.rate_limiter is None
     await resolver.update_config(rate_limit_rps=2.0, rate_limit_burst=2.0)
     assert resolver.rate_limit_rps == 2.0
@@ -49,7 +56,7 @@ async def test_update_config_changes_values():
 
 
 def test_build_block_response_refused():
-    resolver = DNSResolver("1.1.1.1", protocol="udp")
+    resolver = DNSResolver(upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}])
     query = dns.message.make_query("example.com", "A").to_wire()
     response = resolver.build_block_response(query, action="REFUSED")
     msg = dns.message.from_wire(response)

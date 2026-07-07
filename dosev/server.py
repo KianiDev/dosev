@@ -1,4 +1,4 @@
-# dosev/server.py – FINAL with all fixes
+# dosev/server.py – FINAL with all fixes and new resolver signature
 
 import asyncio
 import base64
@@ -216,8 +216,6 @@ async def reload_resolver(holder: ResolverHolder,
                           blocklists: Optional[Dict[str, Any]] = None) -> None:
     """Hot‑reload the resolver's configuration without restarting the server."""
     await current_resolver.update_config(
-        upstream_dns=config.get("upstream_dns"),
-        protocol=config.get("protocol"),
         verbose=config.get("verbose", False),
         disable_ipv6=config.get("disable_ipv6", False),
         udp_timeout=config.get("upstream_udp_timeout"),
@@ -268,8 +266,7 @@ async def reload_resolver(holder: ResolverHolder,
         except Exception as e:
             logging.warning("Blocklist reload during config update failed: %s", e)
 
-    logging.info("Configuration reloaded successfully (upstream=%s, protocol=%s)",
-                 current_resolver.upstream_dns, current_resolver.protocol)
+    logging.info("Configuration reloaded successfully")
 
 
 def _drop_dns_privileges(user: str, group: Optional[str] = None,
@@ -401,7 +398,7 @@ async def _start_doh_server(holder: ResolverHolder, listen_ip: str, listen_port:
     return runner
 
 
-async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protocol: str,
+async def run_server(listen_ip: str, listen_port: int,
                      verbose: bool = False,
                      blocklists: Optional[Dict[str, Any]] = None,
                      disable_ipv6: bool = False,
@@ -455,8 +452,7 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
     logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
 
     resolver = DNSResolver(
-        upstream_dns=upstream_dns,
-        protocol=protocol,
+        upstreams=upstreams,
         verbose=verbose,
         disable_ipv6=disable_ipv6,
         cache_ttl=dns_cache_ttl,
@@ -477,7 +473,6 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
         uvloop_enable=uvloop_enable,
         rate_limit_rps=rate_limit_rps,
         rate_limit_burst=rate_limit_burst,
-        upstreams=upstreams,
         optimistic_cache_enabled=optimistic_cache_enabled,
         optimistic_stale_max_age=optimistic_stale_max_age,
         optimistic_stale_response_ttl=optimistic_stale_response_ttl,
@@ -609,7 +604,7 @@ async def run_server(listen_ip: str, listen_port: int, upstream_dns: str, protoc
         logging.info("Shutdown complete.")
 
 
-def run_server_sync(listen_ip: str, listen_port: int, upstream_dns: str, protocol: str,
+def run_server_sync(listen_ip: str, listen_port: int,
                     verbose: bool = False,
                     blocklists: Optional[Dict[str, Any]] = None,
                     disable_ipv6: bool = False,
@@ -660,7 +655,7 @@ def run_server_sync(listen_ip: str, listen_port: int, upstream_dns: str, protoco
                     doh_auto_cache_ttl: int = 3600,
                     bootstrap: Optional[Dict[str, Any]] = None) -> None:
     asyncio.run(run_server(
-        listen_ip, listen_port, upstream_dns, protocol,
+        listen_ip, listen_port,
         verbose=verbose,
         blocklists=blocklists,
         disable_ipv6=disable_ipv6,

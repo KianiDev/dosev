@@ -12,7 +12,10 @@ def _run(coro):
 
 def test_forward_dns_query_udp_real_upstream():
     async def _test():
-        resolver = DNSResolver("1.1.1.1", protocol="udp", udp_timeout=5.0)
+        resolver = DNSResolver(
+            upstreams=[{"address": "1.1.1.1", "protocol": "udp", "port": 53, "ip": "1.1.1.1"}],
+            udp_timeout=5.0
+        )
         query = dns.message.make_query("example.com", "A").to_wire()
 
         response = await resolver.forward_dns_query(query)
@@ -27,7 +30,10 @@ def test_forward_dns_query_udp_real_upstream():
 
 def test_forward_dns_query_tcp_real_upstream():
     async def _test():
-        resolver = DNSResolver("8.8.8.8", protocol="tcp", tcp_timeout=5.0)
+        resolver = DNSResolver(
+            upstreams=[{"address": "8.8.8.8", "protocol": "tcp", "port": 53, "ip": "8.8.8.8"}],
+            tcp_timeout=5.0
+        )
         query = dns.message.make_query("example.com", "A").to_wire()
 
         response = await resolver.forward_dns_query(query)
@@ -54,10 +60,15 @@ except ImportError:
 def test_forward_dns_query_https_real_upstream():
     async def _test():
         resolver = DNSResolver(
-            "cloudflare-dns.com",
-            protocol="https",
-            doh_version="1.1",
-            doh_timeout=10.0,
+            upstreams=[{
+                "address": "cloudflare-dns.com",
+                "protocol": "https",
+                "port": 443,
+                "hostname": "cloudflare-dns.com",
+                "path": "/dns-query",
+                "doh_version": "1.1",
+            }],
+            doh_timeout=10.0
         )
         query = dns.message.make_query("example.com", "A").to_wire()
 

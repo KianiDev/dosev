@@ -1,7 +1,3 @@
-"""
-Advanced tests for dosev.resolver – mocks external dependencies.
-"""
-
 import asyncio
 import os
 import tempfile
@@ -23,21 +19,24 @@ from dosev.resolver import DNSResolver, RateLimiter, AsyncTTLCache, ConnectionPo
 @pytest.fixture
 def resolver():
     """Basic resolver instance with mocked upstream."""
-    return DNSResolver("1.1.1.1", protocol="udp")
+    return DNSResolver(upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}])
 
 
 @pytest.fixture
 def resolver_with_cache():
     """Resolver using AsyncTTLCache (no cachetools)."""
     with patch("dosev.resolver._HAS_CACHETOOLS", False):
-        return DNSResolver("1.1.1.1", protocol="udp", cache_ttl=300, cache_max_size=100)
+        return DNSResolver(
+            upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
+            cache_ttl=300,
+            cache_max_size=100
+        )
 
 
 # ---------- EDNS0 Tests ----------
 
 @pytest.mark.asyncio
 async def test_forward_preserves_edns_payload(resolver):
-    """Client EDNS payload must be forwarded unchanged (RFC 6891)."""
     query = dns.message.make_query("example.com", "A")
     query.use_edns(payload=1232, options=[dns.edns.ECSOption("192.0.2.0", 24, 0)])
     qwire = query.to_wire()
@@ -48,7 +47,7 @@ async def test_forward_preserves_edns_payload(resolver):
         captured["data"] = data
         msg = dns.message.from_wire(data)
         resp = dns.message.make_response(msg)
-        resp.use_edns(payload=1232)  # echo back
+        resp.use_edns(payload=1232)
         return resp.to_wire()
 
     resolver._try_upstream = fake_upstream
@@ -57,13 +56,12 @@ async def test_forward_preserves_edns_payload(resolver):
     assert captured["data"] is not None
     sent = dns.message.from_wire(captured["data"])
     assert sent.opt is not None
-    assert sent.payload == 1232  # not modified
+    assert sent.payload == 1232
     assert response is not None
 
 
 @pytest.mark.asyncio
 async def test_forward_strips_ecs_when_disabled(resolver):
-    """When ecs_enabled=False, ECS option must be removed."""
     resolver.ecs_enabled = False
     query = dns.message.make_query("example.com", "A")
     query.use_edns(options=[dns.edns.ECSOption("192.0.2.0", 24, 0)])
@@ -82,25 +80,22 @@ async def test_forward_strips_ecs_when_disabled(resolver):
     response = await resolver.forward_dns_query(qwire)
     sent = dns.message.from_wire(captured["data"])
     assert sent.opt is not None
-    assert sent.options == ()  # no ECS
+    assert sent.options == ()
 
 
 # ---------- DNSSEC Tests ----------
 
 @pytest.mark.asyncio
 async def test_dnssec_unsigned_domain_is_insecure(resolver):
-    """Unsigned domain returns insecure (not bogus) when DO=1 (RFC 4035)."""
     resolver.dnssec_enabled = True
-    resolver._dnssec_raw_anchors = {dns.name.root: b"dummy"}  # any non-None
+    resolver._dnssec_raw_anchors = {dns.name.root: b"dummy"}
 
     qname = "example.com"
-    # Build a response with no RRSIGs
     msg = dns.message.make_response(dns.message.make_query(qname, "A"))
     rr = dns.rrset.from_text(qname + ".", 300, dns.rdataclass.IN, dns.rdatatype.A, "93.184.216.34")
     msg.answer.append(rr)
     wire = msg.to_wire()
 
-    # No RRSIGs -> insecure, not an error
     secure, insecure = await resolver._dnssec_validate(qname, wire, dnssec_requested=True)
     assert secure is False
     assert insecure is True
@@ -108,24 +103,20 @@ async def test_dnssec_unsigned_domain_is_insecure(resolver):
 
 @pytest.mark.asyncio
 async def test_dnssec_bogus_raises(resolver):
-    """Invalid signature should raise ValidationFailure."""
     resolver.dnssec_enabled = True
-    # Mock _dnssec_validate to raise the exception directly
     with patch.object(resolver, "_dnssec_validate", side_effect=dns.dnssec.ValidationFailure("bad")):
         with pytest.raises(dns.dnssec.ValidationFailure):
             await resolver._dnssec_validate("example.com", b"", dnssec_requested=True)
 
 
-# ---------- Negative Caching with SOA MINIMUM ----------
+# ---------- Negative Caching ----------
 
 @pytest.mark.asyncio
 async def test_negative_cache_uses_soa_minimum(resolver):
-    """Negative cache TTL should come from SOA MINIMUM (RFC 2308)."""
-    resolver.negative_cache_ttl = 5  # fallback
+    resolver.negative_cache_ttl = 5
     query = dns.message.make_query("nxdomain.example", "A")
     qwire = query.to_wire()
 
-    # Build NXDOMAIN response with SOA
     resp = dns.message.make_response(query)
     resp.set_rcode(dns.rcode.NXDOMAIN)
     soa_rr = dns.rrset.from_text(
@@ -135,30 +126,24 @@ async def test_negative_cache_uses_soa_minimum(resolver):
     resp.authority.append(soa_rr)
     wire = resp.to_wire()
 
-    # Mock upstream to return this
     async def fake_upstream(upstream, data):
         return wire
     resolver._try_upstream = fake_upstream
 
-    # First query populates negative cache
     response1 = await resolver.forward_dns_query(qwire)
-    # The cache TTL should be 60 (SOA MINIMUM)
     key = resolver._build_cache_key(qwire)
     entry = await resolver._negative_cache_get(key)
     assert entry is not None
-    # We can't easily inspect TTL in TTLCache, but we can check that it was stored.
-    # For AsyncTTLCache we could check expiry, but we'll trust the logic.
-    # Instead we'll verify that a second query uses cache (no upstream call)
+
     resolver._try_upstream = AsyncMock(side_effect=Exception("should not be called"))
     response2 = await resolver.forward_dns_query(qwire)
     assert dns.message.from_wire(response2).rcode() == dns.rcode.NXDOMAIN
 
 
-# ---------- Optimistic Caching (serve-stale) ----------
+# ---------- Optimistic Caching ----------
 
 @pytest.mark.asyncio
 async def test_optimistic_cache_serves_stale(resolver):
-    """When optimistic_cache_enabled=True, stale responses are served with reduced TTL."""
     resolver.optimistic_cache_enabled = True
     resolver.stale_max_age = 3600
     resolver.stale_response_ttl = 30
@@ -167,25 +152,22 @@ async def test_optimistic_cache_serves_stale(resolver):
     qwire = query.to_wire()
     key = resolver._build_cache_key(qwire)
 
-    # Insert an expired entry into wire cache
     resp = dns.message.make_response(query)
     rr = dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "93.184.216.34")
     resp.answer.append(rr)
     wire = resp.to_wire()
     now = time.time()
-    expiry = now - 10  # expired
-    stale_until = now + 3600  # still in stale window
+    expiry = now - 10
+    stale_until = now + 3600
     entry = (wire, expiry, qwire, stale_until, False)
     await resolver._wire_cache_set(key, entry)
 
-    # Patch background refresh to do nothing
     resolver._maybe_refresh_stale = AsyncMock()
 
-    # Should return stale response with TTL=30
     response = await resolver.forward_dns_query(qwire)
     msg = dns.message.from_wire(response)
     assert msg.answer
-    assert msg.answer[0].ttl == 30  # our stale_response_ttl
+    assert msg.answer[0].ttl == 30
 
 
 # ---------- Blocklist Actions ----------
@@ -212,7 +194,7 @@ def test_build_block_response_zeroip_aaaa_disabled(resolver):
     query = dns.message.make_query("blocked.com", "AAAA").to_wire()
     resp_wire = resolver.build_block_response(query, action="ZEROIP")
     msg = dns.message.from_wire(resp_wire)
-    assert msg.rcode() == dns.rcode.NXDOMAIN  # no AAAA response when IPv6 disabled
+    assert msg.rcode() == dns.rcode.NXDOMAIN
 
 
 def test_build_block_response_zeroip_any(resolver):
@@ -220,7 +202,7 @@ def test_build_block_response_zeroip_any(resolver):
     resp_wire = resolver.build_block_response(query, action="ZEROIP")
     msg = dns.message.from_wire(resp_wire)
     assert msg.rcode() == dns.rcode.NOERROR
-    assert len(msg.answer) == 2  # A and AAAA
+    assert len(msg.answer) == 2
     types = {rr.rdtype for rr in msg.answer}
     assert dns.rdatatype.A in types
     assert dns.rdatatype.AAAA in types
@@ -243,12 +225,6 @@ async def test_hosts_override_a(resolver):
 async def test_hosts_override_aaaa(resolver):
     await resolver.set_hosts_map({"example.com": ("2001:db8::1",)})
     query = dns.message.make_query("example.com", "AAAA").to_wire()
-    response = await resolver.forward_dns_query(query)
-    msg = dns.message.from_wire(response)
-    # hosts only overrides A, not AAAA (unless we change logic; currently only A)
-    # The resolver only handles A in hosts for simplicity. We'll check that it doesn't answer.
-    # Actually, the code currently only synthesizes A responses; for AAAA it will forward.
-    # So we mock upstream to see it's called.
     async def fake_upstream(upstream, data):
         resp = dns.message.make_response(dns.message.from_wire(data))
         rr = dns.rrset.from_text("example.com.", 300, dns.rdataclass.IN, dns.rdatatype.AAAA, "2001:db8::1")
@@ -268,7 +244,6 @@ def test_rebind_protection_strips_private(resolver):
     resolver.rebind_action = "strip"
     query = dns.message.make_query("example.com", "A")
     resp = dns.message.make_response(query)
-    # Add public and private IPs
     resp.answer.append(dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "8.8.8.8"))
     resp.answer.append(dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "192.168.1.1"))
     wire = resp.to_wire()
@@ -295,10 +270,9 @@ def test_rebind_protection_blocks_all_private(resolver):
 @pytest.mark.asyncio
 async def test_upstream_failover(resolver):
     resolver.upstreams = [
-        {"address": "1.1.1.1", "port": 53, "protocol": "udp"},
-        {"address": "8.8.8.8", "port": 53, "protocol": "udp"},
+        {"address": "1.1.1.1", "port": 53, "protocol": "udp", "ip": "1.1.1.1"},
+        {"address": "8.8.8.8", "port": 53, "protocol": "udp", "ip": "8.8.8.8"},
     ]
-    # Make first upstream fail, second succeed
     calls = []
     async def fake_try_upstream(upstream, data):
         calls.append(upstream['address'])
@@ -314,24 +288,21 @@ async def test_upstream_failover(resolver):
     assert calls == ["1.1.1.1", "8.8.8.8"]
 
 
-# ---------- Connection Pool (basic) ----------
+# ---------- Connection Pool ----------
 
 @pytest.mark.asyncio
 async def test_connection_pool_get_put():
     pool = ConnectionPool(max_size=1, idle_timeout=1.0)
     key = ("host", 53)
-    # Simulate a connection
     reader = MagicMock()
     writer = MagicMock()
     writer.is_closing.return_value = False
     await pool.put(key, reader, writer)
-    # Get it back
     result = await pool.get(key)
     assert result is not None
     r, w = result
     assert r is reader
     assert w is writer
-    # Pool should be empty now
     result2 = await pool.get(key)
     assert result2 is None
 
@@ -381,12 +352,11 @@ async def test_update_config_changes_rate_limiter(resolver):
 @pytest.mark.asyncio
 async def test_rate_limiter_token_bucket():
     limiter = RateLimiter(rate=1.0, burst=2.0)
-    # Allow 2 bursts
     assert await limiter.is_allowed("ip") is True
     assert await limiter.is_allowed("ip") is True
-    assert await limiter.is_allowed("ip") is False  # bucket empty
+    assert await limiter.is_allowed("ip") is False
     await asyncio.sleep(1.1)
-    assert await limiter.is_allowed("ip") is True  # refilled
+    assert await limiter.is_allowed("ip") is True
 
 
 # ---------- TC bit ----------
@@ -396,7 +366,7 @@ def test_set_tc_bit(resolver):
     wire = msg.to_wire()
     new_wire = resolver._set_tc_bit(wire)
     flags = int.from_bytes(new_wire[2:4], 'big')
-    assert flags & 0x0200 != 0  # TC set
+    assert flags & 0x0200 != 0
 
 
 # ---------- EDNS0 in NXDOMAIN ----------
@@ -408,6 +378,6 @@ def test_make_nxdomain_response_preserves_edns(resolver):
     nx = resolver._make_nxdomain_response(wire)
     msg = dns.message.from_wire(nx)
     assert msg.opt is not None
-    assert msg.payload == 1232  # preserved
+    assert msg.payload == 1232
     assert len(msg.options) == 1
     assert isinstance(msg.options[0], dns.edns.ECSOption)

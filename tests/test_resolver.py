@@ -8,7 +8,7 @@ from dosev.resolver import DNSResolver
 
 @pytest.mark.asyncio
 async def test_is_blocked_exact_and_suffix():
-    resolver = DNSResolver("1.1.1.1", protocol="udp")
+    resolver = DNSResolver(upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}])
     await resolver.set_blocklist(["example.com", ".bad"])
 
     assert await resolver.is_blocked("example.com") is True
@@ -17,7 +17,7 @@ async def test_is_blocked_exact_and_suffix():
 
 
 def test_build_block_response_nxdomain():
-    resolver = DNSResolver("1.1.1.1", protocol="udp")
+    resolver = DNSResolver(upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}])
     query = dns.message.make_query("example.com", "A").to_wire()
     response = resolver.build_block_response(query, action="NXDOMAIN")
     msg = dns.message.from_wire(response)
@@ -25,7 +25,7 @@ def test_build_block_response_nxdomain():
 
 
 def test_build_nxdomain_response_preserves_opt_section():
-    resolver = DNSResolver("1.1.1.1", protocol="udp")
+    resolver = DNSResolver(upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}])
     query = dns.message.make_query("example.com", "A")
     ecs_opt = dns.edns.ECSOption("192.0.2.0", 24, 0)
     query.use_edns(options=[ecs_opt])
@@ -42,8 +42,7 @@ def test_build_nxdomain_response_preserves_opt_section():
 
 @pytest.mark.asyncio
 async def test_forward_preserves_edns_payload(monkeypatch):
-    """Test that the resolver does not modify the client's EDNS payload (RFC 6891)."""
-    resolver = DNSResolver("1.1.1.1", protocol="udp")
+    resolver = DNSResolver(upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}])
     query = dns.message.make_query("example.com", "A")
     query.use_edns(payload=8192)
     query_wire = query.to_wire()
@@ -59,14 +58,13 @@ async def test_forward_preserves_edns_payload(monkeypatch):
     assert captured['wire'] is not None
     sent_msg = dns.message.from_wire(captured['wire'])
     assert sent_msg.opt is not None
-    # The resolver must preserve the client's advertised payload size.
     assert sent_msg.payload == 8192
     assert response is not None
 
 
 @pytest.mark.asyncio
 async def test_make_local_a_response_with_hosts_map():
-    resolver = DNSResolver("1.1.1.1", protocol="udp")
+    resolver = DNSResolver(upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}])
     await resolver.set_hosts_map({"example.com": ("203.0.113.1",)})
     query = dns.message.make_query("example.com", "A").to_wire()
     response = await resolver.forward_dns_query(query)
@@ -77,7 +75,10 @@ async def test_make_local_a_response_with_hosts_map():
 
 @pytest.mark.asyncio
 async def test_forward_dns_query_negative_responses_are_cached(monkeypatch):
-    resolver = DNSResolver("1.1.1.1", protocol="udp", negative_cache_ttl=5)
+    resolver = DNSResolver(
+        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
+        negative_cache_ttl=5
+    )
     query = dns.message.make_query("does-not-exist.example", "A").to_wire()
     calls = 0
 
@@ -101,10 +102,12 @@ async def test_forward_dns_query_negative_responses_are_cached(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_forward_dns_query_cache_expires(monkeypatch):
-    resolver = DNSResolver("1.1.1.1", protocol="udp", cache_ttl=1)
+    resolver = DNSResolver(
+        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
+        cache_ttl=1
+    )
     query = dns.message.make_query("example.com", "A").to_wire()
 
-    # Plain function – no 'self' because it's assigned to instance (not bound)
     async def fake_try_upstream(upstream, data):
         return dns.message.make_response(dns.message.from_wire(data)).to_wire()
 
@@ -121,7 +124,10 @@ async def test_forward_dns_query_cache_expires(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_forward_dns_query_strips_ecs_when_disabled(monkeypatch):
-    resolver = DNSResolver("1.1.1.1", protocol="udp", ecs_enabled=False)
+    resolver = DNSResolver(
+        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
+        ecs_enabled=False
+    )
     query = dns.message.make_query("example.com", "A")
     ecs_opt = dns.edns.ECSOption("192.0.2.0", 24, 0)
     query.use_edns(options=[ecs_opt])
@@ -144,14 +150,13 @@ async def test_forward_dns_query_strips_ecs_when_disabled(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_auto_doh_version_prefers_http3_then_http2(monkeypatch):
-    resolver = DNSResolver("1.1.1.1", protocol="https", doh_timeout=1.0)
+    resolver = DNSResolver(upstreams=[{"address": "1.1.1.1", "protocol": "https", "ip": "1.1.1.1"}], doh_timeout=1.0)
 
-    # These are plain functions assigned to instance – they won't receive 'self'
-    async def fake_https3(data, hostname, port, host, path):
+    async def fake_https3(data, hostname, port, host, path, ip_override):
         return b'response'
 
-    async def fake_https2(data, hostname, port, host, path):
-        return b'response2'  # Not reached
+    async def fake_https2(data, hostname, port, host, path, ip_override):
+        return b'response2'
 
     monkeypatch.setattr(resolver, '_forward_https3', fake_https3)
     monkeypatch.setattr(resolver, '_forward_https2', fake_https2)
@@ -162,7 +167,11 @@ async def test_get_auto_doh_version_prefers_http3_then_http2(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_rate_limiter():
-    resolver = DNSResolver("1.1.1.1", protocol="udp", rate_limit_rps=1.0, rate_limit_burst=1.0)
+    resolver = DNSResolver(
+        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
+        rate_limit_rps=1.0,
+        rate_limit_burst=1.0
+    )
     limiter = resolver.rate_limiter
     assert limiter is not None
     assert await limiter.is_allowed("1.2.3.4") is True

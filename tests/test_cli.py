@@ -1,4 +1,6 @@
 import sys
+import os
+from unittest.mock import patch
 
 from dosev.cli import main
 
@@ -9,8 +11,6 @@ def test_main_loads_config_and_starts_server(monkeypatch):
     monkeypatch.setattr("dosev.cli.load_config", lambda path: {
         "listen_ip": "127.0.0.1",
         "listen_port": 5353,
-        "upstream_dns": "1.1.1.1",
-        "protocol": "udp",
     })
 
     def fake_run_server_sync(**kwargs):
@@ -26,6 +26,9 @@ def test_main_loads_config_and_starts_server(monkeypatch):
 
 
 def test_main_exits_on_config_error(monkeypatch):
+    # Prevent default config creation
+    monkeypatch.setattr("dosev.cli.get_default_config_path", lambda: "/nonexistent/path")
+    monkeypatch.setattr("os.path.exists", lambda x: True)  # so it doesn't create
     monkeypatch.setattr("dosev.cli.load_config", lambda path: (_ for _ in ()).throw(RuntimeError("bad config")))
     monkeypatch.setattr(sys, "argv", ["dosev"])
 
@@ -41,7 +44,7 @@ def test_main_check_config_flag(monkeypatch, capsys, tmp_path):
     cfg_path = tmp_path / "dosev.conf"
     cfg_path.write_text("[server]\nlisten_port = 53\n", encoding="utf-8")
 
-    monkeypatch.setattr("dosev.cli.load_config", lambda path: {"listen_ip": "0.0.0.0", "listen_port": 53, "upstream_dns": "1.1.1.1", "protocol": "udp"})
+    monkeypatch.setattr("dosev.cli.load_config", lambda path: {"listen_ip": "0.0.0.0", "listen_port": 53})
     monkeypatch.setattr("dosev.cli.run_server_sync", lambda **kwargs: (_ for _ in ()).throw(AssertionError("server should not start")))
     monkeypatch.setattr(sys, "argv", ["dosev", "--config", str(cfg_path), "--check-config"])
 

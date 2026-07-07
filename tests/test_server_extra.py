@@ -65,8 +65,7 @@ async def test_run_server_starts_udp_and_tcp_listeners(monkeypatch):
     task = asyncio.create_task(run_server(
         listen_ip="127.0.0.1",
         listen_port=5353,
-        upstream_dns="1.1.1.1",
-        protocol="udp",
+        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
         dns_enable_dot=True,
         dns_dot_cert_file="/tmp/cert.pem",
         dns_dot_key_file="/tmp/key.pem",
@@ -121,8 +120,7 @@ async def test_run_server_graceful_shutdown_on_signal(monkeypatch):
     task = asyncio.create_task(run_server(
         listen_ip="127.0.0.1",
         listen_port=5353,
-        upstream_dns="1.1.1.1",
-        protocol="udp"
+        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}]
     ))
 
     await asyncio.sleep(0.1)
@@ -155,8 +153,7 @@ def test_run_server_sync_uses_asyncio_run(monkeypatch):
     run_server_sync(
         listen_ip="1.2.3.4",
         listen_port=9999,
-        upstream_dns="8.8.8.8",
-        protocol="tls",
+        upstreams=[{"address": "8.8.8.8", "protocol": "tls", "ip": "8.8.8.8"}],
         verbose=True
     )
     assert called['coro'] is not None
@@ -244,7 +241,7 @@ def test_drop_dns_privileges_drops_privs_when_root(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_reload_resolver_updates_max_edns_payload(monkeypatch):
-    resolver = DNSResolver("1.1.1.1", protocol="udp")
+    resolver = DNSResolver(upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}])
     holder = ResolverHolder(resolver)
 
     async def fake_fetch_blocklists(urls, destination_dir):
@@ -253,8 +250,7 @@ async def test_reload_resolver_updates_max_edns_payload(monkeypatch):
     monkeypatch.setattr("dosev.server.fetch_blocklists", fake_fetch_blocklists)
 
     config = {
-        'upstream_dns': '9.9.9.9',
-        'protocol': 'udp',
+        'upstreams': [{"address": "9.9.9.9", "protocol": "udp", "ip": "9.9.9.9"}],
         'dns_max_payload': 1232,
     }
 
@@ -265,7 +261,7 @@ async def test_reload_resolver_updates_max_edns_payload(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_handle_doh_request_returns_bad_request_for_missing_dns(monkeypatch):
-    resolver = DNSResolver("1.1.1.1", protocol="udp")
+    resolver = DNSResolver(upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}])
     holder = ResolverHolder(resolver)
 
     class FakeRequest:
@@ -284,7 +280,7 @@ async def test_handle_doh_request_returns_bad_request_for_missing_dns(monkeypatc
 
 @pytest.mark.asyncio
 async def test_reload_resolver_reloads_blocklists(monkeypatch, tmp_path):
-    resolver = DNSResolver("1.1.1.1", protocol="udp")
+    resolver = DNSResolver(upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}])
     holder = ResolverHolder(resolver)
 
     blocklist_dir = tmp_path / "blocklists"
@@ -305,8 +301,7 @@ async def test_reload_resolver_reloads_blocklists(monkeypatch, tmp_path):
     monkeypatch.setattr("dosev.server.fetch_blocklists", fake_fetch_blocklists)
 
     config = {
-        'upstream_dns': '9.9.9.9',
-        'protocol': 'tls',
+        'upstreams': [{"address": "9.9.9.9", "protocol": "tls", "ip": "9.9.9.9"}],
         'verbose': True,
         'disable_ipv6': True,
         'upstream_udp_timeout': 3.0,
@@ -320,7 +315,6 @@ async def test_reload_resolver_reloads_blocklists(monkeypatch, tmp_path):
         'metrics_port': 8000,
         'rate_limit_rps': 1.0,
         'rate_limit_burst': 2.0,
-        'upstreams': [],
         'optimistic_cache_enabled': True,
         'optimistic_stale_max_age': 100,
         'optimistic_stale_response_ttl': 10,
@@ -335,8 +329,7 @@ async def test_reload_resolver_reloads_blocklists(monkeypatch, tmp_path):
 
     await reload_resolver(holder, config, resolver, blocklists_config)
 
-    assert resolver.upstream_dns == '9.9.9.9'
-    assert resolver.protocol == 'tls'
+    assert resolver.upstreams[0]["address"] == "9.9.9.9"
     assert resolver.verbose is True
     assert resolver.disable_ipv6 is True
     assert resolver.udp_timeout == 3.0

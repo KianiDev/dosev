@@ -8,7 +8,7 @@ from dosev.resolver import DNSResolver
 
 
 def test_split_hostport_ipv6_and_host():
-    resolver = DNSResolver("1.1.1.1", protocol="udp")
+    resolver = DNSResolver(upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}])
     host, port = resolver._split_hostport("[2001:db8::1]:853", default_port=53)
     assert host == "2001:db8::1"
     assert port == 853
@@ -23,7 +23,7 @@ def test_split_hostport_ipv6_and_host():
 
 
 def test_private_ip_detection():
-    resolver = DNSResolver("1.1.1.1", protocol="udp")
+    resolver = DNSResolver(upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}])
     assert resolver._is_private_ip("10.0.0.1") is True
     assert resolver._is_private_ip("192.168.1.1") is True
     assert resolver._is_private_ip("8.8.8.8") is False
@@ -32,7 +32,10 @@ def test_private_ip_detection():
 
 
 def test_build_block_response_zeroip_aaaa_disabled():
-    resolver = DNSResolver("1.1.1.1", protocol="udp", disable_ipv6=True)
+    resolver = DNSResolver(
+        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
+        disable_ipv6=True
+    )
     query = dns.message.make_query("example.com", "AAAA").to_wire()
     response = resolver.build_block_response(query, action="ZEROIP")
     msg = dns.message.from_wire(response)
@@ -42,7 +45,11 @@ def test_build_block_response_zeroip_aaaa_disabled():
 
 @pytest.mark.asyncio
 async def test_update_config_changes_values():
-    resolver = DNSResolver("1.1.1.1", protocol="udp", rate_limit_rps=0.0, rate_limit_burst=0.0)
+    resolver = DNSResolver(
+        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
+        rate_limit_rps=0.0,
+        rate_limit_burst=0.0
+    )
     assert resolver.rate_limiter is None
     await resolver.update_config(rate_limit_rps=2.0, rate_limit_burst=2.0)
     assert resolver.rate_limit_rps == 2.0
@@ -51,7 +58,7 @@ async def test_update_config_changes_values():
 
 
 def test_build_block_response_refused():
-    resolver = DNSResolver("1.1.1.1", protocol="udp")
+    resolver = DNSResolver(upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}])
     query = dns.message.make_query("example.com", "A").to_wire()
     response = resolver.build_block_response(query, action="REFUSED")
     msg = dns.message.from_wire(response)
@@ -60,7 +67,10 @@ def test_build_block_response_refused():
 
 @pytest.mark.asyncio
 async def test_load_trust_anchors_builds_keyring_from_file(tmp_path):
-    resolver = DNSResolver("1.1.1.1", protocol="udp", dnssec_enabled=True)
+    resolver = DNSResolver(
+        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
+        dnssec_enabled=True
+    )
     anchor_path = tmp_path / "anchors.txt"
     anchor_path.write_text(
         ". 300 IN DNSKEY 257 3 8 "
@@ -74,9 +84,10 @@ async def test_load_trust_anchors_builds_keyring_from_file(tmp_path):
 
 @pytest.mark.asyncio
 async def test_resolve_upstream_ip_all_fail(monkeypatch):
-    resolver = DNSResolver("1.1.1.1", protocol="udp")
-    resolver.bootstrap_servers = ["1.1.1.1:53"]
-
+    resolver = DNSResolver(
+        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
+        bootstrap={"servers": ["1.1.1.1:53"]}
+    )
     async def fake_udp_query(ip, port, qname, qtype=1):
         return None
     monkeypatch.setattr(resolver, "_udp_query_a_or_aaaa", fake_udp_query)
@@ -93,7 +104,11 @@ async def test_resolve_upstream_ip_all_fail(monkeypatch):
 
 
 def test_apply_rebind_protection_strips_private_ips():
-    resolver = DNSResolver("1.1.1.1", rebind_protection_enabled=True, rebind_action="strip")
+    resolver = DNSResolver(
+        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
+        rebind_protection_enabled=True,
+        rebind_action="strip"
+    )
     msg = dns.message.make_response(dns.message.make_query("example.com", "A"))
     msg.answer.append(dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "8.8.8.8"))
     msg.answer.append(dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "192.168.1.1"))
@@ -106,8 +121,11 @@ def test_apply_rebind_protection_strips_private_ips():
 
 
 def test_apply_rebind_protection_blocks_when_action_block(monkeypatch):
-    resolver = DNSResolver("1.1.1.1", rebind_protection_enabled=True, rebind_action="block")
-    # Override the instance method directly
+    resolver = DNSResolver(
+        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
+        rebind_protection_enabled=True,
+        rebind_action="block"
+    )
     def fake_is_private(ip):
         return True
     monkeypatch.setattr(resolver, "_is_private_ip", fake_is_private)
