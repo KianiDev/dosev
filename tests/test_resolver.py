@@ -41,7 +41,8 @@ def test_build_nxdomain_response_preserves_opt_section():
 
 
 @pytest.mark.asyncio
-async def test_forward_normalizes_edns_payload_to_4096(monkeypatch):
+async def test_forward_preserves_edns_payload(monkeypatch):
+    """Test that the resolver does not modify the client's EDNS payload (RFC 6891)."""
     resolver = DNSResolver("1.1.1.1", protocol="udp")
     query = dns.message.make_query("example.com", "A")
     query.use_edns(payload=8192)
@@ -58,7 +59,8 @@ async def test_forward_normalizes_edns_payload_to_4096(monkeypatch):
     assert captured['wire'] is not None
     sent_msg = dns.message.from_wire(captured['wire'])
     assert sent_msg.opt is not None
-    assert sent_msg.payload == 4096
+    # The resolver must preserve the client's advertised payload size.
+    assert sent_msg.payload == 8192
     assert response is not None
 
 
