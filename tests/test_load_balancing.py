@@ -75,16 +75,17 @@ async def test_load_balancing_parallel_all_fail(resolver):
     resolver.load_balancing = "parallel"
     with pytest.raises(Exception) as exc:
         await resolver.forward_dns_query(query)
+    # The exception should contain one of the failure messages
     assert "fail" in str(exc.value)
 
 
 @pytest.mark.asyncio
 async def test_load_balancing_random(resolver):
     """Random: pick a random upstream for each query."""
-    # Monkeypatch random.choice to return a deterministic upstream
+    # Monkeypatch random.choice to return a deterministic upstream dict
     original_choice = random.choice
     try:
-        choices = ["upstream1", "upstream2", "upstream3"]
+        choices = resolver.upstreams.copy()  # list of dicts
         def mock_choice(seq):
             return choices.pop(0)
         random.choice = mock_choice
@@ -119,21 +120,25 @@ async def test_load_balancing_roundrobin(resolver):
         return b"success"
     resolver._try_upstream = fake_try_upstream
 
-    query = dns.message.make_query("example.com", "A").to_wire()
+    # Use different names to avoid cache hits
+    query1 = dns.message.make_query("example.com", "A").to_wire()
+    query2 = dns.message.make_query("example.org", "A").to_wire()
+    query3 = dns.message.make_query("example.net", "A").to_wire()
 
     # First call -> upstream1
-    response = await resolver.forward_dns_query(query)
+    response = await resolver.forward_dns_query(query1)
     assert response == b"success"
     assert used == ["upstream1"]
 
     # Second call -> upstream2
-    response = await resolver.forward_dns_query(query)
+    response = await resolver.forward_dns_query(query2)
     assert used == ["upstream1", "upstream2"]
 
     # Third call -> upstream3
-    response = await resolver.forward_dns_query(query)
+    response = await resolver.forward_dns_query(query3)
     assert used == ["upstream1", "upstream2", "upstream3"]
 
-    # Fourth call -> upstream1 again
-    response = await resolver.forward_dns_query(query)
+    # Fourth call -> upstream1 again (cycle)
+    query4 = dns.message.make_query("example.info", "A").to_wire()
+    response = await resolver.forward_dns_query(query4)
     assert used == ["upstream1", "upstream2", "upstream3", "upstream1"]

@@ -1386,7 +1386,8 @@ class DNSResolver:
 
         elif strategy == 'parallel':
             # Query all upstreams concurrently, return first success
-            tasks = [self._try_upstream(upstream, data) for upstream in upstream_list]
+            tasks = [asyncio.create_task(self._try_upstream(upstream, data))
+                     for upstream in upstream_list]
             pending = set(tasks)
             try:
                 while pending:
@@ -1568,8 +1569,6 @@ class DNSResolver:
 
         else:
             raise ValueError(f"Unknown load balancing strategy: {strategy}")
-
-    # --- forwarding implementations ---
 
     async def _forward_udp(self, data: bytes, upstream: Dict[str, Any]) -> bytes:
         host = upstream['address']
