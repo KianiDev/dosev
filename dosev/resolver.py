@@ -1955,9 +1955,10 @@ class DNSResolver:
             raise RuntimeError("aioquic is required for HTTP/3 DoH (install with: pip install aioquic)")
         try:
             from aioquic.h3.connection import H3Connection
-            from aioquic.h3.events import HeadersReceived, DataReceived
+            from aioquic.h3.events import HeadersReceived, DataReceived, DataSent
             from aioquic.asyncio.client import connect as quic_connect
             from aioquic.asyncio.protocol import QuicConnectionProtocol
+            from aioquic.quic.connection import QuicConnection
         except ImportError:
             raise RuntimeError("aioquic.h3 not available; upgrade aioquic to the latest version")
 
@@ -1965,72 +1966,19 @@ class DNSResolver:
         if self.disable_ipv6 and self._is_ipv6_address(resolved):
             raise Exception("IPv6 disabled but resolved to IPv6")
 
-        key = (hostname, port, path)
-        ctx = await self._h3_pool.get(key)
-        if ctx is not None:
-            connection, h3 = ctx
-            stream_id = h3.get_next_available_stream_id()
-            try:
-                h3.send_headers(
-                    stream_id=stream_id,
-                    headers=[
-                        (b":method", b"POST"),
-                        (b":scheme", b"https"),
-                        (b":authority", hostname.encode()),
-                        (b":path", path.encode()),
-                        (b"content-type", b"application/dns-message"),
-                        (b"accept", b"application/dns-message"),
-                        (b"content-length", str(len(data)).encode()),
-                    ],
-                    end_stream=False
-                )
-                h3.send_data(stream_id, data, end_stream=True)
-
-                response_data = bytearray()
-                response_complete = asyncio.Event()
-
-                async def handle_events():
-                    iterations_without_data = 0
-                    max_idle_iterations = int(self.doh_timeout * 10)
-                    while not response_complete.is_set():
-                        try:
-                            event = await asyncio.wait_for(connection.next_event(), timeout=0.1)
-                            iterations_without_data = 0
-                            for h3_event in h3.handle_event(event):
-                                if isinstance(h3_event, DataReceived) and h3_event.stream_id == stream_id:
-                                    response_data.extend(h3_event.data)
-                                    if h3_event.stream_ended:
-                                        response_complete.set()
-                                elif isinstance(h3_event, HeadersReceived) and h3_event.stream_ended:
-                                    response_complete.set()
-                        except asyncio.TimeoutError:
-                            iterations_without_data += 1
-                            if iterations_without_data > max_idle_iterations:
-                                raise asyncio.TimeoutError("HTTP/3 response timeout")
-
-                await asyncio.wait_for(handle_events(), timeout=self.doh_timeout + 5)
-                await self._h3_pool.put(key, (connection, h3))
-                return bytes(response_data)
-            except Exception:
-                try:
-                    connection.close()
-                except Exception:
-                    pass
-                raise
-
-        configuration = QuicConfiguration(is_client=True, alpn_protocols=["h3"], verify_mode=ssl.CERT_REQUIRED)
-        configuration.server_name = hostname
-
-        # Correct: H3Protocol must inherit from QuicConnectionProtocol
+        # Define a proper protocol class that inherits from QuicConnectionProtocol
         class H3Protocol(QuicConnectionProtocol):
-            def __init__(self, quic, stream_handler=None):
+            def __init__(self, quic: QuicConnection, stream_handler=None):
                 super().__init__(quic, stream_handler)
                 self.h3 = H3Connection(self._quic)
                 self._response_data = bytearray()
                 self._response_complete = asyncio.Event()
-                self._response_stream_id = None
+                self._response_stream_id: Optional[int] = None
+                self._request_stream_id: Optional[int] = None
+                self._error: Optional[Exception] = None
 
             def quic_event_received(self, event):
+                # Forward events to HTTP/3
                 for h3_event in self.h3.handle_event(event):
                     if isinstance(h3_event, DataReceived):
                         if h3_event.stream_id == self._response_stream_id:
@@ -2038,13 +1986,18 @@ class DNSResolver:
                             if h3_event.stream_ended:
                                 self._response_complete.set()
                     elif isinstance(h3_event, HeadersReceived):
-                        if h3_event.stream_ended:
+                        if h3_event.stream_id == self._response_stream_id and h3_event.stream_ended:
                             self._response_complete.set()
+                    elif isinstance(h3_event, DataSent):
+                        pass
 
-            async def send_request(self, data: bytes, stream_id: int) -> bytes:
-                self._response_stream_id = stream_id
+            async def send_request(self, data: bytes) -> bytes:
+                self._request_stream_id = self.h3.get_next_available_stream_id()
+                self._response_stream_id = self._request_stream_id
+
+                # Send headers and data
                 self.h3.send_headers(
-                    stream_id=stream_id,
+                    stream_id=self._request_stream_id,
                     headers=[
                         (b":method", b"POST"),
                         (b":scheme", b"https"),
@@ -2056,18 +2009,49 @@ class DNSResolver:
                     ],
                     end_stream=False
                 )
-                self.h3.send_data(stream_id, data, end_stream=True)
+                self.h3.send_data(self._request_stream_id, data, end_stream=True)
                 self.transmit()
 
                 # Wait for response
                 await asyncio.wait_for(self._response_complete.wait(), timeout=self.doh_timeout + 5)
+                if self._error:
+                    raise self._error
                 return bytes(self._response_data)
 
-        async with quic_connect(resolved, port, configuration=configuration,
-                                create_protocol=lambda *args, **kwargs: H3Protocol(*args, **kwargs)) as client:
-            stream_id = client._quic.get_next_available_stream_id()
-            response_data = await client.send_request(data, stream_id)
-            return response_data
+        # Check connection pool
+        key = (hostname, port, path, resolved)
+        client: Optional[H3Protocol] = await self._h3_pool.get(key)
+        if client is None:
+            configuration = QuicConfiguration(is_client=True, alpn_protocols=["h3"], verify_mode=ssl.CERT_REQUIRED)
+            configuration.server_name = hostname
+
+            # Establish connection and create protocol
+            async with quic_connect(resolved, port, configuration=configuration,
+                                    create_protocol=lambda *args, **kwargs: H3Protocol(*args, **kwargs)) as client:
+                try:
+                    # Send request and get response
+                    response = await client.send_request(data)
+                    # Put the client back into the pool for reuse
+                    await self._h3_pool.put(key, client)
+                    return response
+                except Exception as e:
+                    # On error, close the connection and don't pool
+                    client._quic.close()
+                    raise
+        else:
+            try:
+                # Reuse existing client
+                response = await client.send_request(data)
+                await self._h3_pool.put(key, client)
+                return response
+            except Exception as e:
+                # Connection may be dead; close it and don't pool
+                try:
+                    client._quic.close()
+                except Exception:
+                    pass
+                # Remove from pool by not putting back
+                raise
     # ---------- DOQ with connection pooling ----------
     async def _forward_quic(self, data: bytes, upstream: Dict[str, Any]) -> bytes:
         if not _HAS_AIOQUIC:
