@@ -3,6 +3,8 @@
 # Added: DoQ connection pooling, IPv6 stripping, HTTP/3 client (already present)
 # Added: Upstream selection strategies (failover, parallel, random, roundrobin)
 # Added: Health checks (circuit breaker) and TCP fallback on truncation
+# Added: DNSSEC CD flag support (respect client's CD bit)
+# Refactored: forward_dns_query split into helpers for maintainability
 
 import asyncio
 import logging
@@ -308,6 +310,7 @@ class DNSResolver:
       - Upstream selection strategies: failover, parallel, random, roundrobin
       - Health checks (circuit breaker) for upstreams
       - TCP fallback on truncated UDP responses
+      - DNSSEC CD flag support (respect client's CD bit)
     """
 
     def __init__(self,
@@ -496,117 +499,50 @@ class DNSResolver:
         self._health_cooldown: int = self._health_config.get('cooldown', 60)
         self._health_domain: str = self._health_config.get('domain', '.')
 
-        # Upstream health state: key = upstream address + protocol + port (unique enough)
+        # Upstream health state
         self._upstream_health: Dict[str, Dict[str, Any]] = {}
         self._health_lock: asyncio.Lock = asyncio.Lock()
         self._health_task: Optional[asyncio.Task] = None
-        # NOTE: health loop is NOT started here – call start_health_checks() after creation
 
         if self.dnssec_enabled:
             self._load_trust_anchors()
             if self.auto_update_trust_anchor:
                 self._trust_anchor_updater_task = asyncio.create_task(self._background_trust_anchor_updater())
-    
-    async def start_health_checks(self) -> None:
-        """Start the health check background task if enabled and not already running."""
-        if self._health_enabled and self.upstreams and self._health_task is None:
-            self._health_task = asyncio.create_task(self._health_check_loop())
-            self.logger.info("Health check loop started")
-        
 
     # ---------- Health check methods ----------
     def _get_upstream_key(self, upstream: Dict[str, Any]) -> str:
-        """Return a unique key for an upstream (address, protocol, port)."""
         addr = upstream.get('address', '')
         proto = upstream.get('protocol', 'udp')
         port = upstream.get('port', 53)
         return f"{addr}:{proto}:{port}"
 
     async def _do_health_check(self, upstream: Dict[str, Any]) -> bool:
-        """Perform a single health check query to the upstream."""
-        # Build a simple SOA query for the root or configured domain
         try:
             qname = self._health_domain
             query = dns.message.make_query(qname, dns.rdatatype.SOA)
-            # Use a short timeout
             data = query.to_wire()
-            # We'll use the same forwarding logic but without caching or health checks
-            # We'll directly call the protocol-specific forwarder with a short timeout.
-            # To avoid recursion, we won't call forward_dns_query; we'll use _try_upstream directly,
-            # but we need to bypass health checks there. We'll add a flag.
-            # Simpler: call _try_upstream with a special flag to skip health checks? Or we can call the low-level methods.
-            # We'll create a new method _forward_health_check that directly calls the protocol methods.
-            # For now, we'll reuse _try_upstream but we need to ensure it doesn't recurse.
-            # We'll add a parameter to _try_upstream to skip health checks.
-            # But we can also just call the protocol method directly.
-            # Let's use _forward_udp etc. with a short timeout.
-            # We'll copy the upstream dict and set a short timeout.
-            # We'll use the same resolution logic.
-            # We'll just try UDP first; if it fails, we can try TCP? For health, we just check UDP.
-            # We'll handle all protocols generically by calling _try_upstream with health_check=True.
-            # But we need to add health_check flag to _try_upstream.
-            # Let's do that: add an optional `_health_check` parameter to _try_upstream and _forward_* methods.
-            # We'll implement a quick path: use the regular forwarding logic but with a shorter timeout.
-            # We'll use asyncio.wait_for with the health_timeout.
-            # We'll call _try_upstream(upstream, data, health_check=True) – but we need to propagate.
-            # To avoid too much complexity, we'll simply call the low-level forward functions.
-            # For UDP, we'll call _forward_udp directly with a timeout.
-            # For other protocols, we'll fallback to TCP or just return False.
-            # For simplicity, we'll only do UDP health checks.
-            # If the upstream is TCP/TLS/HTTPS, we'll still try UDP if the port allows? Not ideal.
-            # Better: use the same transport as the upstream protocol.
-            # We'll call _try_upstream with a flag to skip health checks.
-            # Let's implement that: add a parameter `_health_check` to _try_upstream.
-            # We'll pass it through to the forward methods.
-            # We'll add `_health_check` to _forward_udp, _forward_tcp, etc. but they ignore it.
-            # In _try_upstream, we will not check health if _health_check is True.
-            # That's a clean solution.
-            # We'll also need to pass the health timeout – we'll set a lower timeout for the overall call.
-            # We'll call _try_upstream(upstream, data, _health_check=True)
-            # and wrap with asyncio.wait_for(self._try_upstream(...), timeout=self._health_timeout)
-            # That will work.
-            # But to avoid infinite recursion, we need to ensure that _try_upstream does not call health checks again.
-            # So we'll add a parameter.
-            # We'll modify _try_upstream signature: async def _try_upstream(self, upstream, data, _health_check=False)
-            # and in the code, skip the health check if _health_check is True.
-            # Also, we'll skip metrics and other checks.
-            # We'll implement that.
-            # For now, we'll just call _try_upstream with the health flag.
-            # We'll implement this in the next iteration.
-            # We'll do a simpler approach: use the existing _forward_udp with the upstream's IP and port.
-            # But for TLS/HTTPS, we'd need to handle them too.
-            # Let's just use _try_upstream with a flag.
-            # We'll add the flag now.
-
-            # We'll call _try_upstream with _health_check=True
             result = await asyncio.wait_for(
                 self._try_upstream(upstream, data, _health_check=True),
                 timeout=self._health_timeout
             )
-            # If we got a response, consider it healthy
             return True
         except Exception as e:
             self.logger.debug("Health check failed for %s: %s", upstream.get('address'), e)
             return False
 
     async def _health_check_loop(self) -> None:
-        """Background task that periodically checks upstream health."""
         while True:
             try:
                 await asyncio.sleep(self._health_interval)
-                # Check each upstream
                 async with self._health_lock:
                     for upstream in self.upstreams:
                         key = self._get_upstream_key(upstream)
                         state = self._upstream_health.get(key, {})
-                        # Skip if still in cooldown
                         now = time.time()
                         if state.get('next_retry', 0) > now:
                             continue
-                        # Perform the check
                         healthy = await self._do_health_check(upstream)
                         if healthy:
-                            # Increment successes
                             state['successes'] = state.get('successes', 0) + 1
                             state['failures'] = 0
                             if state['successes'] >= self._health_healthy_threshold:
@@ -614,7 +550,6 @@ class DNSResolver:
                                 state['successes'] = 0
                                 self.logger.info("Upstream %s is now healthy", upstream.get('address'))
                         else:
-                            # Increment failures
                             state['failures'] = state.get('failures', 0) + 1
                             state['successes'] = 0
                             if state['failures'] >= self._health_unhealthy_threshold:
@@ -629,11 +564,12 @@ class DNSResolver:
             except Exception as e:
                 self.logger.warning("Health check loop error: %s", e)
 
-       # Run health check loop every 10 seconds
+    async def start_health_checks(self) -> None:
+        if self._health_enabled and self.upstreams and self._health_task is None:
+            self._health_task = asyncio.create_task(self._health_check_loop())
+            self.logger.info("Health check loop started")
+
     async def _get_healthy_upstreams(self, upstreams: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Return list of upstreams that are considered healthy.
-        If all are unhealthy or health checks disabled, return the full list.
-        """
         if not self._health_enabled:
             return upstreams
         healthy = []
@@ -652,8 +588,7 @@ class DNSResolver:
             return upstreams
         return healthy
 
-    # ---------- existing methods (unchanged except for modifications) ----------
-
+    # ---------- Existing helpers (unchanged) ----------
     async def start_pool_cleanups(self) -> None:
         await self._tcp_pool.start_cleanup()
         await self._h2_pool.start_cleanup()
@@ -665,7 +600,6 @@ class DNSResolver:
         await self._h2_pool.stop()
         await self._h3_pool.stop()
         await self._quic_pool.stop()
-        
 
     async def stop_background_tasks(self) -> None:
         if self._trust_anchor_updater_task is not None:
@@ -971,12 +905,10 @@ class DNSResolver:
 
     # ---------- IPv6 stripping ----------
     def _strip_ipv6_records(self, response_bytes: bytes) -> bytes:
-        """Strip AAAA records from the response if strip_ipv6_records is enabled."""
         if not self.strip_ipv6_records:
             return response_bytes
         try:
             msg = dns.message.from_wire(response_bytes)
-            # Filter AAAA from answer and additional sections
             msg.answer = [rrset for rrset in msg.answer if rrset.rdtype != dns.rdatatype.AAAA]
             msg.additional = [rrset for rrset in msg.additional if rrset.rdtype != dns.rdatatype.AAAA]
             return msg.to_wire()
@@ -1088,7 +1020,7 @@ class DNSResolver:
             data = self._strip_ecs(data)
         return data
 
-    # ---------- DNSSEC trust anchor management (unchanged) ----------
+    # ---------- DNSSEC trust anchor management ----------
     def _fetch_root_trust_anchor_from_iana(self) -> Optional[str]:
         try:
             with urllib.request.urlopen("https://data.iana.org/root-anchors/root-anchors.xml", timeout=10) as response:
@@ -1218,12 +1150,13 @@ class DNSResolver:
                 self.logger.warning("Background trust anchor update failed: %s", e)
             await asyncio.sleep(86400)
 
-    # ---------- DNSSEC validation (unchanged) ----------
+    # ---------- DNSSEC validation with CD flag support ----------
     async def _dnssec_validate(self, qname: str, response_wire: bytes, dnssec_requested: bool = True) -> Tuple[bool, bool]:
         if not self.dnssec_enabled:
             return False, True
         if not _HAS_DNSPY:
             raise RuntimeError("dnspython required")
+        # If the client did not request DNSSEC (CD flag), skip validation
         if not dnssec_requested:
             return False, True
 
@@ -1268,7 +1201,7 @@ class DNSResolver:
             self.logger.warning("DNSSEC validation error for %s: %s", qname, e)
             raise
 
-    # ---------- upstream resolution (unchanged) ----------
+    # ---------- upstream resolution ----------
     async def _resolve_upstream_ip(self, hostname: str, ip_override: Optional[str] = None) -> str:
         if ip_override:
             try:
@@ -1389,36 +1322,28 @@ class DNSResolver:
             except Exception:
                 pass
 
-    # ---------- modified _try_upstream with health checks and TCP fallback ----------
+    # ---------- _try_upstream with health checks and TCP fallback ----------
     async def _try_upstream(self, upstream: Dict[str, Any], data: bytes, _health_check: bool = False) -> bytes:
-        """Try a single upstream. If _health_check is True, skip health checks."""
         proto = upstream.get('protocol', 'udp')
         if proto == 'udp':
-            # Try UDP first
             try:
                 response = await self._with_retries(
                     lambda d: self._forward_udp(d, upstream), data, timeout=self.udp_timeout)
-                # Check for TC bit and fallback to TCP if enabled
                 if self.tcp_fallback_enabled and not _health_check:
-                    # Check TC bit in response
                     if len(response) >= 4:
                         flags = int.from_bytes(response[2:4], 'big')
-                        if flags & 0x0200:  # TC bit set
+                        if flags & 0x0200:
                             self.logger.debug("UDP response truncated (TC=1), falling back to TCP for %s",
                                               upstream.get('address'))
-                            # Create a TCP version of this upstream
                             tcp_upstream = upstream.copy()
                             tcp_upstream['protocol'] = 'tcp'
-                            # Use the same port, or default to 53 if not set
                             if 'port' not in tcp_upstream:
                                 tcp_upstream['port'] = 53
-                            # Retry over TCP
                             return await self._with_retries(
                                 lambda d: self._forward_tcp(d, tcp_upstream), data, timeout=self.tcp_timeout)
                 return response
             except Exception as e:
-                # If UDP fails, and we are not in health check, fallback to TCP if the upstream supports it?
-                # For simplicity, we only do TCP fallback on truncation, not on UDP failure.
+                # If UDP fails, we don't fallback to TCP; only on truncation
                 raise
         elif proto == 'tcp':
             return await self._with_retries(
@@ -1437,55 +1362,95 @@ class DNSResolver:
         else:
             raise ValueError(f"Unsupported upstream protocol: {proto}")
 
-    # ---------- main forward_dns_query (modified to use healthy upstreams) ----------
+    # ---------- Refactored forward_dns_query with CD flag ----------
     async def forward_dns_query(self, data: bytes) -> bytes:
+        # Extract query details and cache key
         original_data = data
         data = self._normalize_query_for_forward(data)
         qname = self._extract_qname_from_wire(data)
         qtype = self._extract_qtype_from_wire(data) or 1
         key = self._build_cache_key(data)
         orig_id = int.from_bytes(data[:2], 'big')
+
+        # Check CD flag: if set, skip DNSSEC validation downstream
         dnssec_requested = self._dnssec_requested(original_data)
+        # CD bit is in the query flags (0x0010)
+        cd_flag = False
+        if len(original_data) >= 4:
+            flags = int.from_bytes(original_data[2:4], 'big')
+            cd_flag = bool(flags & 0x0010)
+        if cd_flag:
+            dnssec_requested = False
 
-        async with self._config_lock:
-            disable_ipv6 = self.disable_ipv6
-            dnssec_enabled = self.dnssec_enabled
-            rebind_protection_enabled = self.rebind_protection_enabled
-            doh_timeout = self.doh_timeout
-            optimistic_cache_enabled = self.optimistic_cache_enabled
-            stale_max_age = self.stale_max_age
-            stale_response_ttl = self.stale_response_ttl
-            upstreams = list(self.upstreams) if self.upstreams else []
-            load_balancing = self.load_balancing
+        # Check hosts and blocklists
+        host_values = await self._check_hosts_and_blocklists(qname, qtype, original_data)
+        if host_values is not None:
+            return host_values
 
-        host_values = await self.get_host_for(qname)
-        if host_values:
-            if qtype == 1 and len(host_values) > 0:
-                ip = host_values[0]
+        # Check caches
+        cached = await self._check_caches(key, qname, original_data, dnssec_requested)
+        if cached is not None:
+            return self._set_query_id(cached, orig_id)
+
+        # Build upstream list (filtered by health)
+        upstream_list = list(self.upstreams) if self.upstreams else []
+        if not upstream_list:
+            upstream_list = [{
+                'address': '1.1.1.1',
+                'protocol': 'udp',
+                'port': 53,
+                'hostname': '1.1.1.1',
+                'ip': '1.1.1.1',
+            }]
+
+        # Apply health filtering
+        if self._health_enabled:
+            healthy_list = await self._get_healthy_upstreams(upstream_list)
+            if healthy_list:
+                upstream_list = healthy_list
+
+        # Execute load balancing strategy
+        strategy = self.load_balancing
+        try:
+            resp = await self._execute_strategy(strategy, upstream_list, data, qname, dnssec_requested, key, orig_id)
+            return resp
+        except Exception as e:
+            self.logger.error("Upstream query failed: %s", e)
+            raise
+
+    # ---------- Helper methods for forward_dns_query ----------
+    async def _check_hosts_and_blocklists(self, qname: str, qtype: int, original_data: bytes) -> Optional[bytes]:
+        """Check hosts overrides and blocklists; return synthesized response if applicable."""
+        if qname:
+            host_values = await self.get_host_for(qname)
+            if host_values:
+                if qtype == 1 and len(host_values) > 0:
+                    ip = host_values[0]
+                    try:
+                        if _HAS_DNSPY:
+                            absolute_qname = qname if qname.endswith('.') else f"{qname}."
+                            resp = dns.message.make_response(dns.message.from_wire(original_data) if original_data else None)
+                            rr = dns.rrset.from_text(absolute_qname, 60, dns.rdataclass.IN, dns.rdatatype.A, ip)
+                            resp.answer = [rr]
+                            return resp.to_wire()
+                        else:
+                            return self._build_local_A_response(original_data, ip)
+                    except Exception:
+                        self.logger.exception("failed to synthesize hosts map response for %s", qname)
+            if await self.is_blocked(qname):
+                self._log_event("Blocked (internal)", qname, None, "blocklist")
                 try:
-                    if _HAS_DNSPY:
-                        absolute_qname = qname if qname.endswith('.') else f"{qname}."
-                        from dns import message, rdatatype, rdataclass, rrset
-                        resp = dns.message.make_response(dns.message.from_wire(original_data) if original_data else None)
-                        rr = dns.rrset.from_text(absolute_qname, 60, dns.rdataclass.IN, dns.rdatatype.A, ip)
-                        resp.answer = [rr]
-                        return resp.to_wire()
-                    else:
-                        return self._build_local_A_response(original_data, ip)
+                    return self.build_block_response(original_data)
                 except Exception:
-                    self.logger.exception("failed to synthesize hosts map response for %s", qname)
+                    return self._make_nxdomain_response(original_data)
+        return None
 
-        if await self.is_blocked(qname):
-            self._log_event("Blocked (internal)", qname, None, "blocklist")
-            try:
-                return self.build_block_response(original_data)
-            except Exception:
-                return self._make_nxdomain_response(original_data)
-
+    async def _check_caches(self, key, qname: str, original_data: bytes, dnssec_requested: bool) -> Optional[bytes]:
+        """Check negative cache, positive wire cache (with optimistic serving)."""
         cached_negative = await self._negative_cache_get(key)
         if cached_negative is not None:
             self.logger.debug("negative-cache hit %s", key)
-            return self._set_query_id(cached_negative, orig_id)
+            return cached_negative
 
         cached = await self._wire_cache_get_valid(key)
         if cached is not None:
@@ -1508,81 +1473,25 @@ class DNSResolver:
                     self.logger.warning("DNSSEC revalidation failed for %s, treating as cache miss", key)
                     async with self._lock:
                         await self._wire_cache_delete(key)
-                    cached = None
+                    return None
 
-            if cached is not None:
-                if self.rebind_protection_enabled:
-                    resp_bytes = self._apply_rebind_protection(resp_bytes)
-                    if resp_bytes is None:
-                        return self._make_nxdomain_response(data)
-                return self._set_query_id(resp_bytes, orig_id)
+            if self.rebind_protection_enabled:
+                resp_bytes = self._apply_rebind_protection(resp_bytes)
+                if resp_bytes is None:
+                    return self._make_nxdomain_response(original_data)
+            return resp_bytes
+        return None
 
-        # Build upstream list and apply health filtering
-        upstream_list = upstreams
-        if not upstream_list:
-            upstream_list = [{
-                'address': '1.1.1.1',
-                'protocol': 'udp',
-                'port': 53,
-                'hostname': '1.1.1.1',
-                'ip': '1.1.1.1',
-            }]
-
-        # Filter healthy upstreams
-        if self._health_enabled:
-            healthy_list = await self._get_healthy_upstreams(upstream_list)
-            if healthy_list:
-                upstream_list = healthy_list
-
+    async def _execute_strategy(self, strategy: str, upstream_list: List[Dict[str, Any]],
+                                data: bytes, qname: str, dnssec_requested: bool,
+                                key, orig_id: int) -> bytes:
+        """Execute the selected load balancing strategy."""
         last_exc = None
-
-        # ---------- Load balancing strategy ----------
-        strategy = load_balancing
-
         if strategy == 'failover':
             for upstream in upstream_list:
                 try:
-                    resp = await self._try_upstream(upstream, data)
-                    if self.metrics_enabled and self._metrics:
-                        try:
-                            self._metrics['requests_total'].labels(proto=upstream['protocol']).inc()
-                        except Exception:
-                            pass
-                    dnssec_ok = False
-                    if self.dnssec_enabled and qname:
-                        try:
-                            secure, insecure = await self._dnssec_validate(qname, resp, dnssec_requested)
-                            if secure:
-                                dnssec_ok = True
-                            else:
-                                dnssec_ok = False
-                        except Exception as e:
-                            self.logger.warning("DNSSEC validation failed for %s: %s", qname, e)
-                            raise
-                    if self.rebind_protection_enabled:
-                        resp = self._apply_rebind_protection(resp)
-                        if resp is None:
-                            return self._make_nxdomain_response(data)
-                    if self.strip_ipv6_records:
-                        resp = self._strip_ipv6_records(resp)
-                    if self._is_negative_response(resp):
-                        ttl = self._extract_soa_minimum(resp)
-                        if ttl is None:
-                            ttl = self.negative_cache_ttl
-                        async with self._lock:
-                            await self._wire_cache_delete(key)
-                            await self._negative_cache_set(key, resp, ttl=ttl)
-                        return resp
-                    ttl = self._extract_min_ttl(resp)
-                    if ttl <= 0:
-                        ttl = 30
-                    expiry = time.time() + ttl
-                    stale_until = expiry + self.stale_max_age if self.optimistic_cache_enabled else expiry
-                    val = (resp, expiry, data, stale_until, dnssec_ok)
-                    async with self._lock:
-                        await self._negative_cache_delete(key)
-                        await self._wire_cache_set(key, val)
-                    return resp
+                    return await self._process_upstream_response(
+                        upstream, data, qname, dnssec_requested, key, orig_id)
                 except Exception as e:
                     last_exc = e
                     self.logger.debug("upstream %s failed: %s", upstream.get('address'), e)
@@ -1590,7 +1499,8 @@ class DNSResolver:
             raise last_exc or Exception("All upstreams failed")
 
         elif strategy == 'parallel':
-            tasks = [asyncio.create_task(self._try_upstream(upstream, data))
+            tasks = [asyncio.create_task(self._process_upstream_response(
+                upstream, data, qname, dnssec_requested, key, orig_id))
                      for upstream in upstream_list]
             pending = set(tasks)
             try:
@@ -1600,61 +1510,24 @@ class DNSResolver:
                         if not task.cancelled():
                             try:
                                 result = task.result()
-                                resp = result
-                                if self.metrics_enabled and self._metrics:
-                                    try:
-                                        self._metrics['requests_total'].labels(proto='parallel').inc()
-                                    except Exception:
-                                        pass
-                                dnssec_ok = False
-                                if self.dnssec_enabled and qname:
-                                    try:
-                                        secure, insecure = await self._dnssec_validate(qname, resp, dnssec_requested)
-                                        if secure:
-                                            dnssec_ok = True
-                                        else:
-                                            dnssec_ok = False
-                                    except Exception as e:
-                                        self.logger.warning("DNSSEC validation failed for %s: %s", qname, e)
-                                        raise
-                                if self.rebind_protection_enabled:
-                                    resp = self._apply_rebind_protection(resp)
-                                    if resp is None:
-                                        return self._make_nxdomain_response(data)
-                                if self.strip_ipv6_records:
-                                    resp = self._strip_ipv6_records(resp)
-                                if self._is_negative_response(resp):
-                                    ttl = self._extract_soa_minimum(resp)
-                                    if ttl is None:
-                                        ttl = self.negative_cache_ttl
-                                    async with self._lock:
-                                        await self._wire_cache_delete(key)
-                                        await self._negative_cache_set(key, resp, ttl=ttl)
-                                    return resp
-                                ttl = self._extract_min_ttl(resp)
-                                if ttl <= 0:
-                                    ttl = 30
-                                expiry = time.time() + ttl
-                                stale_until = expiry + self.stale_max_age if self.optimistic_cache_enabled else expiry
-                                val = (resp, expiry, data, stale_until, dnssec_ok)
-                                async with self._lock:
-                                    await self._negative_cache_delete(key)
-                                    await self._wire_cache_set(key, val)
-                                return resp
+                                # Cancel remaining tasks
+                                for t in pending:
+                                    t.cancel()
+                                return result
                             except Exception as e:
                                 if not pending:
                                     raise e
                                 continue
                     break
                 if pending:
-                    for task in pending:
-                        task.cancel()
+                    for t in pending:
+                        t.cancel()
                     await asyncio.gather(*pending, return_exceptions=True)
                 raise last_exc or Exception("All upstreams failed in parallel")
             except Exception as e:
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
                 raise e
 
@@ -1662,47 +1535,8 @@ class DNSResolver:
             import random
             upstream = random.choice(upstream_list)
             try:
-                resp = await self._try_upstream(upstream, data)
-                if self.metrics_enabled and self._metrics:
-                    try:
-                        self._metrics['requests_total'].labels(proto=upstream['protocol']).inc()
-                    except Exception:
-                        pass
-                dnssec_ok = False
-                if self.dnssec_enabled and qname:
-                    try:
-                        secure, insecure = await self._dnssec_validate(qname, resp, dnssec_requested)
-                        if secure:
-                            dnssec_ok = True
-                        else:
-                            dnssec_ok = False
-                    except Exception as e:
-                        self.logger.warning("DNSSEC validation failed for %s: %s", qname, e)
-                        raise
-                if self.rebind_protection_enabled:
-                    resp = self._apply_rebind_protection(resp)
-                    if resp is None:
-                        return self._make_nxdomain_response(data)
-                if self.strip_ipv6_records:
-                    resp = self._strip_ipv6_records(resp)
-                if self._is_negative_response(resp):
-                    ttl = self._extract_soa_minimum(resp)
-                    if ttl is None:
-                        ttl = self.negative_cache_ttl
-                    async with self._lock:
-                        await self._wire_cache_delete(key)
-                        await self._negative_cache_set(key, resp, ttl=ttl)
-                    return resp
-                ttl = self._extract_min_ttl(resp)
-                if ttl <= 0:
-                    ttl = 30
-                expiry = time.time() + ttl
-                stale_until = expiry + self.stale_max_age if self.optimistic_cache_enabled else expiry
-                val = (resp, expiry, data, stale_until, dnssec_ok)
-                async with self._lock:
-                    await self._negative_cache_delete(key)
-                    await self._wire_cache_set(key, val)
-                return resp
+                return await self._process_upstream_response(
+                    upstream, data, qname, dnssec_requested, key, orig_id)
             except Exception as e:
                 last_exc = e
                 self.logger.debug("random upstream %s failed: %s", upstream.get('address'), e)
@@ -1713,58 +1547,70 @@ class DNSResolver:
             upstream = upstream_list[idx]
             self._rr_index += 1
             try:
-                resp = await self._try_upstream(upstream, data)
-                if self.metrics_enabled and self._metrics:
-                    try:
-                        self._metrics['requests_total'].labels(proto=upstream['protocol']).inc()
-                    except Exception:
-                        pass
-                dnssec_ok = False
-                if self.dnssec_enabled and qname:
-                    try:
-                        secure, insecure = await self._dnssec_validate(qname, resp, dnssec_requested)
-                        if secure:
-                            dnssec_ok = True
-                        else:
-                            dnssec_ok = False
-                    except Exception as e:
-                        self.logger.warning("DNSSEC validation failed for %s: %s", qname, e)
-                        raise
-                if self.rebind_protection_enabled:
-                    resp = self._apply_rebind_protection(resp)
-                    if resp is None:
-                        return self._make_nxdomain_response(data)
-                if self.strip_ipv6_records:
-                    resp = self._strip_ipv6_records(resp)
-                if self._is_negative_response(resp):
-                    ttl = self._extract_soa_minimum(resp)
-                    if ttl is None:
-                        ttl = self.negative_cache_ttl
-                    async with self._lock:
-                        await self._wire_cache_delete(key)
-                        await self._negative_cache_set(key, resp, ttl=ttl)
-                    return resp
-                ttl = self._extract_min_ttl(resp)
-                if ttl <= 0:
-                    ttl = 30
-                expiry = time.time() + ttl
-                stale_until = expiry + self.stale_max_age if self.optimistic_cache_enabled else expiry
-                val = (resp, expiry, data, stale_until, dnssec_ok)
-                async with self._lock:
-                    await self._negative_cache_delete(key)
-                    await self._wire_cache_set(key, val)
-                return resp
+                return await self._process_upstream_response(
+                    upstream, data, qname, dnssec_requested, key, orig_id)
             except Exception as e:
                 last_exc = e
                 self.logger.debug("roundrobin upstream %s failed: %s", upstream.get('address'), e)
                 raise last_exc
-
         else:
             raise ValueError(f"Unknown load balancing strategy: {strategy}")
 
-    # ---------- forwarding implementations (unchanged except for possible health check flags) ----------
-    # (The _forward_* methods remain exactly as they were; we only added the health check flag to _try_upstream.)
+    async def _process_upstream_response(self, upstream: Dict[str, Any], data: bytes,
+                                         qname: str, dnssec_requested: bool,
+                                         key, orig_id: int) -> bytes:
+        """Send query to a single upstream, process response: DNSSEC, rebind, caching."""
+        resp = await self._try_upstream(upstream, data)
 
+        if self.metrics_enabled and self._metrics:
+            try:
+                self._metrics['requests_total'].labels(proto=upstream['protocol']).inc()
+            except Exception:
+                pass
+
+        dnssec_ok = False
+        if self.dnssec_enabled and qname:
+            try:
+                secure, insecure = await self._dnssec_validate(qname, resp, dnssec_requested)
+                if secure:
+                    dnssec_ok = True
+                else:
+                    dnssec_ok = False
+            except Exception as e:
+                self.logger.warning("DNSSEC validation failed for %s: %s", qname, e)
+                raise
+
+        if self.rebind_protection_enabled:
+            resp = self._apply_rebind_protection(resp)
+            if resp is None:
+                return self._make_nxdomain_response(data)
+
+        if self.strip_ipv6_records:
+            resp = self._strip_ipv6_records(resp)
+
+        # Cache response
+        if self._is_negative_response(resp):
+            ttl = self._extract_soa_minimum(resp)
+            if ttl is None:
+                ttl = self.negative_cache_ttl
+            async with self._lock:
+                await self._wire_cache_delete(key)
+                await self._negative_cache_set(key, resp, ttl=ttl)
+            return self._set_query_id(resp, orig_id)
+
+        ttl = self._extract_min_ttl(resp)
+        if ttl <= 0:
+            ttl = 30
+        expiry = time.time() + ttl
+        stale_until = expiry + self.stale_max_age if self.optimistic_cache_enabled else expiry
+        val = (resp, expiry, data, stale_until, dnssec_ok)
+        async with self._lock:
+            await self._negative_cache_delete(key)
+            await self._wire_cache_set(key, val)
+
+        return self._set_query_id(resp, orig_id)
+
+    # ---------- Forwarding implementations ----------
     async def _forward_udp(self, data: bytes, upstream: Dict[str, Any]) -> bytes:
         host = upstream['address']
         port = upstream.get('port', 53)

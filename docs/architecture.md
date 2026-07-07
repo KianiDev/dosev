@@ -52,7 +52,7 @@ The heart of the system. It manages:
 - **Caches**: positive cache (TTL‑based), negative cache (NXDOMAIN/NODATA), and stale‑serve logic.
 - **Blocklists & Hosts**: exact‑match and suffix‑based domain filtering; static A/AAAA overrides.
 - **Upstream management**: supports `failover`, `parallel`, `random`, and `roundrobin` strategies; configured via `load_balancing` in the config. Also includes health checks (circuit breaker) and TCP fallback on truncated UDP responses.
-- **DNSSEC**: validates responses using a trust anchor (bundled or IANA‑fetched); caches validation results.
+- **DNSSEC**: validates responses using a trust anchor (bundled or IANA‑fetched); caches validation results. Respects the client's CD (Checking Disabled) flag – if set, validation is skipped.
 - **EDNS0**: parses client subnet and forwards it to upstreams.
 - **Rate limiting**: token‑bucket per client IP.
 - **Rebinding protection**: strips or blocks private IPs.

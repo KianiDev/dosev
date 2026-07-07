@@ -52,3 +52,19 @@ def test_main_check_config_flag(monkeypatch, capsys, tmp_path):
 
     captured = capsys.readouterr()
     assert "Configuration is valid." in captured.out
+
+
+def test_main_version_flag(monkeypatch, capsys):
+    """Test that --version prints the version and exits."""
+    monkeypatch.setattr(sys, "argv", ["dosev", "--version"])
+    # Mock version function to return a known value
+    def fake_version(name):
+        return "1.6.0"
+    monkeypatch.setattr("dosev.cli.version", fake_version)
+
+    try:
+        main()
+    except SystemExit as e:
+        assert e.code == 0
+    captured = capsys.readouterr()
+    assert "dosev 1.6.0" in captured.out

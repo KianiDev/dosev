@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+from importlib.metadata import version
 from .config import load_config, _default_log_dir, get_default_config_path, write_default_config
 from .server import run_server_sync
 
@@ -11,7 +12,18 @@ def main() -> None:
                         help=f"Path to configuration file (default: {default_config})")
     parser.add_argument("--check-config", action="store_true",
                         help="Validate the configuration and exit without starting the server")
+    parser.add_argument("--version", action="store_true",
+                        help="Show version and exit")
+
     args = parser.parse_args()
+
+    if args.version:
+        try:
+            ver = version("dosev")
+        except Exception:
+            ver = "unknown"
+        print(f"dosev {ver}")
+        return
 
     config_path = args.config
 

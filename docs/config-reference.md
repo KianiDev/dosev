@@ -107,6 +107,8 @@ All upstreams are now defined in the `[upstreams]` section (see below).
 | `dns_privilege_drop_group` | string | `""` | Group to drop privileges to. |
 | `dns_chroot_dir` | string | `""` | chroot directory (Linux/Unix). |
 
+**Note:** If the client sets the CD (Checking Disabled) flag in the query, validation is automatically bypassed, regardless of the dnssec_enabled setting.
+
 ---
 
 ### `[logging]`
