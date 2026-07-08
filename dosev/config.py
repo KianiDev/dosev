@@ -136,6 +136,19 @@ auto_update_trust_anchor = true
 # Path to a file containing additional trust anchors (DNSKEY or DS records).
 trust_anchors_file =
 
+# DNSSEC KeyTrap mitigation (CVE-2023-50387):
+# Limit the number of signatures validated per response.
+# Set to 0 to disable limits (not recommended).
+dnssec_max_validations = 32
+# Limit the number of DNSKEY records processed per validation.
+dnssec_max_dnskey_records = 8
+# Timeout in seconds for DNSSEC validation operations.
+dnssec_validation_timeout = 2.0
+
+# Scrub unsolicited NS records from authority section to prevent cache poisoning.
+# See: CVE-2025-11411, RFC 2181 Section 5.4.1
+dns_scrub_unsolicited_ns = true
+
 # Certificate pinning: comma‑separated list of host=sha256(der) pairs.
 pinned_certs =
 
@@ -319,6 +332,19 @@ def _validate_and_warn(config: Dict[str, Any]) -> None:
         if cooldown < 0:
             raise ValueError('health.cooldown must be non‑negative')
 
+    # DNSSEC validation limits (must be non-negative)
+    dnssec_max_validations = config.get('dnssec_max_validations', 32)
+    if dnssec_max_validations < 0:
+        raise ValueError('dnssec_max_validations must be non-negative')
+
+    dnssec_max_dnskey_records = config.get('dnssec_max_dnskey_records', 8)
+    if dnssec_max_dnskey_records < 0:
+        raise ValueError('dnssec_max_dnskey_records must be non-negative')
+
+    dnssec_validation_timeout = config.get('dnssec_validation_timeout', 2.0)
+    if dnssec_validation_timeout <= 0:
+        raise ValueError('dnssec_validation_timeout must be positive')
+
 def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     config = configparser.ConfigParser()
     if not os.path.exists(path):
@@ -342,6 +368,10 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
             'dnssec_enabled': False,
             'auto_update_trust_anchor': True,
             'trust_anchors_file': '',
+            'dnssec_max_validations': 32,
+            'dnssec_max_dnskey_records': 8,
+            'dnssec_validation_timeout': 2.0,
+            'dns_scrub_unsolicited_ns': True,
             'metrics_enabled': False,
             'metrics_port': 8000,
             'uvloop_enable': False,
@@ -442,6 +472,10 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     dnssec_enabled = config.getboolean('security', 'dnssec_enabled', fallback=False)
     auto_update_trust_anchor = config.getboolean('security', 'auto_update_trust_anchor', fallback=True)
     trust_anchors_file = config.get('security', 'trust_anchors_file', fallback='')
+    dnssec_max_validations = config.getint('security', 'dnssec_max_validations', fallback=32)
+    dnssec_max_dnskey_records = config.getint('security', 'dnssec_max_dnskey_records', fallback=8)
+    dnssec_validation_timeout = config.getfloat('security', 'dnssec_validation_timeout', fallback=2.0)
+    dns_scrub_unsolicited_ns = config.getboolean('security', 'dns_scrub_unsolicited_ns', fallback=True)
 
     pinned_raw = config.get('security', 'pinned_certs', fallback='')
     dns_pinned_certs = {}
@@ -584,6 +618,10 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
         'dnssec_enabled': dnssec_enabled,
         'auto_update_trust_anchor': auto_update_trust_anchor,
         'trust_anchors_file': trust_anchors_file,
+        'dnssec_max_validations': dnssec_max_validations,
+        'dnssec_max_dnskey_records': dnssec_max_dnskey_records,
+        'dnssec_validation_timeout': dnssec_validation_timeout,
+        'dns_scrub_unsolicited_ns': dns_scrub_unsolicited_ns,
         'metrics_enabled': metrics_enabled,
         'metrics_port': metrics_port,
         'uvloop_enable': uvloop_enable,

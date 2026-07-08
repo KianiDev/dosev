@@ -52,7 +52,8 @@ The heart of the system. It manages:
 - **Caches**: positive cache (TTL‑based), negative cache (NXDOMAIN/NODATA), and stale‑serve logic.
 - **Blocklists & Hosts**: exact‑match and suffix‑based domain filtering; static A/AAAA overrides.
 - **Upstream management**: supports `failover`, `parallel`, `random`, and `roundrobin` strategies; configured via `load_balancing` in the config. Also includes health checks (circuit breaker) and TCP fallback on truncated UDP responses.
-- **DNSSEC**: validates responses using a trust anchor (bundled or IANA‑fetched); caches validation results. Respects the client's CD (Checking Disabled) flag – if set, validation is skipped.
+- **DNSSEC**: validates responses using a trust anchor (bundled or IANA‑fetched); caches validation results. Respects the client's CD (Checking Disabled) flag – if set, validation is skipped. Includes **KeyTrap mitigation** (CVE‑2023‑50387) with configurable limits on signature validations, DNSKEY records, and validation timeouts.
+- **Cache poisoning prevention**: scrubs unsolicited NS records from the authority section (RFC 2181 Section 5.4.1) to prevent injection attacks (CVE‑2025‑11411). Configurable via `dns_scrub_unsolicited_ns`.
 - **EDNS0**: parses client subnet and forwards it to upstreams.
 - **Rate limiting**: token‑bucket per client IP.
 - **Rebinding protection**: strips or blocks private IPs.
@@ -71,7 +72,8 @@ If an upstream returns a UDP response with the TC (truncation) bit set, the reso
 - `forward_dns_query(data: bytes) -> bytes` – the main entry point for processing a raw DNS query.
 - `_try_upstream(upstream, data) -> bytes` – sends a query to a single upstream, with retries.
 - `_wire_cache_get_valid(key) -> Optional[bytes]` – fetches a cached response, with stale‑serve logic.
-- `_dnssec_validate(qname, response) -> None` – validates DNSSEC signatures.
+- `_dnssec_validate(qname, response) -> None` – validates DNSSEC signatures with KeyTrap mitigation.
+- `_scrub_authority_section(response, qname) -> bytes` – removes unsolicited NS records.
 
 ### 2. Server Layer (dosev/server.py)
 
@@ -140,7 +142,8 @@ On first run, a default configuration file is created in the OS‑specific user 
 - **Certificate pinning**: SHA‑256 pinning for TLS connections.
 - **Rebinding protection**: Prevents DNS rebinding attacks by filtering private IPs.
 - **Rate limiting**: Protects against DDoS.
-- **DNSSEC**: Validates response authenticity.
+- **DNSSEC**: Validates response authenticity with KeyTrap mitigation.
+- **Cache poisoning prevention**: Scrubs unsolicited NS records to prevent injection attacks.
 - **chroot**: Optional jail for additional isolation.
 
 ---
@@ -193,6 +196,5 @@ The modular design makes it easy to add:
 - Full RFC 5011 trust anchor management.
 - DNSCrypt and ODoH client/server support.
 - More advanced EDNS0 options.
-- Enhanced load balancing (round‑robin, weighted).
-- Health checks for upstreams.
+- Enhanced load balancing (weighted, latency‑based).
 - Web‑based status dashboard.

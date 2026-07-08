@@ -1,4 +1,4 @@
-# dosev/server.py – FINAL with HTTP/3 support, IPv6 stripping, load balancing, health checks, TCP fallback
+# dosev/server.py – with HTTP/3, health checks, and new DNSSEC/NS scrub parameters
 
 import asyncio
 import base64
@@ -34,14 +34,11 @@ from aioquic.quic.events import QuicEvent
 
 
 class ResolverHolder:
-    """Mutable container that allows atomic resolver swaps."""
     def __init__(self, resolver: DNSResolver) -> None:
         self.resolver: DNSResolver = resolver
 
 
 class UDPResolverProtocol(asyncio.DatagramProtocol):
-    """Async UDP protocol handler for DNS queries."""
-
     def __init__(self, holder: ResolverHolder) -> None:
         self.holder: ResolverHolder = holder
         self.transport: Optional[asyncio.DatagramTransport] = None
@@ -100,7 +97,6 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
 
             response = await resolver.forward_dns_query(data)
 
-            # Apply TC bit if response exceeds client's EDNS payload
             client_payload = 512
             try:
                 req_msg = dns.message.from_wire(data)
@@ -111,7 +107,6 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
             if len(response) > client_payload:
                 response = resolver._set_tc_bit(response)
 
-            # Apply IPv6 stripping if configured
             if resolver.strip_ipv6_records:
                 response = resolver._strip_ipv6_records(response)
 
@@ -128,7 +123,6 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
 
 async def _tcp_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                        holder: ResolverHolder) -> None:
-    """Handle a single TCP DNS query."""
     peer = writer.get_extra_info('peername')
     logging.debug(f"Accepted TCP connection from {peer}")
     resolver = holder.resolver
@@ -212,7 +206,6 @@ async def reload_resolver(holder: ResolverHolder,
                           config: Dict[str, Any],
                           current_resolver: DNSResolver,
                           blocklists: Optional[Dict[str, Any]] = None) -> None:
-    """Hot‑reload the resolver's configuration without restarting the server."""
     await current_resolver.update_config(
         verbose=config.get("verbose", False),
         disable_ipv6=config.get("disable_ipv6", False),
@@ -225,6 +218,10 @@ async def reload_resolver(holder: ResolverHolder,
         dnssec_enabled=config.get("dnssec_enabled", False),
         auto_update_trust_anchor=config.get("auto_update_trust_anchor", True),
         trust_anchors=config.get("trust_anchors_file"),
+        dnssec_max_validations=config.get("dnssec_max_validations", 32),
+        dnssec_max_dnskey_records=config.get("dnssec_max_dnskey_records", 8),
+        dnssec_validation_timeout=config.get("dnssec_validation_timeout", 2.0),
+        scrub_unsolicited_ns=config.get("dns_scrub_unsolicited_ns", True),
         metrics_enabled=config.get("metrics_enabled", False),
         metrics_port=config.get("metrics_port", 8000),
         rate_limit_rps=config.get("rate_limit_rps"),
@@ -396,7 +393,6 @@ async def _start_doh_server(holder: ResolverHolder, listen_ip: str, listen_port:
 
 # ---------- HTTP/3 Server ----------
 class Http3ServerProtocol(QuicConnectionProtocol):
-    """HTTP/3 server protocol for DNS over HTTPS."""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._http = H3Connection(self._quic)
@@ -483,7 +479,6 @@ class Http3ServerProtocol(QuicConnectionProtocol):
 
 async def _start_http3_server(holder: ResolverHolder, listen_ip: str, listen_port: int,
                                 cert_file: str, key_file: str, doh_path: str = "/dns-query") -> None:
-    """Start HTTP/3 server using aioquic."""
     with open(cert_file, 'rb') as f:
         cert_data = f.read()
     with open(key_file, 'rb') as f:
@@ -522,6 +517,10 @@ async def run_server(listen_ip: str, listen_port: int,
                      dnssec_enabled: bool = False,
                      auto_update_trust_anchor: bool = True,
                      trust_anchors_file: Optional[str] = None,
+                     dnssec_max_validations: int = 32,
+                     dnssec_max_dnskey_records: int = 8,
+                     dnssec_validation_timeout: float = 2.0,
+                     dns_scrub_unsolicited_ns: bool = True,
                      metrics_enabled: bool = False,
                      metrics_port: int = 8000,
                      uvloop_enable: bool = False,
@@ -561,7 +560,7 @@ async def run_server(listen_ip: str, listen_port: int,
                      dns_enable_http3: bool = False,
                      tcp_fallback_enabled: bool = True,
                      health_config: Optional[Dict[str, Any]] = None) -> None:
-    """Start the DNS server with full protocol support (UDP, TCP, TLS, DoH, HTTP/3)."""
+
     logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
 
     resolver = DNSResolver(
@@ -582,6 +581,10 @@ async def run_server(listen_ip: str, listen_port: int,
         dnssec_enabled=dnssec_enabled,
         auto_update_trust_anchor=auto_update_trust_anchor,
         trust_anchors=None if not trust_anchors_file else {'file': trust_anchors_file},
+        dnssec_max_validations=dnssec_max_validations,
+        dnssec_max_dnskey_records=dnssec_max_dnskey_records,
+        dnssec_validation_timeout=dnssec_validation_timeout,
+        scrub_unsolicited_ns=dns_scrub_unsolicited_ns,
         metrics_enabled=metrics_enabled,
         metrics_port=metrics_port,
         uvloop_enable=uvloop_enable,
@@ -607,7 +610,7 @@ async def run_server(listen_ip: str, listen_port: int,
     holder = ResolverHolder(resolver)
     loop = asyncio.get_running_loop()
 
-    # Start background tasks (trust anchor updater, health checks)
+    # Start background tasks
     await resolver.start_background_tasks()
 
     if blocklists is None:
@@ -740,6 +743,7 @@ async def run_server(listen_ip: str, listen_port: int,
         await server.wait_closed()
         logging.info("Shutdown complete.")
 
+
 def run_server_sync(listen_ip: str, listen_port: int,
                     verbose: bool = False,
                     blocklists: Optional[Dict[str, Any]] = None,
@@ -756,6 +760,10 @@ def run_server_sync(listen_ip: str, listen_port: int,
                     dnssec_enabled: bool = False,
                     auto_update_trust_anchor: bool = True,
                     trust_anchors_file: Optional[str] = None,
+                    dnssec_max_validations: int = 32,
+                    dnssec_max_dnskey_records: int = 8,
+                    dnssec_validation_timeout: float = 2.0,
+                    dns_scrub_unsolicited_ns: bool = True,
                     metrics_enabled: bool = False,
                     metrics_port: int = 8000,
                     uvloop_enable: bool = False,
@@ -812,6 +820,10 @@ def run_server_sync(listen_ip: str, listen_port: int,
         dnssec_enabled=dnssec_enabled,
         auto_update_trust_anchor=auto_update_trust_anchor,
         trust_anchors_file=trust_anchors_file,
+        dnssec_max_validations=dnssec_max_validations,
+        dnssec_max_dnskey_records=dnssec_max_dnskey_records,
+        dnssec_validation_timeout=dnssec_validation_timeout,
+        dns_scrub_unsolicited_ns=dns_scrub_unsolicited_ns,
         metrics_enabled=metrics_enabled,
         metrics_port=metrics_port,
         uvloop_enable=uvloop_enable,

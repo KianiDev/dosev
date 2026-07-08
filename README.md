@@ -36,7 +36,7 @@ For detailed instructions, see the [Quick Start Guide](docs/quickstart.md).
 |---------|-------------|
 | **Multi‑protocol client** | Forward queries via UDP, TCP, TLS, HTTPS (HTTP/1.1, HTTP/2, HTTP/3), and QUIC. |
 | **Multi‑protocol server** | Listen on UDP, TCP, TLS, and HTTPS (HTTP/2 & HTTP/3). |
-| **DNSSEC validation** | Validate responses with a built‑in root trust anchor (auto‑updated from IANA). |
+| **DNSSEC validation** | Validate responses with a built‑in root trust anchor (auto‑updated from IANA). Includes KeyTrap mitigation (CVE‑2023‑50387). |
 | **Caching** | Positive and negative caching with configurable TTLs; optimistic caching (serve‑stale). |
 | **Blocklists** | Filter domains using local files or remote lists (automatically refreshed). |
 | **Hosts overrides** | Custom A/AAAA records for local name resolution. |
@@ -44,6 +44,7 @@ For detailed instructions, see the [Quick Start Guide](docs/quickstart.md).
 | **Upstream selection** | Multiple strategies: `failover` (try in order), `parallel` (query all, return first success), `random`, `roundrobin`. |
 | **Rate limiting** | Token‑bucket limiter per client IP. |
 | **Rebinding protection** | Strip or block private IP addresses from responses. |
+| **Cache poisoning prevention** | Scrub unsolicited NS records (RFC 2181, CVE‑2025‑11411). |
 | **Metrics** | Prometheus‑compatible metrics (requests, errors, latency). |
 | **Privilege dropping** | Drop root privileges after binding to privileged ports. |
 | **Cross‑platform** | Works on Linux, macOS, and Windows. |

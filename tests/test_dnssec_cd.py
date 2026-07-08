@@ -57,8 +57,6 @@ async def test_cd_flag_skips_validation(resolver_with_dnssec):
 @pytest.mark.asyncio
 async def test_no_cd_flag_triggers_validation(resolver_with_dnssec):
     """If CD flag is not set, validation should be attempted."""
-    # Make _dnssec_requested return True to simulate DO flag
-    # Use a synchronous function to avoid creating a coroutine object
     def fake_dnssec_requested(data):
         return True
     resolver_with_dnssec._dnssec_requested = fake_dnssec_requested

@@ -132,7 +132,6 @@ async def test_health_check_query_success():
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
         health_config={'enabled': True},
     )
-    # Update fake to accept _no_retry
     async def fake_try_upstream(upstream, data, _health_check=False, _no_retry=False):
         return b'success'
     resolver._try_upstream = fake_try_upstream

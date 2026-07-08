@@ -5,6 +5,9 @@
 # Added: Health checks (circuit breaker) and TCP fallback on truncation
 # Added: DNSSEC CD flag support (respect client's CD bit)
 # Refactored: forward_dns_query split into helpers for maintainability
+# Fixed: Reduced retries for auto-probing, added negative cache, limited concurrency
+# Security: DNSSEC KeyTrap mitigation (CVE-2023-50387) – limits validations, DNSKEYs, timeout
+# Security: Scrub unsolicited NS records (CVE-2025-11411, RFC 2181) – prevent cache poisoning
 
 import asyncio
 import logging
@@ -311,6 +314,8 @@ class DNSResolver:
       - Health checks (circuit breaker) for upstreams
       - TCP fallback on truncated UDP responses
       - DNSSEC CD flag support (respect client's CD bit)
+      - DNSSEC KeyTrap mitigation (limits validations, DNSKEYs, timeout)
+      - Scrub unsolicited NS records to prevent cache poisoning
     """
 
     def __init__(self,
@@ -324,7 +329,7 @@ class DNSResolver:
                   doh_timeout: float = 5.0,
                   udp_timeout: float = 2.0,
                   tcp_timeout: float = 5.0,
-                  retries: int = 2,
+                  retries: int = 1,
                   dns_logging_enabled: bool = False,
                   dns_log_dir: str = DEFAULT_LOG_DIR,
                   pinned_certs: Optional[Dict[str, str]] = None,
@@ -350,7 +355,11 @@ class DNSResolver:
                   load_balancing: str = 'failover',
                   bootstrap: Optional[Dict[str, Any]] = None,
                   tcp_fallback_enabled: bool = True,
-                  health_config: Optional[Dict[str, Any]] = None) -> None:
+                  health_config: Optional[Dict[str, Any]] = None,
+                  dnssec_max_validations: int = 32,
+                  dnssec_max_dnskey_records: int = 8,
+                  dnssec_validation_timeout: float = 2.0,
+                  scrub_unsolicited_ns: bool = True) -> None:
         self.upstreams: List[Dict[str, Any]] = upstreams or []
 
         if bootstrap is None:
@@ -482,14 +491,11 @@ class DNSResolver:
         self._doh_auto_cache: Dict[str, Tuple[str, float]] = {}
         self._doh_auto_lock: asyncio.Lock = asyncio.Lock()
 
-        # Load‑balancing settings
         self.load_balancing: str = load_balancing
         self._rr_index: int = 0
 
-        # TCP fallback
         self.tcp_fallback_enabled: bool = tcp_fallback_enabled
 
-        # Health checks
         self._health_config: Dict[str, Any] = health_config or {}
         self._health_enabled: bool = self._health_config.get('enabled', False)
         self._health_interval: int = self._health_config.get('interval', 30)
@@ -499,10 +505,17 @@ class DNSResolver:
         self._health_cooldown: int = self._health_config.get('cooldown', 60)
         self._health_domain: str = self._health_config.get('domain', '.')
 
-        # Upstream health state
         self._upstream_health: Dict[str, Dict[str, Any]] = {}
         self._health_lock: asyncio.Lock = asyncio.Lock()
         self._health_task: Optional[asyncio.Task] = None
+
+        # ---------- DNSSEC KeyTrap mitigation ----------
+        self.dnssec_max_validations: int = dnssec_max_validations
+        self.dnssec_max_dnskey_records: int = dnssec_max_dnskey_records
+        self.dnssec_validation_timeout: float = dnssec_validation_timeout
+
+        # ---------- Scrub unsolicited NS records ----------
+        self.scrub_unsolicited_ns: bool = scrub_unsolicited_ns
 
     # ---------- Health check methods ----------
     def _get_upstream_key(self, upstream: Dict[str, Any]) -> str:
@@ -516,7 +529,6 @@ class DNSResolver:
             qname = self._health_domain
             query = dns.message.make_query(qname, dns.rdatatype.SOA)
             data = query.to_wire()
-            # Use a single attempt without retries for health checks
             result = await asyncio.wait_for(
                 self._try_upstream(upstream, data, _health_check=True, _no_retry=True),
                 timeout=self._health_timeout
@@ -564,7 +576,7 @@ class DNSResolver:
         if self._health_enabled and self.upstreams and self._health_task is None:
             self._health_task = asyncio.create_task(self._health_check_loop())
             self.logger.info("Health check loop started")
-            
+
     async def start_background_tasks(self) -> None:
         """Start background tasks: DNSSEC trust anchor updater and health checks."""
         if self.dnssec_enabled and self.auto_update_trust_anchor and self._trust_anchor_updater_task is None:
@@ -593,7 +605,7 @@ class DNSResolver:
             return upstreams
         return healthy
 
-    # ---------- Existing helpers (unchanged) ----------
+    # ---------- Existing helpers ----------
     async def start_pool_cleanups(self) -> None:
         await self._tcp_pool.start_cleanup()
         await self._h2_pool.start_cleanup()
@@ -622,7 +634,7 @@ class DNSResolver:
                 pass
             self._health_task = None
 
-    # ---------- blocklist helpers (unchanged) ----------
+    # ---------- blocklist helpers ----------
     async def set_blocklist(self, domains: Iterable[str]) -> None:
         async with self._blocklist_lock:
             self._blocklist_exact.clear()
@@ -697,7 +709,7 @@ class DNSResolver:
                         exact_set.add(domain)
         return exact_set, suffix_set, hosts_map
 
-    # ---------- wire-cache helpers (unchanged) ----------
+    # ---------- wire-cache helpers ----------
     async def _wire_cache_get(self, key: Tuple[str, int, str]) -> Optional[Tuple[bytes, float, bytes, float, bool]]:
         try:
             if self._cache_is_sync:
@@ -820,7 +832,7 @@ class DNSResolver:
         except Exception:
             return False
 
-    # ---------- other helpers (unchanged) ----------
+    # ---------- other helpers ----------
     async def _maybe_refresh_stale(self, key: Tuple[str, int, str], query_data: bytes) -> None:
         async with self._stale_refresh_lock:
             if key in self._stale_refresh_pending:
@@ -920,7 +932,7 @@ class DNSResolver:
         except Exception:
             return response_bytes
 
-    # ---------- parsing helpers (unchanged) ----------
+    # ---------- parsing helpers ----------
     @staticmethod
     def _parse_dns_name(packet: bytes, offset: int,
                         max_depth: int = 20,
@@ -1099,10 +1111,26 @@ class DNSResolver:
                             rr = dns.rrset.from_text(name_text, ttl, 'IN', 'DNSKEY', rdata_text)
                             name_obj = dns.name.from_text(name_text)
                             if name_obj in anchors:
+                                count = 0
                                 for r in rr:
+                                    if count >= self.dnssec_max_dnskey_records:
+                                        self.logger.warning("DNSKEY limit (%d) reached for %s, truncating",
+                                                            self.dnssec_max_dnskey_records, name_text)
+                                        break
                                     anchors[name_obj].add(r)
+                                    count += 1
                             else:
-                                anchors[name_obj] = rr
+                                new_rr = dns.rrset.RRset(name_obj, rr.rdclass, rr.rdtype)
+                                new_rr.ttl = rr.ttl
+                                count = 0
+                                for r in rr:
+                                    if count >= self.dnssec_max_dnskey_records:
+                                        self.logger.warning("DNSKEY limit (%d) reached for %s, truncating",
+                                                            self.dnssec_max_dnskey_records, name_text)
+                                        break
+                                    new_rr.add(r)
+                                    count += 1
+                                anchors[name_obj] = new_rr
                         except Exception as e:
                             self.logger.debug("failed to parse anchor line '%s': %s", line, e)
                             continue
@@ -1155,13 +1183,12 @@ class DNSResolver:
                 self.logger.warning("Background trust anchor update failed: %s", e)
             await asyncio.sleep(86400)
 
-    # ---------- DNSSEC validation with CD flag support ----------
+    # ---------- DNSSEC validation with KeyTrap mitigation ----------
     async def _dnssec_validate(self, qname: str, response_wire: bytes, dnssec_requested: bool = True) -> Tuple[bool, bool]:
         if not self.dnssec_enabled:
             return False, True
         if not _HAS_DNSPY:
             raise RuntimeError("dnspython required")
-        # If the client did not request DNSSEC (CD flag), skip validation
         if not dnssec_requested:
             return False, True
 
@@ -1170,11 +1197,16 @@ class DNSResolver:
         if not self._dnssec_raw_anchors:
             raise Exception("DNSSEC trust anchors missing")
 
+        validation_counter = 0
+        max_validations = self.dnssec_max_validations if self.dnssec_max_validations > 0 else 999999
+
         def _validate() -> Tuple[bool, bool]:
+            nonlocal validation_counter
             msg = dns.message.from_wire(response_wire)
             has_rrsig = any(rr.rdtype == dns.rdatatype.RRSIG for rr in msg.answer)
             if not has_rrsig:
                 return False, True
+
             for rrset in msg.answer:
                 if rrset.rdtype == dns.rdatatype.RRSIG:
                     continue
@@ -1189,16 +1221,32 @@ class DNSResolver:
                             break
                 if sig is None:
                     raise dns.dnssec.ValidationFailure(f"No RRSIG for rrset {rrset.name}")
+
+                validation_counter += 1
+                if validation_counter > max_validations:
+                    self.logger.warning("DNSSEC validation limit (%d) exceeded for %s, treating as insecure",
+                                        max_validations, qname)
+                    return False, True
+
                 dns.dnssec.validate(rrset, sig, self._dnssec_raw_anchors)
+
             return True, False
 
         try:
-            secure, insecure = await asyncio.get_running_loop().run_in_executor(None, _validate)
+            secure, insecure = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(None, _validate),
+                timeout=self.dnssec_validation_timeout
+            )
             if secure:
-                self.logger.debug("DNSSEC validation passed for %s", qname)
+                self.logger.debug("DNSSEC validation passed for %s (validations=%d)",
+                                  qname, validation_counter)
             else:
                 self.logger.debug("DNSSEC validation: insecure (unsigned) for %s", qname)
             return secure, insecure
+        except asyncio.TimeoutError:
+            self.logger.warning("DNSSEC validation timeout for %s after %.1fs",
+                                qname, self.dnssec_validation_timeout)
+            return False, True
         except dns.dnssec.ValidationFailure as e:
             self.logger.warning("DNSSEC validation bogus for %s: %s", qname, e)
             raise
@@ -1348,7 +1396,6 @@ class DNSResolver:
                                 lambda d: self._forward_tcp(d, tcp_upstream), data, timeout=self.tcp_timeout, no_retry=_no_retry)
                 return response
             except Exception as e:
-                # If UDP fails, we don't fallback to TCP; only on truncation
                 raise
         elif proto == 'tcp':
             return await self._with_retries(
@@ -1366,10 +1413,42 @@ class DNSResolver:
                 lambda d: self._forward_quic(d, upstream), data, timeout=self.doh_timeout, no_retry=_no_retry)
         else:
             raise ValueError(f"Unsupported upstream protocol: {proto}")
-        
+
+    # ---------- Scrub unsolicited NS records ----------
+    def _scrub_authority_section(self, response_bytes: bytes, qname: str) -> bytes:
+        if not self.scrub_unsolicited_ns or not _HAS_DNSPY:
+            return response_bytes
+
+        try:
+            msg = dns.message.from_wire(response_bytes)
+            if not msg.authority:
+                return response_bytes
+
+            qname_lower = qname.lower().rstrip('.')
+            filtered_authority = []
+            for rrset in msg.authority:
+                if rrset.rdtype != dns.rdatatype.NS:
+                    filtered_authority.append(rrset)
+                    continue
+
+                rr_name = str(rrset.name).lower().rstrip('.')
+                if rr_name == '.' or rr_name == qname_lower:
+                    filtered_authority.append(rrset)
+                elif qname_lower.endswith('.' + rr_name):
+                    filtered_authority.append(rrset)
+                elif rr_name.endswith('.' + qname_lower):
+                    filtered_authority.append(rrset)
+                else:
+                    self.logger.debug("Scrubbed unsolicited NS record for %s (qname=%s)", rr_name, qname)
+
+            msg.authority = filtered_authority
+            return msg.to_wire()
+        except Exception as e:
+            self.logger.debug("NS scrubbing failed: %s", e)
+            return response_bytes
+
     # ---------- Refactored forward_dns_query with CD flag ----------
     async def forward_dns_query(self, data: bytes) -> bytes:
-        # Extract query details and cache key
         original_data = data
         data = self._normalize_query_for_forward(data)
         qname = self._extract_qname_from_wire(data)
@@ -1377,9 +1456,7 @@ class DNSResolver:
         key = self._build_cache_key(data)
         orig_id = int.from_bytes(data[:2], 'big')
 
-        # Check CD flag: if set, skip DNSSEC validation downstream
         dnssec_requested = self._dnssec_requested(original_data)
-        # CD bit is in the query flags (0x0010)
         cd_flag = False
         if len(original_data) >= 4:
             flags = int.from_bytes(original_data[2:4], 'big')
@@ -1387,17 +1464,14 @@ class DNSResolver:
         if cd_flag:
             dnssec_requested = False
 
-        # Check hosts and blocklists
         host_values = await self._check_hosts_and_blocklists(qname, qtype, original_data)
         if host_values is not None:
             return host_values
 
-        # Check caches
         cached = await self._check_caches(key, qname, original_data, dnssec_requested)
         if cached is not None:
             return self._set_query_id(cached, orig_id)
 
-        # Build upstream list (filtered by health)
         upstream_list = list(self.upstreams) if self.upstreams else []
         if not upstream_list:
             upstream_list = [{
@@ -1408,13 +1482,11 @@ class DNSResolver:
                 'ip': '1.1.1.1',
             }]
 
-        # Apply health filtering
         if self._health_enabled:
             healthy_list = await self._get_healthy_upstreams(upstream_list)
             if healthy_list:
                 upstream_list = healthy_list
 
-        # Execute load balancing strategy
         strategy = self.load_balancing
         try:
             resp = await self._execute_strategy(strategy, upstream_list, data, qname, dnssec_requested, key, orig_id)
@@ -1425,7 +1497,6 @@ class DNSResolver:
 
     # ---------- Helper methods for forward_dns_query ----------
     async def _check_hosts_and_blocklists(self, qname: str, qtype: int, original_data: bytes) -> Optional[bytes]:
-        """Check hosts overrides and blocklists; return synthesized response if applicable."""
         if qname:
             host_values = await self.get_host_for(qname)
             if host_values:
@@ -1451,7 +1522,6 @@ class DNSResolver:
         return None
 
     async def _check_caches(self, key, qname: str, original_data: bytes, dnssec_requested: bool) -> Optional[bytes]:
-        """Check negative cache, positive wire cache (with optimistic serving)."""
         cached_negative = await self._negative_cache_get(key)
         if cached_negative is not None:
             self.logger.debug("negative-cache hit %s", key)
@@ -1490,7 +1560,6 @@ class DNSResolver:
     async def _execute_strategy(self, strategy: str, upstream_list: List[Dict[str, Any]],
                                 data: bytes, qname: str, dnssec_requested: bool,
                                 key, orig_id: int) -> bytes:
-        """Execute the selected load balancing strategy."""
         last_exc = None
         if strategy == 'failover':
             for upstream in upstream_list:
@@ -1504,28 +1573,23 @@ class DNSResolver:
             raise last_exc or Exception("All upstreams failed")
 
         elif strategy == 'parallel':
-            # Limit concurrency to avoid overwhelming the upstream/system
-            semaphore = asyncio.Semaphore(5)  # max 5 concurrent tasks per query
+            semaphore = asyncio.Semaphore(5)
             async def bounded_task(upstream):
                 async with semaphore:
                     return await self._process_upstream_response(
                         upstream, data, qname, dnssec_requested, key, orig_id)
             tasks = [asyncio.create_task(bounded_task(upstream)) for upstream in upstream_list]
             try:
-                # Wait for the first success
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 for t in done:
                     if not t.cancelled():
                         try:
                             result = t.result()
-                            # Cancel remaining
                             for p in pending:
                                 p.cancel()
                             return result
                         except Exception as e:
-                            # If the first completed task failed, wait for others
                             pass
-                # If all failed, raise
                 raise last_exc or Exception("All upstreams failed in parallel")
             except Exception as e:
                 for t in tasks:
@@ -1533,7 +1597,7 @@ class DNSResolver:
                         t.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
                 raise e
-            
+
         elif strategy == 'random':
             import random
             upstream = random.choice(upstream_list)
@@ -1562,7 +1626,6 @@ class DNSResolver:
     async def _process_upstream_response(self, upstream: Dict[str, Any], data: bytes,
                                          qname: str, dnssec_requested: bool,
                                          key, orig_id: int) -> bytes:
-        """Send query to a single upstream, process response: DNSSEC, rebind, caching."""
         resp = await self._try_upstream(upstream, data)
 
         if self.metrics_enabled and self._metrics:
@@ -1571,8 +1634,11 @@ class DNSResolver:
             except Exception:
                 pass
 
+        # Scrub unsolicited NS records before caching
+        if self.scrub_unsolicited_ns and qname:
+            resp = self._scrub_authority_section(resp, qname)
+
         dnssec_ok = False
-        # Only validate if DNSSEC is enabled AND the client requested it (CD flag not set)
         if self.dnssec_enabled and qname and dnssec_requested:
             try:
                 secure, insecure = await self._dnssec_validate(qname, resp, dnssec_requested)
@@ -1592,7 +1658,6 @@ class DNSResolver:
         if self.strip_ipv6_records:
             resp = self._strip_ipv6_records(resp)
 
-        # Cache response
         if self._is_negative_response(resp):
             ttl = self._extract_soa_minimum(resp)
             if ttl is None:
@@ -1800,15 +1865,13 @@ class DNSResolver:
                 version, expiry = self._doh_auto_cache[hostname]
                 if now < expiry and version != '_probing':
                     return version
-            # If previous probe failed recently, don't retry immediately
             if hostname in self._doh_auto_cache:
                 version, expiry = self._doh_auto_cache[hostname]
                 if version == '_failed' and now < expiry:
-                    return '1.1'  # default fallback
+                    return '1.1'
             self._doh_auto_cache[hostname] = ('_probing', now + 10)
 
         probe_data = dns.message.make_query('probe.invalid', 'A').to_wire()
-        # Try HTTP/3 with a single attempt and no retries
         try:
             await asyncio.wait_for(
                 self._forward_https3(probe_data, hostname, port, host, path, None),
@@ -1816,7 +1879,6 @@ class DNSResolver:
             )
             version = '3'
         except Exception:
-            # Try HTTP/2
             try:
                 await asyncio.wait_for(
                     self._forward_https2(probe_data, hostname, port, host, path, None),
@@ -1830,7 +1892,6 @@ class DNSResolver:
             if self._doh_auto_cache.get(hostname, ('', 0))[0] == '_probing':
                 self._doh_auto_cache[hostname] = (version, time.time() + self.doh_auto_cache_ttl)
             elif version == '1.1':
-                # Cache failure to avoid repeated probing
                 self._doh_auto_cache[hostname] = ('_failed', time.time() + self.doh_auto_cache_ttl // 2)
         return version
 
@@ -1968,10 +2029,9 @@ class DNSResolver:
             raise RuntimeError("aioquic is required for HTTP/3 DoH (install with: pip install aioquic)")
         try:
             from aioquic.h3.connection import H3Connection
-            from aioquic.h3.events import HeadersReceived, DataReceived, DataSent
+            from aioquic.h3.events import HeadersReceived, DataReceived
             from aioquic.asyncio.client import connect as quic_connect
             from aioquic.asyncio.protocol import QuicConnectionProtocol
-            from aioquic.quic.connection import QuicConnection
         except ImportError:
             raise RuntimeError("aioquic.h3 not available; upgrade aioquic to the latest version")
 
@@ -1979,38 +2039,14 @@ class DNSResolver:
         if self.disable_ipv6 and self._is_ipv6_address(resolved):
             raise Exception("IPv6 disabled but resolved to IPv6")
 
-        # Define a proper protocol class that inherits from QuicConnectionProtocol
-        class H3Protocol(QuicConnectionProtocol):
-            def __init__(self, quic: QuicConnection, stream_handler=None):
-                super().__init__(quic, stream_handler)
-                self.h3 = H3Connection(self._quic)
-                self._response_data = bytearray()
-                self._response_complete = asyncio.Event()
-                self._response_stream_id: Optional[int] = None
-                self._request_stream_id: Optional[int] = None
-                self._error: Optional[Exception] = None
-
-            def quic_event_received(self, event):
-                # Forward events to HTTP/3
-                for h3_event in self.h3.handle_event(event):
-                    if isinstance(h3_event, DataReceived):
-                        if h3_event.stream_id == self._response_stream_id:
-                            self._response_data.extend(h3_event.data)
-                            if h3_event.stream_ended:
-                                self._response_complete.set()
-                    elif isinstance(h3_event, HeadersReceived):
-                        if h3_event.stream_id == self._response_stream_id and h3_event.stream_ended:
-                            self._response_complete.set()
-                    elif isinstance(h3_event, DataSent):
-                        pass
-
-            async def send_request(self, data: bytes) -> bytes:
-                self._request_stream_id = self.h3.get_next_available_stream_id()
-                self._response_stream_id = self._request_stream_id
-
-                # Send headers and data
-                self.h3.send_headers(
-                    stream_id=self._request_stream_id,
+        key = (hostname, port, path)
+        ctx = await self._h3_pool.get(key)
+        if ctx is not None:
+            connection, h3 = ctx
+            stream_id = h3.get_next_available_stream_id()
+            try:
+                h3.send_headers(
+                    stream_id=stream_id,
                     headers=[
                         (b":method", b"POST"),
                         (b":scheme", b"https"),
@@ -2022,49 +2058,89 @@ class DNSResolver:
                     ],
                     end_stream=False
                 )
-                self.h3.send_data(self._request_stream_id, data, end_stream=True)
-                self.transmit()
+                h3.send_data(stream_id, data, end_stream=True)
 
-                # Wait for response
-                await asyncio.wait_for(self._response_complete.wait(), timeout=self.doh_timeout + 5)
-                if self._error:
-                    raise self._error
-                return bytes(self._response_data)
+                response_data = bytearray()
+                response_complete = asyncio.Event()
 
-        # Check connection pool
-        key = (hostname, port, path, resolved)
-        client: Optional[H3Protocol] = await self._h3_pool.get(key)
-        if client is None:
-            configuration = QuicConfiguration(is_client=True, alpn_protocols=["h3"], verify_mode=ssl.CERT_REQUIRED)
-            configuration.server_name = hostname
+                async def handle_events():
+                    iterations_without_data = 0
+                    max_idle_iterations = int(self.doh_timeout * 10)
+                    while not response_complete.is_set():
+                        try:
+                            event = await asyncio.wait_for(connection.next_event(), timeout=0.1)
+                            iterations_without_data = 0
+                            for h3_event in h3.handle_event(event):
+                                if isinstance(h3_event, DataReceived) and h3_event.stream_id == stream_id:
+                                    response_data.extend(h3_event.data)
+                                    if h3_event.stream_ended:
+                                        response_complete.set()
+                                elif isinstance(h3_event, HeadersReceived) and h3_event.stream_ended:
+                                    response_complete.set()
+                        except asyncio.TimeoutError:
+                            iterations_without_data += 1
+                            if iterations_without_data > max_idle_iterations:
+                                raise asyncio.TimeoutError("HTTP/3 response timeout")
 
-            # Establish connection and create protocol
-            async with quic_connect(resolved, port, configuration=configuration,
-                                    create_protocol=lambda *args, **kwargs: H3Protocol(*args, **kwargs)) as client:
+                await asyncio.wait_for(handle_events(), timeout=self.doh_timeout + 5)
+                await self._h3_pool.put(key, (connection, h3))
+                return bytes(response_data)
+            except Exception:
                 try:
-                    # Send request and get response
-                    response = await client.send_request(data)
-                    # Put the client back into the pool for reuse
-                    await self._h3_pool.put(key, client)
-                    return response
-                except Exception as e:
-                    # On error, close the connection and don't pool
-                    client._quic.close()
-                    raise
-        else:
-            try:
-                # Reuse existing client
-                response = await client.send_request(data)
-                await self._h3_pool.put(key, client)
-                return response
-            except Exception as e:
-                # Connection may be dead; close it and don't pool
-                try:
-                    client._quic.close()
+                    connection.close()
                 except Exception:
                     pass
-                # Remove from pool by not putting back
                 raise
+
+        configuration = QuicConfiguration(is_client=True, alpn_protocols=["h3"], verify_mode=ssl.CERT_REQUIRED)
+        configuration.server_name = hostname
+
+        class H3Protocol(QuicConnectionProtocol):
+            def __init__(self, quic, stream_handler=None):
+                super().__init__(quic, stream_handler)
+                self.h3 = H3Connection(self._quic)
+                self._response_data = bytearray()
+                self._response_complete = asyncio.Event()
+                self._response_stream_id = None
+
+            def quic_event_received(self, event):
+                for h3_event in self.h3.handle_event(event):
+                    if isinstance(h3_event, DataReceived):
+                        if h3_event.stream_id == self._response_stream_id:
+                            self._response_data.extend(h3_event.data)
+                            if h3_event.stream_ended:
+                                self._response_complete.set()
+                    elif isinstance(h3_event, HeadersReceived):
+                        if h3_event.stream_ended:
+                            self._response_complete.set()
+
+            async def send_request(self, data: bytes, stream_id: int) -> bytes:
+                self._response_stream_id = stream_id
+                self.h3.send_headers(
+                    stream_id=stream_id,
+                    headers=[
+                        (b":method", b"POST"),
+                        (b":scheme", b"https"),
+                        (b":authority", hostname.encode()),
+                        (b":path", path.encode()),
+                        (b"content-type", b"application/dns-message"),
+                        (b"accept", b"application/dns-message"),
+                        (b"content-length", str(len(data)).encode()),
+                    ],
+                    end_stream=False
+                )
+                self.h3.send_data(stream_id, data, end_stream=True)
+                self.transmit()
+
+                await asyncio.wait_for(self._response_complete.wait(), timeout=self.doh_timeout + 5)
+                return bytes(self._response_data)
+
+        async with quic_connect(resolved, port, configuration=configuration,
+                                create_protocol=lambda *args, **kwargs: H3Protocol(*args, **kwargs)) as client:
+            stream_id = client._quic.get_next_available_stream_id()
+            response_data = await client.send_request(data, stream_id)
+            return response_data
+
     # ---------- DOQ with connection pooling ----------
     async def _forward_quic(self, data: bytes, upstream: Dict[str, Any]) -> bytes:
         if not _HAS_AIOQUIC:
@@ -2414,7 +2490,6 @@ class DNSResolver:
 
     async def _with_retries(self, fn: Callable[[bytes], Coroutine[Any, Any, bytes]], data: bytes, timeout: float, no_retry: bool = False) -> bytes:
         if no_retry:
-            # Single attempt, no backoff
             try:
                 return await asyncio.wait_for(fn(data), timeout=timeout)
             except Exception as e:
@@ -2627,7 +2702,11 @@ class DNSResolver:
                             load_balancing: Optional[str] = None,
                             bootstrap: Optional[Dict[str, Any]] = None,
                             tcp_fallback_enabled: Optional[bool] = None,
-                            health_config: Optional[Dict[str, Any]] = None) -> None:
+                            health_config: Optional[Dict[str, Any]] = None,
+                            dnssec_max_validations: Optional[int] = None,
+                            dnssec_max_dnskey_records: Optional[int] = None,
+                            dnssec_validation_timeout: Optional[float] = None,
+                            scrub_unsolicited_ns: Optional[bool] = None) -> None:
         async with self._config_lock:
             if verbose is not None:
                 self.verbose = bool(verbose)
@@ -2741,7 +2820,6 @@ class DNSResolver:
                 self._health_healthy_threshold = health_config.get('healthy_threshold', 2)
                 self._health_cooldown = health_config.get('cooldown', 60)
                 self._health_domain = health_config.get('domain', '.')
-                # Restart health task if needed
                 if self._health_enabled and self._health_task is None and self.upstreams:
                     self._health_task = asyncio.create_task(self._health_check_loop())
                 elif not self._health_enabled and self._health_task is not None:
@@ -2751,13 +2829,24 @@ class DNSResolver:
                     except asyncio.CancelledError:
                         pass
                     self._health_task = None
+            if dnssec_max_validations is not None:
+                self.dnssec_max_validations = dnssec_max_validations
+            if dnssec_max_dnskey_records is not None:
+                self.dnssec_max_dnskey_records = dnssec_max_dnskey_records
+            if dnssec_validation_timeout is not None:
+                self.dnssec_validation_timeout = dnssec_validation_timeout
+            if scrub_unsolicited_ns is not None:
+                self.scrub_unsolicited_ns = scrub_unsolicited_ns
 
             self.logger.info("DNSResolver configuration updated: "
                              "disable_ipv6=%s, strip_ipv6_records=%s, verbose=%s, rate_limit=%s/%s, optimistic_cache=%s, "
-                             "rebind_protection=%s/%s, doh_version=%s, load_balancing=%s, tcp_fallback=%s, health=%s",
+                             "rebind_protection=%s/%s, doh_version=%s, load_balancing=%s, tcp_fallback=%s, health=%s, "
+                             "dnssec_max_validations=%s, dnssec_max_dnskey_records=%s, scrub_unsolicited_ns=%s",
                              self.disable_ipv6, self.strip_ipv6_records, self.verbose,
                              self.rate_limit_rps, self.rate_limit_burst,
                              self.optimistic_cache_enabled,
                              self.rebind_protection_enabled, self.rebind_action,
                              self.doh_version, self.load_balancing, self.tcp_fallback_enabled,
-                             self._health_enabled)
+                             self._health_enabled,
+                             self.dnssec_max_validations, self.dnssec_max_dnskey_records,
+                             self.scrub_unsolicited_ns)

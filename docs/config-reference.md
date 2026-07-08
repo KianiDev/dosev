@@ -93,6 +93,8 @@ All upstreams are now defined in the `[upstreams]` section (see below).
 
 **Note:** Health checks are performed using the same protocol as the upstream (UDP for UDP, TCP for TCP, etc.). If all upstreams are unhealthy, the resolver falls back to using all upstreams (to avoid complete service failure).
 
+---
+
 ### `[security]`
 
 | Option | Type | Default | Description |
@@ -100,6 +102,10 @@ All upstreams are now defined in the `[upstreams]` section (see below).
 | `dnssec_enabled` | bool | `false` | Enable DNSSEC validation. |
 | `auto_update_trust_anchor` | bool | `true` | Automatically fetch root trust anchor from IANA. |
 | `trust_anchors_file` | string | `""` | Custom trust anchor file (overrides built‑in). |
+| `dnssec_max_validations` | int | `32` | Maximum number of signatures validated per response (KeyTrap mitigation, CVE‑2023‑50387). Set to `0` to disable limit. |
+| `dnssec_max_dnskey_records` | int | `8` | Maximum number of DNSKEY records processed per domain (KeyTrap mitigation). |
+| `dnssec_validation_timeout` | float | `2.0` | Timeout in seconds for DNSSEC validation operations. |
+| `dns_scrub_unsolicited_ns` | bool | `true` | Scrub unsolicited NS records from authority section to prevent cache poisoning (RFC 2181 Section 5.4.1, CVE‑2025‑11411). |
 | `pinned_certs` | string | `""` | Comma‑separated `hostname=sha256` pins for TLS connections. |
 | `rebind_protection` | bool | `false` | Enable rebinding protection. |
 | `rebind_action` | string | `strip` | `strip` or `block` when private IPs are detected. |
@@ -107,7 +113,7 @@ All upstreams are now defined in the `[upstreams]` section (see below).
 | `dns_privilege_drop_group` | string | `""` | Group to drop privileges to. |
 | `dns_chroot_dir` | string | `""` | chroot directory (Linux/Unix). |
 
-**Note:** If the client sets the CD (Checking Disabled) flag in the query, validation is automatically bypassed, regardless of the dnssec_enabled setting.
+**Note:** If the client sets the CD (Checking Disabled) flag in the query, validation is automatically bypassed, regardless of the `dnssec_enabled` setting.
 
 ---
 
