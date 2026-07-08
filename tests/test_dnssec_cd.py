@@ -18,9 +18,8 @@ def resolver_with_dnssec():
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
         dnssec_enabled=True,
-        auto_update_trust_anchor=False,  # prevent background task creation
+        auto_update_trust_anchor=False,
     )
-    # Mock trust anchors to avoid real validation
     resolver._dnssec_raw_anchors = {dns.name.root: b"dummy"}
     return resolver
 
@@ -29,7 +28,7 @@ def resolver_with_dnssec():
 async def test_cd_flag_skips_validation(resolver_with_dnssec):
     """If CD flag is set, DNSSEC validation should be skipped."""
     query = dns.message.make_query("example.com", "A")
-    query.flags |= 0x0010  # CD flag
+    query.flags |= 0x0010
     qwire = query.to_wire()
 
     resp = dns.message.make_response(query)
@@ -37,7 +36,7 @@ async def test_cd_flag_skips_validation(resolver_with_dnssec):
     resp.answer.append(rr)
     resp_wire = resp.to_wire()
 
-    async def fake_try_upstream(upstream, data, _health_check=False):
+    async def fake_try_upstream(upstream, data, _health_check=False, _no_retry=False):
         return resp_wire
     resolver_with_dnssec._try_upstream = fake_try_upstream
 
@@ -58,14 +57,14 @@ async def test_cd_flag_skips_validation(resolver_with_dnssec):
 @pytest.mark.asyncio
 async def test_no_cd_flag_triggers_validation(resolver_with_dnssec):
     """If CD flag is not set, validation should be attempted."""
-    # Patch _dnssec_requested to return True to simulate DO flag
-    # without dealing with EDNS flag setting issues across dnspython versions.
-    async def fake_dnssec_requested(data):
+    # Make _dnssec_requested return True to simulate DO flag
+    # Use a synchronous function to avoid creating a coroutine object
+    def fake_dnssec_requested(data):
         return True
     resolver_with_dnssec._dnssec_requested = fake_dnssec_requested
 
     query = dns.message.make_query("example.com", "A")
-    query.flags &= ~0x0010  # ensure CD flag is not set
+    query.flags &= ~0x0010
     qwire = query.to_wire()
 
     resp = dns.message.make_response(query)
@@ -73,7 +72,7 @@ async def test_no_cd_flag_triggers_validation(resolver_with_dnssec):
     resp.answer.append(rr)
     resp_wire = resp.to_wire()
 
-    async def fake_try_upstream(upstream, data, _health_check=False):
+    async def fake_try_upstream(upstream, data, _health_check=False, _no_retry=False):
         return resp_wire
     resolver_with_dnssec._try_upstream = fake_try_upstream
 
@@ -103,7 +102,7 @@ async def test_cd_flag_passthrough_ignores_bogus(resolver_with_dnssec):
     resp.answer.append(rr)
     resp_wire = resp.to_wire()
 
-    async def fake_try_upstream(upstream, data, _health_check=False):
+    async def fake_try_upstream(upstream, data, _health_check=False, _no_retry=False):
         return resp_wire
     resolver_with_dnssec._try_upstream = fake_try_upstream
 
