@@ -31,15 +31,13 @@ async def resolver_with_health():
         health_config=health_config,
         load_balancing="failover",
     )
-    # Start health checks (but we'll control them manually in tests)
-    await resolver.start_health_checks()
+    await resolver.start_background_tasks()
     return resolver
 
 
 @pytest.mark.asyncio
 async def test_health_check_initialization(resolver_with_health):
     """Health state should be initialized when health checks are enabled."""
-    # Wait for health check loop to run at least once
     await asyncio.sleep(0.1)
     assert resolver_with_health._health_task is not None
     assert not resolver_with_health._health_task.done()
@@ -48,7 +46,6 @@ async def test_health_check_initialization(resolver_with_health):
 @pytest.mark.asyncio
 async def test_health_check_mark_unhealthy(resolver_with_health):
     """After consecutive failures, upstream should be marked unhealthy."""
-    # Override _do_health_check to always return False
     async def fake_health_check(upstream):
         return False
     resolver_with_health._do_health_check = fake_health_check
@@ -57,16 +54,15 @@ async def test_health_check_mark_unhealthy(resolver_with_health):
     async with resolver_with_health._health_lock:
         resolver_with_health._upstream_health[key] = {
             'healthy': True,
-            'failures': 2,  # threshold = 2
+            'failures': 2,
             'successes': 0,
             'last_check': 0,
             'next_retry': 0,
         }
 
-    # Simulate failure increment
     async with resolver_with_health._health_lock:
         state = resolver_with_health._upstream_health[key]
-        state['failures'] = 3  # exceed threshold
+        state['failures'] = 3
         state['healthy'] = False
         state['next_retry'] = time.time() + 10
 
@@ -136,8 +132,8 @@ async def test_health_check_query_success():
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
         health_config={'enabled': True},
     )
-    # Override _try_upstream to return success
-    async def fake_try_upstream(upstream, data, _health_check=False):
+    # Update fake to accept _no_retry
+    async def fake_try_upstream(upstream, data, _health_check=False, _no_retry=False):
         return b'success'
     resolver._try_upstream = fake_try_upstream
 
@@ -152,7 +148,7 @@ async def test_health_check_query_failure():
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
         health_config={'enabled': True},
     )
-    async def fake_try_upstream(upstream, data, _health_check=False):
+    async def fake_try_upstream(upstream, data, _health_check=False, _no_retry=False):
         raise Exception("timeout")
     resolver._try_upstream = fake_try_upstream
 
