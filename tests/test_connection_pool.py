@@ -34,7 +34,10 @@ async def test_connection_pool_max_size():
 
     await pool.put(key, MagicMock(), writer1)
     await pool.put(key, MagicMock(), writer2)
-    writer2.close.assert_called_once()
+    # writer1 should be closed (evicted)
+    writer1.close.assert_called_once()
+    # writer2 should be kept (not closed)
+    writer2.close.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -82,14 +85,13 @@ async def test_client_pool_close_on_eviction():
     pool = ClientPool(max_size=1)
     key = ("host", 443)
     client1, client2 = MagicMock(), MagicMock()
-    # Give both clients an aclose method (AsyncMock)
     client1.aclose = AsyncMock()
     client2.aclose = AsyncMock()
 
     await pool.put(key, client1)
     await pool.put(key, client2)
-    # client1 should be closed
     client1.aclose.assert_awaited_once()
+    client2.aclose.assert_not_called()
 
 
 @pytest.mark.asyncio

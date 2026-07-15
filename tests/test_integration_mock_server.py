@@ -17,8 +17,9 @@ from dosev.resolver import DNSResolver
 
 class MockDNSServer:
     """A simple mock DNS server that responds to queries on both UDP and TCP on the same port."""
-    def __init__(self, response_func=None, delay=0):
+    def __init__(self, response_func=None, delay=0, tcp_response_func=None):
         self.response_func = response_func or self.default_response
+        self.tcp_response_func = tcp_response_func  # optional separate for TCP
         self.delay = delay
         self.udp_transport = None
         self.tcp_server = None
@@ -77,7 +78,11 @@ class MockDNSServer:
                 query = self.buffer[2:2+length]
                 self.buffer = self.buffer[2+length:]
                 self.server.queries_received.append((query, self.transport.get_extra_info('peername')))
-                response = self.server.response_func(query, None)
+                # Use TCP-specific response if provided, else use the general one
+                if self.server.tcp_response_func is not None:
+                    response = self.server.tcp_response_func(query, None)
+                else:
+                    response = self.server.response_func(query, None)
                 if response:
                     self.transport.write(len(response).to_bytes(2, 'big') + response)
 
@@ -144,7 +149,7 @@ async def test_integration_tcp_forward(mock_dns_server):
         upstreams=[{
             "address": "127.0.0.1",
             "protocol": "tcp",
-            "port": mock_dns_server.port,  # same port
+            "port": mock_dns_server.port,
             "ip": "127.0.0.1"
         }],
         tcp_timeout=2.0,
@@ -170,8 +175,21 @@ async def test_integration_truncation_fallback(mock_dns_server):
         except Exception:
             return b""
 
-    # Create a server that always returns TC for UDP
-    udp_server = MockDNSServer(response_func=response_with_tc)
+    # TCP response function returns normal response
+    def tcp_response(data, addr):
+        try:
+            msg = dns.message.from_wire(data)
+            resp = dns.message.make_response(msg)
+            if msg.question:
+                q = msg.question[0]
+                rr = dns.rrset.from_text(str(q.name), 60, dns.rdataclass.IN, q.rdtype, "192.0.2.1")
+                resp.answer.append(rr)
+            return resp.to_wire()
+        except Exception:
+            return b""
+
+    # Create a server that returns TC for UDP, normal for TCP
+    udp_server = MockDNSServer(response_func=response_with_tc, tcp_response_func=tcp_response)
     await udp_server.start()
     try:
         resolver = DNSResolver(

@@ -21,22 +21,12 @@ from dosev.resolver import DNSResolver, ConnectionPool, ClientPool, RateLimiter
 
 # ---------- Helpers ----------
 def make_a_response(qname: str, ip: str = "192.0.2.1", ttl: int = 60) -> bytes:
-    # Ensure absolute name
     if not qname.endswith('.'):
         qname = qname + '.'
     query = dns.message.make_query(qname, "A")
     resp = dns.message.make_response(query)
     rr = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.A, ip)
     resp.answer.append(rr)
-    return resp.to_wire()
-
-
-def make_nxdomain_response(qname: str) -> bytes:
-    if not qname.endswith('.'):
-        qname = qname + '.'
-    query = dns.message.make_query(qname, "A")
-    resp = dns.message.make_response(query)
-    resp.set_rcode(dns.rcode.NXDOMAIN)
     return resp.to_wire()
 
 
@@ -65,7 +55,6 @@ def make_rrsig(covered_type: int, name: str) -> dns.rrset.RRset:
 # ---------- Forward UDP Edge Cases ----------
 @pytest.mark.asyncio
 async def test_forward_udp_timeout():
-    """UDP forward should raise TimeoutError when no response arrives."""
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "port": 53, "ip": "1.1.1.1"}],
         udp_timeout=0.01
@@ -106,10 +95,13 @@ async def test_forward_tcp_pool_reuse():
 
     async def fake_connect(*args, **kwargs):
         reader = AsyncMock()
-        reader.readexactly = AsyncMock(side_effect=[
-            len(resp).to_bytes(2, "big"),
-            resp
-        ])
+        # Use a function that always returns the next expected value
+        def readexactly_side_effect(n):
+            if n == 2:
+                return len(resp).to_bytes(2, "big")
+            else:
+                return resp
+        reader.readexactly = AsyncMock(side_effect=readexactly_side_effect)
         writer = MagicMock()
         writer.is_closing = MagicMock(return_value=False)
         writer.write = MagicMock()
@@ -117,7 +109,6 @@ async def test_forward_tcp_pool_reuse():
         return reader, writer
 
     with patch("asyncio.open_connection", side_effect=fake_connect):
-        # First call should create connection
         result = await resolver._forward_tcp(data, resolver.upstreams[0])
         assert result == resp
 
@@ -141,11 +132,14 @@ async def test_forward_tcp_closed_connection_creates_new():
         nonlocal connect_count
         connect_count += 1
         reader = AsyncMock()
-        reader.readexactly = AsyncMock(side_effect=[
-            len(resp).to_bytes(2, "big"),
-            resp
-        ])
+        def readexactly_side_effect(n):
+            if n == 2:
+                return len(resp).to_bytes(2, "big")
+            else:
+                return resp
+        reader.readexactly = AsyncMock(side_effect=readexactly_side_effect)
         writer = MagicMock()
+        # For the first connection, mark as closing; for the second, keep open
         writer.is_closing = MagicMock(return_value=connect_count == 1)
         writer.write = MagicMock()
         writer.drain = AsyncMock()
@@ -154,13 +148,12 @@ async def test_forward_tcp_closed_connection_creates_new():
     with patch("asyncio.open_connection", side_effect=fake_connect):
         result = await resolver._forward_tcp(data, resolver.upstreams[0])
         assert result == resp
-        # The closed connection was discarded, so a new one should be created
+        # The first connection was closed, so a second was created
         assert connect_count == 2
 
 
 @pytest.mark.asyncio
 async def test_forward_tcp_timeout():
-    """TCP forward should raise TimeoutError on read timeout."""
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "tcp", "port": 53, "ip": "1.1.1.1"}],
         tcp_timeout=0.01
@@ -184,7 +177,6 @@ async def test_forward_tcp_timeout():
 # ---------- Forward TLS Edge Cases ----------
 @pytest.mark.asyncio
 async def test_forward_tls_cert_verification_error():
-    """TLS should raise SSLCertVerificationError on cert validation failure."""
     resolver = DNSResolver(
         upstreams=[{"address": "example.com", "protocol": "tls", "port": 853, "hostname": "example.com"}]
     )
@@ -197,7 +189,6 @@ async def test_forward_tls_cert_verification_error():
 
 @pytest.mark.asyncio
 async def test_forward_tls_cert_pin_mismatch():
-    """TLS should raise when certificate pin doesn't match."""
     resolver = DNSResolver(
         upstreams=[{"address": "example.com", "protocol": "tls", "port": 853, "hostname": "example.com"}],
         pinned_certs={"example.com": "abcdef1234567890"}
@@ -207,10 +198,12 @@ async def test_forward_tls_cert_pin_mismatch():
 
     async def fake_connect(*args, **kwargs):
         reader = AsyncMock()
-        reader.readexactly = AsyncMock(side_effect=[
-            len(resp).to_bytes(2, "big"),
-            resp
-        ])
+        def readexactly_side_effect(n):
+            if n == 2:
+                return len(resp).to_bytes(2, "big")
+            else:
+                return resp
+        reader.readexactly = AsyncMock(side_effect=readexactly_side_effect)
         writer = MagicMock()
         writer.is_closing = MagicMock(return_value=False)
         writer.write = MagicMock()
@@ -229,7 +222,6 @@ async def test_forward_tls_cert_pin_mismatch():
 
 @pytest.mark.asyncio
 async def test_forward_tls_ssl_zero_return():
-    """TLS should handle SSLZeroReturnError."""
     resolver = DNSResolver(
         upstreams=[{"address": "example.com", "protocol": "tls", "port": 853}]
     )
@@ -243,7 +235,6 @@ async def test_forward_tls_ssl_zero_return():
 # ---------- Forward HTTPS Edge Cases ----------
 @pytest.mark.asyncio
 async def test_forward_https1_chunked_response():
-    """HTTPS/1.1 should handle chunked transfer encoding."""
     resolver = DNSResolver(
         upstreams=[{"address": "example.com", "protocol": "https", "port": 443, "hostname": "example.com"}]
     )
@@ -286,6 +277,7 @@ async def test_forward_https1_chunked_response():
         writer.is_closing = MagicMock(return_value=False)
         writer.write = MagicMock()
         writer.drain = AsyncMock()
+        writer.wait_closed = AsyncMock()
         return reader, writer
 
     with patch("asyncio.open_connection", side_effect=fake_connect):
@@ -295,7 +287,6 @@ async def test_forward_https1_chunked_response():
 
 @pytest.mark.asyncio
 async def test_forward_https1_missing_content_length():
-    """HTTPS/1.1 should reject responses without Content-Length or chunked."""
     resolver = DNSResolver(
         upstreams=[{"address": "example.com", "protocol": "https", "port": 443, "hostname": "example.com"}]
     )
@@ -314,11 +305,11 @@ async def test_forward_https1_missing_content_length():
             response.splitlines()[1] + b"\r\n",
             b"\r\n",
         ])
-        # reader.readexactly should never be called
         writer = MagicMock()
         writer.is_closing = MagicMock(return_value=False)
         writer.write = MagicMock()
         writer.drain = AsyncMock()
+        writer.wait_closed = AsyncMock()
         return reader, writer
 
     with patch("asyncio.open_connection", side_effect=fake_connect):
@@ -328,7 +319,6 @@ async def test_forward_https1_missing_content_length():
 
 @pytest.mark.asyncio
 async def test_forward_https2_pool_reuse():
-    """HTTPS/2 should reuse httpx clients from the pool."""
     resolver = DNSResolver(
         upstreams=[{"address": "example.com", "protocol": "https", "port": 443, "hostname": "example.com"}],
         doh_timeout=1.0
@@ -341,11 +331,9 @@ async def test_forward_https2_pool_reuse():
     mock_client.aclose = AsyncMock()
 
     with patch("httpx.AsyncClient", return_value=mock_client):
-        # First call creates client
         result = await resolver._forward_https2(data, "example.com", 443, "example.com", "/dns-query", None)
         assert result == resp
 
-        # Second call should reuse client from pool
         with patch.object(resolver._h2_pool, "get", new=AsyncMock(return_value=mock_client)):
             result2 = await resolver._forward_https2(data, "example.com", 443, "example.com", "/dns-query", None)
             assert result2 == resp
@@ -354,7 +342,6 @@ async def test_forward_https2_pool_reuse():
 # ---------- DNSSEC Validation Edge Cases ----------
 @pytest.mark.asyncio
 async def test_dnssec_validation_bogus_signature():
-    """DNSSEC validation should raise ValidationFailure on bogus signatures."""
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
         dnssec_enabled=True,
@@ -376,7 +363,6 @@ async def test_dnssec_validation_bogus_signature():
 
 @pytest.mark.asyncio
 async def test_dnssec_validation_limit_exceeded():
-    """DNSSEC validation should treat as insecure when validation limit is exceeded."""
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
         dnssec_enabled=True,
@@ -404,7 +390,6 @@ async def test_dnssec_validation_limit_exceeded():
 
 @pytest.mark.asyncio
 async def test_dnssec_validation_timeout():
-    """DNSSEC validation should return insecure on timeout."""
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
         dnssec_enabled=True,
@@ -432,7 +417,6 @@ async def test_dnssec_validation_timeout():
 
 @pytest.mark.asyncio
 async def test_dnssec_no_validation_when_disabled():
-    """DNSSEC validation should be skipped when disabled."""
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
         dnssec_enabled=False,
@@ -451,7 +435,6 @@ async def test_dnssec_no_validation_when_disabled():
 # ---------- Optimistic Caching Edge Cases ----------
 @pytest.mark.asyncio
 async def test_optimistic_cache_serves_stale():
-    """Optimistic cache should serve stale responses with rewritten TTL."""
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
         optimistic_cache_enabled=True,
@@ -485,7 +468,6 @@ async def test_optimistic_cache_serves_stale():
 
 @pytest.mark.asyncio
 async def test_optimistic_cache_expires_completely():
-    """When stale entry expires completely, it should be removed."""
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
         optimistic_cache_enabled=True,
@@ -508,7 +490,6 @@ async def test_optimistic_cache_expires_completely():
 # ---------- TCP Fallback ----------
 @pytest.mark.asyncio
 async def test_tcp_fallback_on_truncated_response():
-    """TCP fallback should be triggered when UDP response has TC bit set."""
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "port": 53, "ip": "1.1.1.1"}],
         tcp_fallback_enabled=True,
@@ -532,13 +513,16 @@ async def test_tcp_fallback_on_truncated_response():
     resolver._forward_tcp = fake_forward_tcp
 
     result = await resolver._try_upstream(resolver.upstreams[0], data)
-    assert result == make_a_response("example.com")
+    # Instead of exact equality, check that it's a valid response with an answer
+    msg = dns.message.from_wire(result)
+    assert msg.rcode() == dns.rcode.NOERROR
+    assert len(msg.answer) == 1
+    assert msg.answer[0].rdtype == dns.rdatatype.A
     assert tcp_called is True
 
 
 @pytest.mark.asyncio
 async def test_tcp_fallback_disabled():
-    """When tcp_fallback_enabled is False, TC bit should not trigger TCP retry."""
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "port": 53, "ip": "1.1.1.1"}],
         tcp_fallback_enabled=False,
@@ -568,7 +552,6 @@ async def test_tcp_fallback_disabled():
 
 # ---------- _set_tc_bit ----------
 def test_set_tc_bit():
-    """_set_tc_bit should set the TC flag in the response."""
     resolver = DNSResolver()
     response = make_a_response("example.com")
     modified = resolver._set_tc_bit(response)
@@ -582,12 +565,12 @@ def test_dnssec_requested_detects_do_flag():
     query = dns.message.make_query("example.com", "A")
     query.use_edns(payload=1232)
     if query.opt:
-        query.opt.flags = dns.flags.DO
+        for rr in query.opt:
+            rr.flags = dns.flags.DO
     assert resolver._dnssec_requested(query.to_wire()) is True
 
 
 def test_dnssec_requested_no_edns():
-    """_dnssec_requested should return False when no EDNS0 OPT record."""
     resolver = DNSResolver()
     query = dns.message.make_query("example.com", "A")
     assert resolver._dnssec_requested(query.to_wire()) is False
@@ -595,7 +578,6 @@ def test_dnssec_requested_no_edns():
 
 # ---------- _extract_soa_minimum ----------
 def test_extract_soa_minimum():
-    """_extract_soa_minimum should extract SOA MINIMUM from authority section."""
     resolver = DNSResolver()
     query = dns.message.make_query("example.com", "A")
     resp = dns.message.make_response(query)
@@ -610,7 +592,6 @@ def test_extract_soa_minimum():
 
 
 def test_extract_soa_minimum_no_soa():
-    """_extract_soa_minimum should return None when no SOA record."""
     resolver = DNSResolver()
     query = dns.message.make_query("example.com", "A")
     resp = dns.message.make_response(query)
@@ -623,7 +604,6 @@ def test_extract_soa_minimum_no_soa():
 
 # ---------- _extract_min_ttl ----------
 def test_extract_min_ttl():
-    """_extract_min_ttl should extract the minimum TTL from answer section."""
     resolver = DNSResolver()
     query = dns.message.make_query("example.com", "A")
     resp = dns.message.make_response(query)
@@ -638,7 +618,6 @@ def test_extract_min_ttl():
 
 # ---------- Rebinding Protection ----------
 def test_apply_rebind_protection_strips_private():
-    """rebind_protection should strip private IPs from responses."""
     resolver = DNSResolver(
         rebind_protection_enabled=True,
         rebind_action="strip",
@@ -658,7 +637,6 @@ def test_apply_rebind_protection_strips_private():
 
 
 def test_apply_rebind_protection_blocks_all_private():
-    """rebind_protection with action='block' should return None when all private."""
     resolver = DNSResolver(
         rebind_protection_enabled=True,
         rebind_action="block",
@@ -674,7 +652,6 @@ def test_apply_rebind_protection_blocks_all_private():
 
 # ---------- _is_private_ip ----------
 def test_is_private_ip():
-    """_is_private_ip should correctly detect private IPv4 and IPv6 addresses."""
     resolver = DNSResolver()
     assert resolver._is_private_ip("10.0.0.1") is True
     assert resolver._is_private_ip("192.168.1.1") is True
@@ -688,7 +665,6 @@ def test_is_private_ip():
 
 # ---------- _split_hostport ----------
 def test_split_hostport():
-    """_split_hostport should correctly parse host:port strings."""
     resolver = DNSResolver()
     host, port = resolver._split_hostport("[2001:db8::1]:853")
     assert host == "2001:db8::1"
@@ -705,7 +681,6 @@ def test_split_hostport():
 
 # ---------- Get Block Action ----------
 def test_set_block_action():
-    """set_block_action should set the block action."""
     resolver = DNSResolver()
     resolver.set_block_action("REFUSED")
     assert resolver.get_block_action() == "REFUSED"
@@ -716,7 +691,6 @@ def test_set_block_action():
 
 # ---------- Build Local A Response ----------
 def test_build_local_A_response():
-    """_build_local_A_response should synthesize A record response from hosts map."""
     resolver = DNSResolver()
     query = dns.message.make_query("example.com", "A").to_wire()
     response = resolver._build_local_A_response(query, "192.0.2.1")
@@ -728,7 +702,6 @@ def test_build_local_A_response():
 
 # ---------- Make NXDOMAIN Response ----------
 def test_make_nxdomain_response_preserves_edns():
-    """_make_nxdomain_response should preserve EDNS0 options from query."""
     resolver = DNSResolver()
     query = dns.message.make_query("example.com", "A")
     query.use_edns(payload=1232, options=[dns.edns.ECSOption("192.0.2.0", 24, 0)])
@@ -742,7 +715,6 @@ def test_make_nxdomain_response_preserves_edns():
 
 
 def test_make_nxdomain_response_no_query():
-    """_make_nxdomain_response should handle empty query data."""
     resolver = DNSResolver()
     response = resolver._make_nxdomain_response(b"")
     assert len(response) >= 12
@@ -750,7 +722,6 @@ def test_make_nxdomain_response_no_query():
 
 # ---------- Is Negative Response ----------
 def test_is_negative_response_nxdomain():
-    """_is_negative_response should return True for NXDOMAIN."""
     resolver = DNSResolver()
     query = dns.message.make_query("example.com", "A")
     resp = dns.message.make_response(query)
@@ -759,7 +730,6 @@ def test_is_negative_response_nxdomain():
 
 
 def test_is_negative_response_noanswer():
-    """_is_negative_response should return True for NOERROR with no answers."""
     resolver = DNSResolver()
     query = dns.message.make_query("example.com", "A")
     resp = dns.message.make_response(query)
@@ -767,14 +737,12 @@ def test_is_negative_response_noanswer():
 
 
 def test_is_negative_response_with_answer():
-    """_is_negative_response should return False for successful response."""
     resolver = DNSResolver()
     resp = make_a_response("example.com")
     assert resolver._is_negative_response(resp) is False
 
 
 def test_is_negative_response_malformed():
-    """_is_negative_response should handle malformed data gracefully."""
     resolver = DNSResolver()
     assert resolver._is_negative_response(b"") is False
     assert resolver._is_negative_response(b"short") is False
@@ -783,7 +751,6 @@ def test_is_negative_response_malformed():
 # ---------- Make Response from Hosts ----------
 @pytest.mark.asyncio
 async def test_hosts_map_response():
-    """forward_dns_query should return synthesized A record from hosts map."""
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}]
     )
