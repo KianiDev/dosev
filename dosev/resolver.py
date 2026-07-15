@@ -2646,7 +2646,11 @@ class DNSResolver:
             msg = dns.message.from_wire(query_data)
             if msg.opt is None:
                 return False
-            return bool(msg.opt.flags & dns.flags.DO)
+            # msg.opt is an RRset; flags are on the OPT rdata
+            for rr in msg.opt:
+                if hasattr(rr, 'flags'):
+                    return bool(rr.flags & dns.flags.DO)
+            return False
         except Exception:
             return False
 
