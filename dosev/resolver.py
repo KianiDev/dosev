@@ -2646,9 +2646,10 @@ class DNSResolver:
             msg = dns.message.from_wire(query_data)
             if msg.opt is None:
                 return False
-            # msg.opt is an RRset; flags are on the OPT rdata
+            # msg.opt is an RRset; the EDNS flags are on the OPT rdata
             for rr in msg.opt:
                 if hasattr(rr, 'flags'):
+                    # The DO bit is part of the EDNS flags field
                     return bool(rr.flags & dns.flags.DO)
             return False
         except Exception:
