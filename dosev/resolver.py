@@ -2646,11 +2646,10 @@ class DNSResolver:
             msg = dns.message.from_wire(query_data)
             if msg.opt is None:
                 return False
-            # msg.opt is an RRset; the EDNS flags are on the OPT rdata
+            # The DO flag is stored in the TTL field of the OPT record (bit 15)
             for rr in msg.opt:
-                if hasattr(rr, 'flags'):
-                    # The DO bit is part of the EDNS flags field
-                    return bool(rr.flags & dns.flags.DO)
+                if rr.ttl & dns.flags.DO:
+                    return True
             return False
         except Exception:
             return False
