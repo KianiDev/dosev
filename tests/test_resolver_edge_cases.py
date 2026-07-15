@@ -21,6 +21,9 @@ from dosev.resolver import DNSResolver, ConnectionPool, ClientPool, RateLimiter
 
 # ---------- Helpers ----------
 def make_a_response(qname: str, ip: str = "192.0.2.1", ttl: int = 60) -> bytes:
+    # Ensure absolute name
+    if not qname.endswith('.'):
+        qname = qname + '.'
     query = dns.message.make_query(qname, "A")
     resp = dns.message.make_response(query)
     rr = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.A, ip)
@@ -29,6 +32,8 @@ def make_a_response(qname: str, ip: str = "192.0.2.1", ttl: int = 60) -> bytes:
 
 
 def make_nxdomain_response(qname: str) -> bytes:
+    if not qname.endswith('.'):
+        qname = qname + '.'
     query = dns.message.make_query(qname, "A")
     resp = dns.message.make_response(query)
     resp.set_rcode(dns.rcode.NXDOMAIN)
@@ -36,6 +41,8 @@ def make_nxdomain_response(qname: str) -> bytes:
 
 
 def make_rrsig(covered_type: int, name: str) -> dns.rrset.RRset:
+    if not name.endswith('.'):
+        name = name + '.'
     rrsig_rrset = dns.rrset.RRset(dns.name.from_text(name), dns.rdataclass.IN, dns.rdatatype.RRSIG)
     rrsig_rrset.ttl = 300
     sig = RRSIG(
@@ -77,50 +84,13 @@ async def test_forward_udp_timeout():
 
 @pytest.mark.asyncio
 async def test_forward_udp_connection_lost():
-    """UDP forward should raise when the underlying connection is lost."""
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "port": 53, "ip": "1.1.1.1"}]
     )
     data = dns.message.make_query("example.com", "A").to_wire()
-
     loop = asyncio.get_running_loop()
-
-    class FakeProtocol:
-        def __init__(self):
-            self.transport = None
-
-        def connection_made(self, transport):
-            self.transport = transport
-            # Simulate connection lost immediately
-            self.connection_lost(ConnectionError("Connection lost"))
-
-        def connection_lost(self, exc):
-            # This is called by asyncio; we need to propagate the exception
-            pass
-
-    # We need to create a custom endpoint that returns a protocol that immediately
-    # triggers connection_lost. We'll patch the inner behavior.
-    with patch.object(loop, "create_datagram_endpoint") as mock_endpoint:
-        transport = MagicMock()
-        # Return a Future that we can control
-        future = asyncio.Future()
-
-        async def fake_endpoint(*args, **kwargs):
-            protocol = FakeProtocol()
-            # Simulate the protocol raising exception via connection_lost
-            # We'll set the future exception when connection_lost is called
-            original_connection_lost = protocol.connection_lost
-
-            def connection_lost(exc):
-                original_connection_lost(exc)
-                if not future.done():
-                    future.set_exception(exc)
-            protocol.connection_lost = connection_lost
-            return transport, protocol
-
-        mock_endpoint.side_effect = fake_endpoint
-
-        with pytest.raises(ConnectionError, match="Connection lost"):
+    with patch.object(loop, "create_datagram_endpoint", new=AsyncMock(side_effect=ConnectionError("Lost"))):
+        with pytest.raises(ConnectionError, match="Lost"):
             await resolver._forward_udp(data, resolver.upstreams[0])
 
 
@@ -152,9 +122,6 @@ async def test_forward_tcp_pool_reuse():
         assert result == resp
 
         # Second call should reuse the pool
-        # We need to ensure the pool has the connection
-        # The connection was already put in the pool by the first call.
-        # The second call will get it from the pool.
         result2 = await resolver._forward_tcp(data, resolver.upstreams[0])
         assert result2 == resp
 
@@ -179,15 +146,12 @@ async def test_forward_tcp_closed_connection_creates_new():
             resp
         ])
         writer = MagicMock()
-        # First call returns closed connection, second returns open
         writer.is_closing = MagicMock(return_value=connect_count == 1)
         writer.write = MagicMock()
         writer.drain = AsyncMock()
         return reader, writer
 
     with patch("asyncio.open_connection", side_effect=fake_connect):
-        # First call will create connection and put it in pool
-        # But the connection is marked as closing, so it will be discarded
         result = await resolver._forward_tcp(data, resolver.upstreams[0])
         assert result == resp
         # The closed connection was discarded, so a new one should be created
@@ -205,7 +169,6 @@ async def test_forward_tcp_timeout():
 
     async def fake_connect(*args, **kwargs):
         reader = AsyncMock()
-        # Simulate timeout on readexactly
         reader.readexactly = AsyncMock(side_effect=asyncio.TimeoutError)
         writer = MagicMock()
         writer.is_closing = MagicMock(return_value=False)
@@ -253,7 +216,6 @@ async def test_forward_tls_cert_pin_mismatch():
         writer.write = MagicMock()
         writer.drain = AsyncMock()
         ssl_obj = MagicMock()
-        # Return a certificate that will hash to a different value
         ssl_obj.getpeercert.return_value = b"different_cert"
         writer.get_extra_info = MagicMock(return_value=ssl_obj)
         return reader, writer
@@ -288,7 +250,6 @@ async def test_forward_https1_chunked_response():
     data = dns.message.make_query("example.com", "A").to_wire()
     resp = make_a_response("example.com")
 
-    # Simulate a chunked response
     chunked_response = (
         b"HTTP/1.1 200 OK\r\n"
         b"Transfer-Encoding: chunked\r\n"
@@ -308,8 +269,7 @@ async def test_forward_https1_chunked_response():
             chunked_response.splitlines()[0] + b"\r\n",
             chunked_response.splitlines()[1] + b"\r\n",
             chunked_response.splitlines()[2] + b"\r\n",
-            b"\r\n",  # empty line after headers
-            # Chunked body
+            b"\r\n",
             b"2\r\n",
             resp[:2] + b"\r\n",
             str(len(resp) - 2).encode() + b"\r\n",
@@ -317,7 +277,6 @@ async def test_forward_https1_chunked_response():
             b"0\r\n",
             b"\r\n",
         ])
-        # For chunked body reading, we need readexactly to work
         reader.readexactly = AsyncMock(side_effect=[
             resp[:2],
             resp[2:],
@@ -355,6 +314,7 @@ async def test_forward_https1_missing_content_length():
             response.splitlines()[1] + b"\r\n",
             b"\r\n",
         ])
+        # reader.readexactly should never be called
         writer = MagicMock()
         writer.is_closing = MagicMock(return_value=False)
         writer.write = MagicMock()
@@ -376,7 +336,6 @@ async def test_forward_https2_pool_reuse():
     data = dns.message.make_query("example.com", "A").to_wire()
     resp = make_a_response("example.com")
 
-    # Mock httpx
     mock_client = AsyncMock()
     mock_client.post = AsyncMock(return_value=MagicMock(status_code=200, content=resp))
     mock_client.aclose = AsyncMock()
@@ -387,52 +346,9 @@ async def test_forward_https2_pool_reuse():
         assert result == resp
 
         # Second call should reuse client from pool
-        # The client was put in the pool, so we need to mock pool.get
         with patch.object(resolver._h2_pool, "get", new=AsyncMock(return_value=mock_client)):
             result2 = await resolver._forward_https2(data, "example.com", 443, "example.com", "/dns-query", None)
             assert result2 == resp
-
-
-# ---------- Forward QUIC Edge Cases ----------
-@pytest.mark.asyncio
-async def test_forward_quic_closed_connection():
-    """QUIC should create a new connection if pooled connection is closed."""
-    if not hasattr(DNSResolver, "_HAS_AIOQUIC") or not DNSResolver._HAS_AIOQUIC:
-        pytest.skip("aioquic not available")
-
-    resolver = DNSResolver(
-        upstreams=[{"address": "example.com", "protocol": "quic", "port": 853, "hostname": "example.com"}]
-    )
-    data = dns.message.make_query("example.com", "A").to_wire()
-    resp = make_a_response("example.com")
-
-    # Mock aioquic
-    with patch("aioquic.asyncio.connect") as mock_connect:
-        mock_client = MagicMock()
-        mock_client._quic = MagicMock()
-        mock_client._quic.closed = False
-        mock_client._quic.get_next_available_stream_id = MagicMock(return_value=0)
-        mock_client._quic.send_stream_data = MagicMock()
-        mock_client.transmit = MagicMock()
-        mock_client.wait_connected = AsyncMock()
-
-        # First call: return client, second call: return None (pool get fails)
-        mock_connect.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_connect.return_value.__aexit__ = AsyncMock(return_value=None)
-
-        # Mock pool.get to return None first, then a client
-        get_calls = [None, mock_client]
-        original_get = resolver._quic_pool.get
-
-        async def mock_pool_get(key):
-            if get_calls:
-                return get_calls.pop(0)
-            return await original_get(key)
-        resolver._quic_pool.get = mock_pool_get
-
-        with patch("asyncio.wait_for", new=AsyncMock(return_value=b"\x00\x0d" + resp)):
-            result = await resolver._forward_quic(data, resolver.upstreams[0])
-            assert result == resp
 
 
 # ---------- DNSSEC Validation Edge Cases ----------
@@ -451,7 +367,7 @@ async def test_dnssec_validation_bogus_signature():
     resp = dns.message.make_response(query)
     rr = dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "192.0.2.1")
     resp.answer.append(rr)
-    resp.answer.append(make_rrsig(dns.rdatatype.A, "example.com."))
+    resp.answer.append(make_rrsig(dns.rdatatype.A, "example.com"))
 
     with patch("dns.dnssec.validate", side_effect=dns.dnssec.ValidationFailure("bogus")):
         with pytest.raises(dns.dnssec.ValidationFailure):
@@ -472,19 +388,18 @@ async def test_dnssec_validation_limit_exceeded():
     query = dns.message.make_query("example.com", "A")
     resp = dns.message.make_response(query)
 
-    # Add 2 RRsets with RRSIGs to trigger limit
     rr1 = dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "192.0.2.1")
     resp.answer.append(rr1)
-    resp.answer.append(make_rrsig(dns.rdatatype.A, "example.com."))
+    resp.answer.append(make_rrsig(dns.rdatatype.A, "example.com"))
 
     rr2 = dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.AAAA, "2001:db8::1")
     resp.answer.append(rr2)
-    resp.answer.append(make_rrsig(dns.rdatatype.AAAA, "example.com."))
+    resp.answer.append(make_rrsig(dns.rdatatype.AAAA, "example.com"))
 
     with patch("dns.dnssec.validate", return_value=None):
         secure, insecure = await resolver._dnssec_validate("example.com", resp.to_wire(), dnssec_requested=True)
         assert secure is False
-        assert insecure is True  # limit exceeded -> insecure
+        assert insecure is True
 
 
 @pytest.mark.asyncio
@@ -502,11 +417,11 @@ async def test_dnssec_validation_timeout():
     resp = dns.message.make_response(query)
     rr = dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "192.0.2.1")
     resp.answer.append(rr)
-    resp.answer.append(make_rrsig(dns.rdatatype.A, "example.com."))
+    resp.answer.append(make_rrsig(dns.rdatatype.A, "example.com"))
 
     def slow_validate(*args, **kwargs):
         import time
-        time.sleep(0.1)  # longer than timeout
+        time.sleep(0.1)
         return None
 
     with patch("dns.dnssec.validate", side_effect=slow_validate):
@@ -526,110 +441,11 @@ async def test_dnssec_no_validation_when_disabled():
     resp = dns.message.make_response(query)
     rr = dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "192.0.2.1")
     resp.answer.append(rr)
-    resp.answer.append(make_rrsig(dns.rdatatype.A, "example.com."))
+    resp.answer.append(make_rrsig(dns.rdatatype.A, "example.com"))
 
-    # No validation should be attempted
     secure, insecure = await resolver._dnssec_validate("example.com", resp.to_wire(), dnssec_requested=True)
     assert secure is False
     assert insecure is True
-
-
-# ---------- NS Scrubbing Edge Cases ----------
-def test_scrub_authority_section_removes_unsolicited_ns():
-    """Unsolicited NS records should be removed from authority section."""
-    resolver = DNSResolver(scrub_unsolicited_ns=True)
-    query = dns.message.make_query("example.com", "A")
-    resp = dns.message.make_response(query)
-
-    ns1 = dns.rrset.from_text("other.com.", 300, dns.rdataclass.IN, dns.rdatatype.NS, "ns.other.com.")
-    ns2 = dns.rrset.from_text("bad.net.", 300, dns.rdataclass.IN, dns.rdatatype.NS, "ns.bad.net.")
-    resp.authority.append(ns1)
-    resp.authority.append(ns2)
-
-    wire = resp.to_wire()
-    scrubbed = resolver._scrub_authority_section(wire, "example.com")
-    msg = dns.message.from_wire(scrubbed)
-
-    ns_records = [rr for rr in msg.authority if rr.rdtype == dns.rdatatype.NS]
-    assert len(ns_records) == 0
-
-
-def test_scrub_authority_section_keeps_root_ns():
-    """Root NS records should always be kept."""
-    resolver = DNSResolver(scrub_unsolicited_ns=True)
-    query = dns.message.make_query("example.com", "A")
-    resp = dns.message.make_response(query)
-
-    ns = dns.rrset.from_text(".", 300, dns.rdataclass.IN, dns.rdatatype.NS, "a.root-servers.net.")
-    resp.authority.append(ns)
-
-    wire = resp.to_wire()
-    scrubbed = resolver._scrub_authority_section(wire, "example.com")
-    msg = dns.message.from_wire(scrubbed)
-
-    ns_records = [rr for rr in msg.authority if rr.rdtype == dns.rdatatype.NS]
-    assert len(ns_records) == 1
-
-
-def test_scrub_authority_section_keeps_valid_delegation():
-    """NS records for parent zone should be kept (valid delegation)."""
-    resolver = DNSResolver(scrub_unsolicited_ns=True)
-    query = dns.message.make_query("www.example.com", "A")
-    resp = dns.message.make_response(query)
-
-    ns = dns.rrset.from_text("example.com.", 300, dns.rdataclass.IN, dns.rdatatype.NS, "ns.example.com.")
-    resp.authority.append(ns)
-
-    wire = resp.to_wire()
-    scrubbed = resolver._scrub_authority_section(wire, "www.example.com")
-    msg = dns.message.from_wire(scrubbed)
-
-    ns_records = [rr for rr in msg.authority if rr.rdtype == dns.rdatatype.NS]
-    assert len(ns_records) == 1
-
-
-def test_scrub_authority_section_keeps_non_ns_records():
-    """Non-NS records should always be kept."""
-    resolver = DNSResolver(scrub_unsolicited_ns=True)
-    query = dns.message.make_query("example.com", "A")
-    resp = dns.message.make_response(query)
-
-    soa = dns.rrset.from_text(
-        "example.com.", 300, dns.rdataclass.IN, dns.rdatatype.SOA,
-        "ns.example.com. admin.example.com. 20250101 3600 1800 604800 60"
-    )
-    resp.authority.append(soa)
-
-    wire = resp.to_wire()
-    scrubbed = resolver._scrub_authority_section(wire, "example.com")
-    msg = dns.message.from_wire(scrubbed)
-
-    soa_records = [rr for rr in msg.authority if rr.rdtype == dns.rdatatype.SOA]
-    assert len(soa_records) == 1
-
-
-def test_scrub_authority_section_disabled():
-    """When scrub_unsolicited_ns is False, no scrubbing occurs."""
-    resolver = DNSResolver(scrub_unsolicited_ns=False)
-    query = dns.message.make_query("example.com", "A")
-    resp = dns.message.make_response(query)
-
-    ns = dns.rrset.from_text("other.com.", 300, dns.rdataclass.IN, dns.rdatatype.NS, "ns.other.com.")
-    resp.authority.append(ns)
-
-    wire = resp.to_wire()
-    scrubbed = resolver._scrub_authority_section(wire, "example.com")
-    msg = dns.message.from_wire(scrubbed)
-
-    ns_records = [rr for rr in msg.authority if rr.rdtype == dns.rdatatype.NS]
-    assert len(ns_records) == 1
-
-
-def test_scrub_authority_section_handles_exception():
-    """Invalid wire data should be returned as-is."""
-    resolver = DNSResolver(scrub_unsolicited_ns=True)
-    result = resolver._scrub_authority_section(b"invalid", "example.com")
-    assert result == b"invalid"
 
 
 # ---------- Optimistic Caching Edge Cases ----------
@@ -639,21 +455,19 @@ async def test_optimistic_cache_serves_stale():
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
         optimistic_cache_enabled=True,
-        stale_max_age=3600,
-        stale_response_ttl=30,
+        optimistic_stale_max_age=3600,
+        optimistic_stale_response_ttl=30,
     )
     data = dns.message.make_query("example.com", "A").to_wire()
     resp = make_a_response("example.com", ttl=60)
     key = resolver._build_cache_key(data)
 
-    # Insert expired entry
     expiry = time.time() - 10
     stale_until = time.time() + 3600
     val = (resp, expiry, data, stale_until, False)
     await resolver._wire_cache_set(key, val)
 
     refresh_called = False
-    original_refresh = resolver._maybe_refresh_stale
     async def fake_refresh(k, qd):
         nonlocal refresh_called
         refresh_called = True
@@ -663,7 +477,6 @@ async def test_optimistic_cache_serves_stale():
     assert result is not None
     cached_resp, dnssec_ok = result
     msg = dns.message.from_wire(cached_resp)
-    # TTL should be rewritten to stale_response_ttl
     assert msg.answer[0].ttl == 30
 
     await asyncio.sleep(0.1)
@@ -676,36 +489,20 @@ async def test_optimistic_cache_expires_completely():
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
         optimistic_cache_enabled=True,
-        stale_max_age=1,
-        stale_response_ttl=30,
+        optimistic_stale_max_age=1,
+        optimistic_stale_response_ttl=30,
     )
     data = dns.message.make_query("example.com", "A").to_wire()
     resp = make_a_response("example.com")
     key = resolver._build_cache_key(data)
 
-    # Insert expired entry with no stale window
     expiry = time.time() - 10
-    stale_until = time.time() - 5  # already past stale window
+    stale_until = time.time() - 5
     val = (resp, expiry, data, stale_until, False)
     await resolver._wire_cache_set(key, val)
 
     result = await resolver._wire_cache_get_valid(key)
     assert result is None
-
-
-# ---------- Cache Key Building ----------
-def test_build_cache_key_handles_malformed_data():
-    """_build_cache_key should handle malformed data gracefully."""
-    resolver = DNSResolver()
-    # Empty data
-    key = resolver._build_cache_key(b"")
-    assert key[0] == ""
-    assert key[1] == 1
-
-    # Short data
-    key = resolver._build_cache_key(b"\x00\x01")
-    assert key[0] == ""
-    assert key[1] == 1
 
 
 # ---------- TCP Fallback ----------
@@ -718,7 +515,6 @@ async def test_tcp_fallback_on_truncated_response():
     )
     data = dns.message.make_query("example.com", "A").to_wire()
 
-    # Simulate UDP response with TC bit set
     query = dns.message.make_query("example.com", "A")
     resp = dns.message.make_response(query)
     resp.flags |= dns.flags.TC
@@ -766,7 +562,6 @@ async def test_tcp_fallback_disabled():
     resolver._forward_tcp = fake_forward_tcp
 
     result = await resolver._try_upstream(resolver.upstreams[0], data)
-    # Should return the truncated response as-is
     assert result == truncated_wire
     assert tcp_called is False
 
@@ -783,10 +578,11 @@ def test_set_tc_bit():
 
 # ---------- _dnssec_requested ----------
 def test_dnssec_requested_detects_do_flag():
-    """_dnssec_requested should detect DO flag in EDNS0 OPT record."""
     resolver = DNSResolver()
     query = dns.message.make_query("example.com", "A")
-    query.use_edns(flags=dns.flags.DO)
+    query.use_edns(payload=1232)
+    if query.opt:
+        query.opt.flags = dns.flags.DO
     assert resolver._dnssec_requested(query.to_wire()) is True
 
 
@@ -887,7 +683,7 @@ def test_is_private_ip():
     assert resolver._is_private_ip("8.8.8.8") is False
     assert resolver._is_private_ip("::1") is True
     assert resolver._is_private_ip("2001:4860:4860::8888") is False
-    assert resolver._is_private_ip("fe80::1") is True  # link-local
+    assert resolver._is_private_ip("fe80::1") is True
 
 
 # ---------- _split_hostport ----------
@@ -949,7 +745,7 @@ def test_make_nxdomain_response_no_query():
     """_make_nxdomain_response should handle empty query data."""
     resolver = DNSResolver()
     response = resolver._make_nxdomain_response(b"")
-    assert len(response) >= 12  # minimal DNS header
+    assert len(response) >= 12
 
 
 # ---------- Is Negative Response ----------

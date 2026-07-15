@@ -172,10 +172,15 @@ class ConnectionPool:
 
             if key not in self._pools:
                 self._pools[key] = []
-            if len(self._pools[key]) < self.max_size:
-                self._pools[key].append((reader, writer, time.time()))
-            else:
-                writer.close()
+            # Evict oldest if full
+            if len(self._pools[key]) >= self.max_size:
+                oldest_reader, oldest_writer, _ = self._pools[key].pop(0)
+                try:
+                    oldest_writer.close()
+                except Exception:
+                    pass
+            # Append new connection
+            self._pools[key].append((reader, writer, time.time()))
 
     async def start_cleanup(self) -> None:
         async def _cleanup():
@@ -235,10 +240,12 @@ class ClientPool:
         async with self._lock:
             if key not in self._pools:
                 self._pools[key] = []
-            if len(self._pools[key]) < self.max_size:
-                self._pools[key].append((client, time.time()))
-            else:
-                await self._close_client(client)
+            # Evict oldest if full
+            if len(self._pools[key]) >= self.max_size:
+                old_client, _ = self._pools[key].pop(0)
+                await self._close_client(old_client)
+            # Append new client
+            self._pools[key].append((client, time.time()))
 
     async def start_cleanup(self) -> None:
         async def _cleanup():
@@ -2644,6 +2651,7 @@ class DNSResolver:
             return False
 
     def _make_nxdomain_response(self, query_data: bytes) -> bytes:
+        extra = b''  # <-- ADD THIS LINE
         if not query_data or len(query_data) < 12:
             tid = 0
             qpart = b''

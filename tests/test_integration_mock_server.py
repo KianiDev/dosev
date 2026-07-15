@@ -16,18 +16,16 @@ from dosev.resolver import DNSResolver
 
 
 class MockDNSServer:
-    """A simple mock DNS server that responds to queries."""
+    """A simple mock DNS server that responds to queries on both UDP and TCP on the same port."""
     def __init__(self, response_func=None, delay=0):
         self.response_func = response_func or self.default_response
         self.delay = delay
-        self.transport = None
-        self.protocol = None
+        self.udp_transport = None
+        self.tcp_server = None
         self.port = 0
         self.queries_received = []
-        self._started = asyncio.Event()
 
     def default_response(self, data, addr):
-        """Default response: echo back with an answer."""
         try:
             msg = dns.message.from_wire(data)
             resp = dns.message.make_response(msg)
@@ -44,7 +42,7 @@ class MockDNSServer:
             self.server = server
 
         def connection_made(self, transport):
-            self.server.transport = transport
+            self.server.udp_transport = transport
 
         def datagram_received(self, data, addr):
             self.server.queries_received.append((data, addr))
@@ -58,8 +56,8 @@ class MockDNSServer:
 
         def send_response(self, data, addr):
             response = self.server.response_func(data, addr)
-            if response and self.server.transport:
-                self.server.transport.sendto(response, addr)
+            if response and self.server.udp_transport:
+                self.server.udp_transport.sendto(response, addr)
 
     class TCPProtocol(asyncio.Protocol):
         def __init__(self, server):
@@ -91,25 +89,21 @@ class MockDNSServer:
             lambda: self.UDPProtocol(self),
             local_addr=(host, port)
         )
-        udp_port = udp_transport.get_extra_info('socket').getsockname()[1]
+        self.port = udp_transport.get_extra_info('socket').getsockname()[1]
 
-        # TCP
+        # TCP on the same port
         tcp_server = await loop.create_server(
             lambda: self.TCPProtocol(self),
-            host=host, port=0
+            host=host, port=self.port
         )
-        tcp_port = tcp_server.sockets[0].getsockname()[1]
-
-        self.port = udp_port  # use UDP port as primary
-        self.udp_transport = udp_transport
         self.tcp_server = tcp_server
-        self._started.set()
-        return self.port
+        self.udp_transport = udp_transport
+        return self
 
     async def stop(self):
-        if hasattr(self, 'udp_transport'):
+        if self.udp_transport:
             self.udp_transport.close()
-        if hasattr(self, 'tcp_server'):
+        if self.tcp_server:
             self.tcp_server.close()
             await self.tcp_server.wait_closed()
 
@@ -117,14 +111,13 @@ class MockDNSServer:
 @pytest.fixture
 async def mock_dns_server():
     server = MockDNSServer()
-    port = await server.start()
+    await server.start()
     yield server
     await server.stop()
 
 
 @pytest.mark.asyncio
 async def test_integration_udp_forward(mock_dns_server):
-    """Test UDP forward through mock server."""
     resolver = DNSResolver(
         upstreams=[{
             "address": "127.0.0.1",
@@ -142,18 +135,16 @@ async def test_integration_udp_forward(mock_dns_server):
     assert len(msg.answer) == 1
     assert msg.answer[0].rdtype == dns.rdatatype.A
 
-    # Check server received the query
     assert len(mock_dns_server.queries_received) == 1
 
 
 @pytest.mark.asyncio
 async def test_integration_tcp_forward(mock_dns_server):
-    """Test TCP forward through mock server."""
     resolver = DNSResolver(
         upstreams=[{
             "address": "127.0.0.1",
             "protocol": "tcp",
-            "port": mock_dns_server.port,
+            "port": mock_dns_server.port,  # same port
             "ip": "127.0.0.1"
         }],
         tcp_timeout=2.0,
@@ -165,18 +156,16 @@ async def test_integration_tcp_forward(mock_dns_server):
     assert msg.rcode() == dns.rcode.NOERROR
     assert len(msg.answer) == 1
 
-    # Server should have received the TCP query
     assert len(mock_dns_server.queries_received) == 1
 
 
 @pytest.mark.asyncio
 async def test_integration_truncation_fallback(mock_dns_server):
-    """Test TCP fallback when UDP response has TC bit set."""
     def response_with_tc(data, addr):
         try:
             msg = dns.message.from_wire(data)
             resp = dns.message.make_response(msg)
-            resp.flags |= dns.flags.TC  # Set truncation bit
+            resp.flags |= dns.flags.TC
             return resp.to_wire()
         except Exception:
             return b""
@@ -197,13 +186,9 @@ async def test_integration_truncation_fallback(mock_dns_server):
             tcp_timeout=2.0,
         )
 
-        # We need a TCP server that returns a proper response
-        # The mock server already has TCP support
-
         query = dns.message.make_query("example.com", "A").to_wire()
         response = await resolver.forward_dns_query(query)
 
-        # Should get the proper response from TCP fallback
         msg = dns.message.from_wire(response)
         assert msg.rcode() == dns.rcode.NOERROR
         assert len(msg.answer) == 1
@@ -214,7 +199,6 @@ async def test_integration_truncation_fallback(mock_dns_server):
 
 @pytest.mark.asyncio
 async def test_integration_nxdomain_caching(mock_dns_server):
-    """Test that NXDOMAIN responses are cached."""
     def nxdomain_response(data, addr):
         try:
             msg = dns.message.from_wire(data)
@@ -238,13 +222,11 @@ async def test_integration_nxdomain_caching(mock_dns_server):
         )
         query = dns.message.make_query("nonexistent.example", "A").to_wire()
 
-        # First query should go to server
         response = await resolver.forward_dns_query(query)
         msg = dns.message.from_wire(response)
         assert msg.rcode() == dns.rcode.NXDOMAIN
         assert len(server.queries_received) == 1
 
-        # Second query should be cached (no new query to server)
         response2 = await resolver.forward_dns_query(query)
         msg2 = dns.message.from_wire(response2)
         assert msg2.rcode() == dns.rcode.NXDOMAIN
@@ -256,8 +238,6 @@ async def test_integration_nxdomain_caching(mock_dns_server):
 
 @pytest.mark.asyncio
 async def test_integration_parallel_load_balancing(mock_dns_server):
-    """Test parallel load balancing with multiple upstreams."""
-    # Start two servers
     server1 = MockDNSServer()
     await server1.start()
     server2 = MockDNSServer()
@@ -278,7 +258,6 @@ async def test_integration_parallel_load_balancing(mock_dns_server):
         msg = dns.message.from_wire(response)
         assert msg.rcode() == dns.rcode.NOERROR
 
-        # Both servers should have received the query (parallel)
         assert len(server1.queries_received) == 1
         assert len(server2.queries_received) == 1
 
