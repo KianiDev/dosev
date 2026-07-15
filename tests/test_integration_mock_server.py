@@ -16,14 +16,15 @@ from dosev.resolver import DNSResolver
 
 
 class MockDNSServer:
-    """A simple mock DNS server that responds to queries on both UDP and TCP on the same port."""
+    """A simple mock DNS server that responds to queries on both UDP and TCP on different ports."""
     def __init__(self, response_func=None, delay=0, tcp_response_func=None):
         self.response_func = response_func or self.default_response
-        self.tcp_response_func = tcp_response_func  # optional separate for TCP
+        self.tcp_response_func = tcp_response_func
         self.delay = delay
         self.udp_transport = None
         self.tcp_server = None
-        self.port = 0
+        self.udp_port = 0
+        self.tcp_port = 0
         self.queries_received = []
 
     def default_response(self, data, addr):
@@ -78,7 +79,6 @@ class MockDNSServer:
                 query = self.buffer[2:2+length]
                 self.buffer = self.buffer[2+length:]
                 self.server.queries_received.append((query, self.transport.get_extra_info('peername')))
-                # Use TCP-specific response if provided, else use the general one
                 if self.server.tcp_response_func is not None:
                     response = self.server.tcp_response_func(query, None)
                 else:
@@ -86,21 +86,22 @@ class MockDNSServer:
                 if response:
                     self.transport.write(len(response).to_bytes(2, 'big') + response)
 
-    async def start(self, host='127.0.0.1', port=0):
+    async def start(self, host='127.0.0.1'):
         loop = asyncio.get_running_loop()
 
-        # UDP
+        # UDP on a random port
         udp_transport, udp_protocol = await loop.create_datagram_endpoint(
             lambda: self.UDPProtocol(self),
-            local_addr=(host, port)
+            local_addr=(host, 0)
         )
-        self.port = udp_transport.get_extra_info('socket').getsockname()[1]
+        self.udp_port = udp_transport.get_extra_info('socket').getsockname()[1]
 
-        # TCP on the same port
+        # TCP on a different random port (avoids Windows permission issues with same port)
         tcp_server = await loop.create_server(
             lambda: self.TCPProtocol(self),
-            host=host, port=self.port
+            host=host, port=0
         )
+        self.tcp_port = tcp_server.sockets[0].getsockname()[1]
         self.tcp_server = tcp_server
         self.udp_transport = udp_transport
         return self
@@ -127,7 +128,7 @@ async def test_integration_udp_forward(mock_dns_server):
         upstreams=[{
             "address": "127.0.0.1",
             "protocol": "udp",
-            "port": mock_dns_server.port,
+            "port": mock_dns_server.udp_port,
             "ip": "127.0.0.1"
         }],
         udp_timeout=2.0,
@@ -149,7 +150,7 @@ async def test_integration_tcp_forward(mock_dns_server):
         upstreams=[{
             "address": "127.0.0.1",
             "protocol": "tcp",
-            "port": mock_dns_server.port,
+            "port": mock_dns_server.tcp_port,
             "ip": "127.0.0.1"
         }],
         tcp_timeout=2.0,
@@ -196,7 +197,7 @@ async def test_integration_truncation_fallback(mock_dns_server):
             upstreams=[{
                 "address": "127.0.0.1",
                 "protocol": "udp",
-                "port": udp_server.port,
+                "port": udp_server.udp_port,
                 "ip": "127.0.0.1"
             }],
             tcp_fallback_enabled=True,
@@ -233,7 +234,7 @@ async def test_integration_nxdomain_caching(mock_dns_server):
             upstreams=[{
                 "address": "127.0.0.1",
                 "protocol": "udp",
-                "port": server.port,
+                "port": server.udp_port,
                 "ip": "127.0.0.1"
             }],
             negative_cache_ttl=5,
@@ -264,8 +265,8 @@ async def test_integration_parallel_load_balancing(mock_dns_server):
     try:
         resolver = DNSResolver(
             upstreams=[
-                {"address": "127.0.0.1", "protocol": "udp", "port": server1.port, "ip": "127.0.0.1"},
-                {"address": "127.0.0.1", "protocol": "udp", "port": server2.port, "ip": "127.0.0.1"},
+                {"address": "127.0.0.1", "protocol": "udp", "port": server1.udp_port, "ip": "127.0.0.1"},
+                {"address": "127.0.0.1", "protocol": "udp", "port": server2.udp_port, "ip": "127.0.0.1"},
             ],
             load_balancing="parallel",
             udp_timeout=2.0,
