@@ -144,23 +144,21 @@ async def test_forward_tcp_closed_connection_creates_new():
         writer.drain = AsyncMock()
         return reader, writer
 
-    # Mock the pool's get to simulate: first call None, second call a closed connection
-    original_get = resolver._tcp_pool.get
+    # Mock pool.get: first call returns None, second returns a closed connection
     mock_get_calls = 0
     async def mock_get(key):
         nonlocal mock_get_calls
         mock_get_calls += 1
         if mock_get_calls == 1:
             return None
-        elif mock_get_calls == 2:
-            # Return a connection that is closed
+        else:
+            # Return a closed connection to force a new one
             closed_reader = AsyncMock()
             closed_writer = MagicMock()
             closed_writer.is_closing = MagicMock(return_value=True)
             closed_writer.close = MagicMock()
             return (closed_reader, closed_writer)
-        else:
-            return None
+
     resolver._tcp_pool.get = mock_get
     resolver._tcp_pool.put = AsyncMock()
 
@@ -264,15 +262,15 @@ async def test_forward_https1_chunked_response():
     resp = make_a_response("example.com")
 
     # Build chunked response as a list of lines (each ending with \r\n)
+    # readline should only see: status, headers, blank line, chunk size lines, final blank.
+    # The actual chunk payload is read via readexactly.
     lines = [
         b"HTTP/1.1 200 OK\r\n",
         b"Transfer-Encoding: chunked\r\n",
         b"Content-Type: application/dns-message\r\n",
         b"\r\n",
         b"2\r\n",
-        resp[:2] + b"\r\n",
         str(len(resp) - 2).encode() + b"\r\n",
-        resp[2:] + b"\r\n",
         b"0\r\n",
         b"\r\n",
     ]
@@ -280,25 +278,30 @@ async def test_forward_https1_chunked_response():
     async def fake_connect(*args, **kwargs):
         reader = AsyncMock()
         remaining_lines = lines.copy()
+
         async def readline_side_effect():
             if remaining_lines:
                 return remaining_lines.pop(0)
             return b""
+
         reader.readline = AsyncMock(side_effect=readline_side_effect)
 
-        # Mock readexactly to handle chunk data + trailing \r\ns
+        # readexactly handles chunk data + trailing \r\ns
+        # The first chunk is resp[:2], the second is resp[2:]
         readexactly_responses = [
             resp[:2],   # chunk1 data
-            b"\r\n",    # after chunk1
+            b"\r\n",    # after chunk1 (read by readuntil)
             resp[2:],   # chunk2 data
             b"\r\n",    # after chunk2
             b"\r\n",    # final \r\n after 0 chunk
         ]
         remaining_readexactly = readexactly_responses.copy()
+
         async def readexactly_side_effect(n):
             if remaining_readexactly:
                 return remaining_readexactly.pop(0)
             return b""
+
         reader.readexactly = AsyncMock(side_effect=readexactly_side_effect)
 
         reader.readuntil = AsyncMock(return_value=b"\r\n")
@@ -592,15 +595,8 @@ def test_set_tc_bit():
 def test_dnssec_requested_detects_do_flag():
     resolver = DNSResolver()
     query = dns.message.make_query("example.com", "A")
-    # Set EDNS and manually set the DO flag on the OPT rdata
-    query.use_edns(payload=1232)
-    if query.opt:
-        # The OPT RRset has a single rdata; we replace it with a new one with DO flag set
-        from dns.rdtypes.ANY.OPT import OPT
-        old_opt = query.opt[0]
-        new_opt = OPT(rdclass=old_opt.rdclass, flags=dns.flags.DO, options=old_opt.options)
-        query.opt.remove(old_opt)
-        query.opt.add(new_opt)
+    # Enable EDNS and set the DO flag via ednsflags
+    query.use_edns(edns=0, ednsflags=dns.flags.DO, payload=1232)
     assert resolver._dnssec_requested(query.to_wire()) is True
 
 
