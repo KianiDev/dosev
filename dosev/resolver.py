@@ -1071,8 +1071,26 @@ class DNSResolver:
                 rdtype = parts[3]
                 rdata = ' '.join(parts[4:])
                 rr = dns.rrset.from_text(name, ttl, rdclass, rdtype, rdata)
-                anchors[dns.name.root] = rr
-                self.logger.info("Using bundled default root trust anchor")
+                # Apply DNSKEY limit to built-in anchor
+                if self.dnssec_max_dnskey_records == 0:
+                    # Limit 0: skip loading DNSKEYs (treat as no trust anchor)
+                    self.logger.warning("dnssec_max_dnskey_records is 0, not loading any DNSKEYs")
+                    anchors = {}
+                else:
+                    # Limit the number of DNSKEYs in the built-in anchor
+                    count = 0
+                    limited_rr = dns.rrset.RRset(rr.name, rr.rdclass, rr.rdtype)
+                    limited_rr.ttl = rr.ttl
+                    for r in rr:
+                        if count >= self.dnssec_max_dnskey_records:
+                            self.logger.warning("DNSKEY limit (%d) reached for built-in root anchor, truncating",
+                                                self.dnssec_max_dnskey_records)
+                            break
+                        limited_rr.add(r)
+                        count += 1
+                    anchors[dns.name.root] = limited_rr
+                self.logger.info("Using bundled default root trust anchor (limited to %d DNSKEYs)",
+                                 self.dnssec_max_dnskey_records)
             except Exception as e:
                 self.logger.error("Failed to parse default root trust anchor: %s", e)
                 return
@@ -1110,16 +1128,22 @@ class DNSResolver:
                         try:
                             rr = dns.rrset.from_text(name_text, ttl, 'IN', 'DNSKEY', rdata_text)
                             name_obj = dns.name.from_text(name_text)
+                            if self.dnssec_max_dnskey_records == 0:
+                                # Skip loading any DNSKEYs
+                                self.logger.debug("Skipping DNSKEY for %s due to limit 0", name_text)
+                                continue
                             if name_obj in anchors:
-                                count = 0
+                                # Limit the number of DNSKEYs per domain
+                                current_count = len(anchors[name_obj])
                                 for r in rr:
-                                    if count >= self.dnssec_max_dnskey_records:
+                                    if current_count >= self.dnssec_max_dnskey_records:
                                         self.logger.warning("DNSKEY limit (%d) reached for %s, truncating",
                                                             self.dnssec_max_dnskey_records, name_text)
                                         break
                                     anchors[name_obj].add(r)
-                                    count += 1
+                                    current_count += 1
                             else:
+                                # Create new RRset with limited records
                                 new_rr = dns.rrset.RRset(name_obj, rr.rdclass, rr.rdtype)
                                 new_rr.ttl = rr.ttl
                                 count = 0
@@ -1134,14 +1158,34 @@ class DNSResolver:
                         except Exception as e:
                             self.logger.debug("failed to parse anchor line '%s': %s", line, e)
                             continue
-                self.logger.info("Loaded trust anchors from file: %s", path)
+                self.logger.info("Loaded trust anchors from file: %s (limited to %d DNSKEYs per domain)",
+                                 path, self.dnssec_max_dnskey_records)
             except Exception as e:
                 self.logger.warning("failed to load trust anchors from %s: %s", path, e)
                 return
 
         elif isinstance(self.trust_anchors, dict):
             anchors = self.trust_anchors
-            self.logger.info("Using provided trust anchors dict")
+            # Apply limit to each RRset in the dict
+            if self.dnssec_max_dnskey_records == 0:
+                self.logger.warning("dnssec_max_dnskey_records is 0, not using any trust anchors")
+                anchors = {}
+            else:
+                for name, rrset in list(anchors.items()):
+                    if len(rrset) > self.dnssec_max_dnskey_records:
+                        new_rr = dns.rrset.RRset(rrset.name, rrset.rdclass, rrset.rdtype)
+                        new_rr.ttl = rrset.ttl
+                        count = 0
+                        for r in rrset:
+                            if count >= self.dnssec_max_dnskey_records:
+                                break
+                            new_rr.add(r)
+                            count += 1
+                        anchors[name] = new_rr
+                        self.logger.debug("Truncated DNSKEY RRset for %s to %d records",
+                                          name, self.dnssec_max_dnskey_records)
+            self.logger.info("Using provided trust anchors dict (limited to %d DNSKEYs per domain)",
+                             self.dnssec_max_dnskey_records)
 
         else:
             self.logger.warning("Unsupported trust_anchors type: %s", type(self.trust_anchors))
@@ -1416,6 +1460,18 @@ class DNSResolver:
 
     # ---------- Scrub unsolicited NS records ----------
     def _scrub_authority_section(self, response_bytes: bytes, qname: str) -> bytes:
+        """
+        Remove unsolicited NS records from the authority section that are not within
+        the same bailiwick as the query. This prevents cache poisoning (CVE-2025-11411).
+        Based on Unbound's iter_scrub.c implementation.
+
+        Args:
+            response_bytes: Wire-format DNS response
+            qname: Original query name (fully qualified)
+
+        Returns:
+            Scrubbed wire-format response
+        """
         if not self.scrub_unsolicited_ns or not _HAS_DNSPY:
             return response_bytes
 
@@ -1432,11 +1488,17 @@ class DNSResolver:
                     continue
 
                 rr_name = str(rrset.name).lower().rstrip('.')
-                if rr_name == '.' or rr_name == qname_lower:
+                # Allow root NS (name == ".") – they are always legitimate
+                if rr_name == '.':
+                    filtered_authority.append(rrset)
+                # Allow NS records that are at or above the qname's zone
+                elif rr_name == qname_lower:
                     filtered_authority.append(rrset)
                 elif qname_lower.endswith('.' + rr_name):
+                    # qname is a subdomain of the NS name (valid delegation)
                     filtered_authority.append(rrset)
                 elif rr_name.endswith('.' + qname_lower):
+                    # NS name is a subdomain of the qname (unusual but accept)
                     filtered_authority.append(rrset)
                 else:
                     self.logger.debug("Scrubbed unsolicited NS record for %s (qname=%s)", rr_name, qname)

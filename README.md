@@ -8,7 +8,7 @@
 
 - **Client protocols**: DNS over UDP, TCP, TLS (DoT), HTTPS (DoH – HTTP/1.1, HTTP/2, HTTP/3), and QUIC (DoQ).
 - **Server protocols**: UDP, TCP, TLS (DoT), HTTPS (DoH – HTTP/2 and HTTP/3).
-- **Features**: EDNS0 (including Client Subnet), DNSSEC validation with automatic trust anchor updates, negative caching, optimistic caching (serve‑stale), blocklists, hosts overrides, upstream failover, rate limiting, rebinding protection, Prometheus metrics, and more.
+- **Features**: EDNS0 (including Client Subnet), DNSSEC validation with automatic _tr_ust anchor updates, negative caching, optimistic caching (serve‑stale), blocklists, hosts overrides, upstream failover, rate limiting, rebinding protection, Prometheus metrics, and more.
 
 ---
 
