@@ -81,11 +81,11 @@ async def test_dnssec_max_validations_limit(resolver):
         resp.answer.append(a_rrset)
         resp.answer.append(create_rrsig(dns.rdatatype.A, name))
 
-    validate_calls = []
+    validate_calls = 0
 
     def fake_validate(rrset, sig, anchors):
-        # sig is an RRSIG rdata object; use covers() method
-        validate_calls.append((rrset.name, sig.covers()))
+        nonlocal validate_calls
+        validate_calls += 1
         return
 
     wire = resp.to_wire()
@@ -99,7 +99,7 @@ async def test_dnssec_max_validations_limit(resolver):
         assert insecure is True
 
         # validate should have been called exactly max_validations (2) times
-        assert len(validate_calls) == 2
+        assert validate_calls == 2
 
 
 @pytest.mark.asyncio

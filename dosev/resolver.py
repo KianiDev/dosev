@@ -1460,6 +1460,7 @@ class DNSResolver:
 
     # ---------- Scrub unsolicited NS records ----------
     # ---------- Scrub unsolicited NS records ----------
+    # ---------- Scrub unsolicited NS records ----------
     def _scrub_authority_section(self, response_bytes: bytes, qname: str) -> bytes:
         """
         Remove unsolicited NS records from the authority section that are not within
@@ -1488,12 +1489,12 @@ class DNSResolver:
                     filtered_authority.append(rrset)
                     continue
 
-                rr_name = str(rrset.name).lower().rstrip('.')
-
                 # Root NS (name == ".") must ALWAYS be kept
-                if rr_name == '.':
+                if rrset.name == dns.name.root:
                     filtered_authority.append(rrset)
                     continue
+
+                rr_name = str(rrset.name).lower().rstrip('.')
 
                 # Allow NS records that are at or above the qname's zone
                 if rr_name == qname_lower:
@@ -1512,6 +1513,7 @@ class DNSResolver:
         except Exception as e:
             self.logger.debug("NS scrubbing failed: %s", e)
             return response_bytes
+        
     # ---------- Refactored forward_dns_query with CD flag ----------
     async def forward_dns_query(self, data: bytes) -> bytes:
         original_data = data
