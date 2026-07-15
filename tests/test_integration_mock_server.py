@@ -11,22 +11,20 @@ import dns.rdatatype
 import dns.rdataclass
 import dns.rrset
 import dns.rcode
-import errno
-import os
-import sys
 
 from dosev.resolver import DNSResolver
 
 
 class MockDNSServer:
-    """A simple mock DNS server that responds to queries on both UDP and TCP on the same port."""
+    """A simple mock DNS server that responds to queries on both UDP and TCP on different ports."""
     def __init__(self, response_func=None, delay=0, tcp_response_func=None):
         self.response_func = response_func or self.default_response
         self.tcp_response_func = tcp_response_func
         self.delay = delay
         self.udp_transport = None
         self.tcp_server = None
-        self.port = 0  # same port for both
+        self.udp_port = 0
+        self.tcp_port = 0
         self.queries_received = []
 
     def default_response(self, data, addr):
@@ -63,6 +61,9 @@ class MockDNSServer:
             if response and self.server.udp_transport:
                 self.server.udp_transport.sendto(response, addr)
 
+        def connection_lost(self, exc):
+            self.server.udp_transport = None
+
     class TCPProtocol(asyncio.Protocol):
         def __init__(self, server):
             self.server = server
@@ -88,51 +89,53 @@ class MockDNSServer:
                 if response:
                     self.transport.write(len(response).to_bytes(2, 'big') + response)
 
-    async def start(self, host='127.0.0.1'):
+        def connection_lost(self, exc):
+            self.transport = None
+
+    async def start(self, host='127.0.0.1', timeout=5.0):
         loop = asyncio.get_running_loop()
 
         # UDP on a random port
-        udp_transport, udp_protocol = await loop.create_datagram_endpoint(
-            lambda: self.UDPProtocol(self),
-            local_addr=(host, 0)
+        udp_transport, udp_protocol = await asyncio.wait_for(
+            loop.create_datagram_endpoint(
+                lambda: self.UDPProtocol(self),
+                local_addr=(host, 0)
+            ),
+            timeout=timeout
         )
-        self.port = udp_transport.get_extra_info('socket').getsockname()[1]
+        self.udp_port = udp_transport.get_extra_info('socket').getsockname()[1]
 
-        # Try to bind TCP to the same port. On Linux this works; on Windows it may fail.
-        try:
-            tcp_server = await loop.create_server(
+        # TCP on a different random port (avoids Windows permission issues with same port)
+        tcp_server = await asyncio.wait_for(
+            loop.create_server(
                 lambda: self.TCPProtocol(self),
-                host=host, port=self.port
-            )
-        except OSError as e:
-            # If permission error (Windows), bind to a different port
-            if e.errno == errno.EACCES or (os.name == 'nt' and e.errno == errno.EADDRINUSE):
-                tcp_server = await loop.create_server(
-                    lambda: self.TCPProtocol(self),
-                    host=host, port=0
-                )
-                self.port = tcp_server.sockets[0].getsockname()[1]
-            else:
-                raise
-
+                host=host, port=0
+            ),
+            timeout=timeout
+        )
+        self.tcp_port = tcp_server.sockets[0].getsockname()[1]
         self.tcp_server = tcp_server
         self.udp_transport = udp_transport
         return self
 
-    async def stop(self):
+    async def stop(self, timeout=5.0):
         if self.udp_transport:
             self.udp_transport.close()
+            # Wait for transport to be fully closed
+            await asyncio.sleep(0.1)
         if self.tcp_server:
             self.tcp_server.close()
-            await self.tcp_server.wait_closed()
+            await asyncio.wait_for(self.tcp_server.wait_closed(), timeout=timeout)
 
 
 @pytest.fixture
 async def mock_dns_server():
     server = MockDNSServer()
-    await server.start()
-    yield server
-    await server.stop()
+    try:
+        await server.start()
+        yield server
+    finally:
+        await server.stop()
 
 
 @pytest.mark.asyncio
@@ -141,7 +144,7 @@ async def test_integration_udp_forward(mock_dns_server):
         upstreams=[{
             "address": "127.0.0.1",
             "protocol": "udp",
-            "port": mock_dns_server.port,
+            "port": mock_dns_server.udp_port,
             "ip": "127.0.0.1"
         }],
         udp_timeout=2.0,
@@ -163,7 +166,7 @@ async def test_integration_tcp_forward(mock_dns_server):
         upstreams=[{
             "address": "127.0.0.1",
             "protocol": "tcp",
-            "port": mock_dns_server.port,
+            "port": mock_dns_server.tcp_port,
             "ip": "127.0.0.1"
         }],
         tcp_timeout=2.0,
@@ -210,7 +213,7 @@ async def test_integration_truncation_fallback(mock_dns_server):
             upstreams=[{
                 "address": "127.0.0.1",
                 "protocol": "udp",
-                "port": udp_server.port,
+                "port": udp_server.udp_port,
                 "ip": "127.0.0.1"
             }],
             tcp_fallback_enabled=True,
@@ -247,7 +250,7 @@ async def test_integration_nxdomain_caching(mock_dns_server):
             upstreams=[{
                 "address": "127.0.0.1",
                 "protocol": "udp",
-                "port": server.port,
+                "port": server.udp_port,
                 "ip": "127.0.0.1"
             }],
             negative_cache_ttl=5,
@@ -278,8 +281,8 @@ async def test_integration_parallel_load_balancing(mock_dns_server):
     try:
         resolver = DNSResolver(
             upstreams=[
-                {"address": "127.0.0.1", "protocol": "udp", "port": server1.port, "ip": "127.0.0.1"},
-                {"address": "127.0.0.1", "protocol": "udp", "port": server2.port, "ip": "127.0.0.1"},
+                {"address": "127.0.0.1", "protocol": "udp", "port": server1.udp_port, "ip": "127.0.0.1"},
+                {"address": "127.0.0.1", "protocol": "udp", "port": server2.udp_port, "ip": "127.0.0.1"},
             ],
             load_balancing="parallel",
             udp_timeout=2.0,
