@@ -1459,6 +1459,7 @@ class DNSResolver:
             raise ValueError(f"Unsupported upstream protocol: {proto}")
 
     # ---------- Scrub unsolicited NS records ----------
+    # ---------- Scrub unsolicited NS records ----------
     def _scrub_authority_section(self, response_bytes: bytes, qname: str) -> bytes:
         """
         Remove unsolicited NS records from the authority section that are not within
@@ -1488,11 +1489,14 @@ class DNSResolver:
                     continue
 
                 rr_name = str(rrset.name).lower().rstrip('.')
-                # Allow root NS (name == ".") – they are always legitimate
+
+                # Root NS (name == ".") must ALWAYS be kept
                 if rr_name == '.':
                     filtered_authority.append(rrset)
+                    continue
+
                 # Allow NS records that are at or above the qname's zone
-                elif rr_name == qname_lower:
+                if rr_name == qname_lower:
                     filtered_authority.append(rrset)
                 elif qname_lower.endswith('.' + rr_name):
                     # qname is a subdomain of the NS name (valid delegation)
@@ -1508,7 +1512,6 @@ class DNSResolver:
         except Exception as e:
             self.logger.debug("NS scrubbing failed: %s", e)
             return response_bytes
-
     # ---------- Refactored forward_dns_query with CD flag ----------
     async def forward_dns_query(self, data: bytes) -> bytes:
         original_data = data

@@ -84,7 +84,8 @@ async def test_dnssec_max_validations_limit(resolver):
     validate_calls = []
 
     def fake_validate(rrset, sig, anchors):
-        validate_calls.append((rrset.name, sig.type_covered))
+        # sig is an RRSIG rdata object; use covers() method
+        validate_calls.append((rrset.name, sig.covers()))
         return
 
     wire = resp.to_wire()
@@ -121,8 +122,6 @@ async def test_dnssec_keytrap_dnskey_limit():
             trust_anchors=fname,
         )
 
-        # Load trust anchors (the limit is applied in _load_trust_anchors)
-        # The method should now respect dnssec_max_dnskey_records
         resolver._load_trust_anchors()
 
         assert resolver._dnssec_raw_anchors is not None
@@ -151,8 +150,9 @@ async def test_dnssec_keytrap_validation_timeout(resolver):
     wire = resp.to_wire()
     qname = "example.com"
 
-    async def slow_validate(rrset, sig, anchors):
-        await asyncio.sleep(0.5)
+    # Must be synchronous because dns.dnssec.validate is called via run_in_executor
+    def slow_validate(rrset, sig, anchors):
+        time.sleep(0.5)  # synchronous sleep
         return
 
     with patch('dns.dnssec.validate', side_effect=slow_validate):

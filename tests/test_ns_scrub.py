@@ -76,7 +76,7 @@ def test_scrub_keeps_valid_ns_parent_zone(resolver):
 
 
 def test_scrub_keeps_root_ns(resolver):
-    """Root NS records (name ".") should be kept."""
+    """Root NS records (name ".") should always be kept."""
     query = dns.message.make_query("example.com", "A")
     resp = dns.message.make_response(query)
 
