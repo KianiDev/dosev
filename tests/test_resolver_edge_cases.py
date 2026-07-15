@@ -125,6 +125,7 @@ async def test_forward_tcp_closed_connection_creates_new():
     resp = make_a_response("example.com")
 
     connect_count = 0
+    put_called = False
 
     async def fake_connect(*args, **kwargs):
         nonlocal connect_count
@@ -137,20 +138,30 @@ async def test_forward_tcp_closed_connection_creates_new():
                 return resp
         reader.readexactly = AsyncMock(side_effect=readexactly_side_effect)
         writer = MagicMock()
-        # First connection is closed, second is open
         if connect_count == 1:
-            writer.is_closing = MagicMock(return_value=True)
+            writer.is_closing.return_value = True
             writer.close = MagicMock()
         else:
-            writer.is_closing = MagicMock(return_value=False)
+            writer.is_closing.return_value = False
         writer.write = MagicMock()
         writer.drain = AsyncMock()
         return reader, writer
 
+    # Patch the pool's put to track that it's called
+    original_put = resolver._tcp_pool.put
+    async def mock_put(key, reader, writer):
+        nonlocal put_called
+        put_called = True
+        await original_put(key, reader, writer)
+    resolver._tcp_pool.put = mock_put
+
     with patch("asyncio.open_connection", side_effect=fake_connect):
         result = await resolver._forward_tcp(data, resolver.upstreams[0])
         assert result == resp
-        # The first connection was closed, so a second was created
+        assert put_called is True
+        # The pool's put should not store the closed connection, so second call should open new one
+        result2 = await resolver._forward_tcp(data, resolver.upstreams[0])
+        assert result2 == resp
         assert connect_count == 2
 
 @pytest.mark.asyncio
@@ -253,12 +264,18 @@ async def test_forward_https1_chunked_response():
         b"\r\n"
     )
 
-    # Split into lines without keeping newlines
+    # Create a list of lines with newlines preserved
     lines = [line + b"\r\n" for line in chunked_response.splitlines() if line]
 
     async def fake_connect(*args, **kwargs):
         reader = AsyncMock()
-        reader.readline = AsyncMock(side_effect=lines)
+        # Use a list that we pop from
+        remaining_lines = lines.copy()
+        async def readline_side_effect():
+            if remaining_lines:
+                return remaining_lines.pop(0)
+            return b""
+        reader.readline = AsyncMock(side_effect=readline_side_effect)
         reader.readexactly = AsyncMock(side_effect=[
             resp[:2],
             resp[2:],
@@ -274,7 +291,6 @@ async def test_forward_https1_chunked_response():
     with patch("asyncio.open_connection", side_effect=fake_connect):
         result = await resolver._forward_https1(data, "example.com", 443, "example.com", "/dns-query", None)
         assert result == resp
-
 
 @pytest.mark.asyncio
 async def test_forward_https1_missing_content_length():
@@ -550,7 +566,7 @@ def test_set_tc_bit():
 def test_dnssec_requested_detects_do_flag():
     resolver = DNSResolver()
     query = dns.message.make_query("example.com", "A")
-    # Correct: use ednsflags parameter
+    # Correct way to set DO flag in dnspython 2.x
     query.use_edns(edns=0, ednsflags=dns.flags.DO, payload=1232)
     assert resolver._dnssec_requested(query.to_wire()) is True
 
