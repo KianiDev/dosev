@@ -129,10 +129,20 @@ class MockDNSServer:
     async def stop(self, timeout=5.0):
         if self.udp_transport:
             self.udp_transport.close()
+            # Wait a tiny bit for the transport to close
             await asyncio.sleep(0.1)
+            self.udp_transport = None
+
         if self.tcp_server:
             self.tcp_server.close()
-            await asyncio.wait_for(self.tcp_server.wait_closed(), timeout=timeout)
+            try:
+                # Use a timeout to avoid hanging, but don't let cancellation break it
+                await asyncio.wait_for(self.tcp_server.wait_closed(), timeout=timeout)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                # If it times out or is cancelled, just continue
+                pass
+            finally:
+                self.tcp_server = None
 
 
 @pytest.fixture
