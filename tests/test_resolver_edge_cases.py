@@ -95,13 +95,10 @@ async def test_forward_tcp_pool_reuse():
 
     async def fake_connect(*args, **kwargs):
         reader = AsyncMock()
-        # Use a function that always returns the next expected value
-        def readexactly_side_effect(n):
-            if n == 2:
-                return len(resp).to_bytes(2, "big")
-            else:
-                return resp
-        reader.readexactly = AsyncMock(side_effect=readexactly_side_effect)
+        reader.readexactly = AsyncMock(side_effect=[
+            len(resp).to_bytes(2, "big"),
+            resp
+        ])
         writer = MagicMock()
         writer.is_closing = MagicMock(return_value=False)
         writer.write = MagicMock()
@@ -112,7 +109,6 @@ async def test_forward_tcp_pool_reuse():
         result = await resolver._forward_tcp(data, resolver.upstreams[0])
         assert result == resp
 
-        # Second call should reuse the pool
         result2 = await resolver._forward_tcp(data, resolver.upstreams[0])
         assert result2 == resp
 
@@ -132,15 +128,18 @@ async def test_forward_tcp_closed_connection_creates_new():
         nonlocal connect_count
         connect_count += 1
         reader = AsyncMock()
-        def readexactly_side_effect(n):
-            if n == 2:
-                return len(resp).to_bytes(2, "big")
-            else:
-                return resp
-        reader.readexactly = AsyncMock(side_effect=readexactly_side_effect)
+        reader.readexactly = AsyncMock(side_effect=[
+            len(resp).to_bytes(2, "big"),
+            resp
+        ])
         writer = MagicMock()
-        # For the first connection, mark as closing; for the second, keep open
-        writer.is_closing = MagicMock(return_value=connect_count == 1)
+        # First connection is closing, second is open
+        if connect_count == 1:
+            writer.is_closing = MagicMock(return_value=True)
+            # Ensure close is called on eviction
+            writer.close = MagicMock()
+        else:
+            writer.is_closing = MagicMock(return_value=False)
         writer.write = MagicMock()
         writer.drain = AsyncMock()
         return reader, writer
@@ -198,12 +197,10 @@ async def test_forward_tls_cert_pin_mismatch():
 
     async def fake_connect(*args, **kwargs):
         reader = AsyncMock()
-        def readexactly_side_effect(n):
-            if n == 2:
-                return len(resp).to_bytes(2, "big")
-            else:
-                return resp
-        reader.readexactly = AsyncMock(side_effect=readexactly_side_effect)
+        reader.readexactly = AsyncMock(side_effect=[
+            len(resp).to_bytes(2, "big"),
+            resp
+        ])
         writer = MagicMock()
         writer.is_closing = MagicMock(return_value=False)
         writer.write = MagicMock()
@@ -241,6 +238,7 @@ async def test_forward_https1_chunked_response():
     data = dns.message.make_query("example.com", "A").to_wire()
     resp = make_a_response("example.com")
 
+    # Correct chunked response
     chunked_response = (
         b"HTTP/1.1 200 OK\r\n"
         b"Transfer-Encoding: chunked\r\n"
@@ -254,20 +252,12 @@ async def test_forward_https1_chunked_response():
         b"\r\n"
     )
 
+    # Split into lines for readline mock
+    lines = chunked_response.splitlines(keepends=True)
+
     async def fake_connect(*args, **kwargs):
         reader = AsyncMock()
-        reader.readline = AsyncMock(side_effect=[
-            chunked_response.splitlines()[0] + b"\r\n",
-            chunked_response.splitlines()[1] + b"\r\n",
-            chunked_response.splitlines()[2] + b"\r\n",
-            b"\r\n",
-            b"2\r\n",
-            resp[:2] + b"\r\n",
-            str(len(resp) - 2).encode() + b"\r\n",
-            resp[2:] + b"\r\n",
-            b"0\r\n",
-            b"\r\n",
-        ])
+        reader.readline = AsyncMock(side_effect=lines)
         reader.readexactly = AsyncMock(side_effect=[
             resp[:2],
             resp[2:],
@@ -297,14 +287,11 @@ async def test_forward_https1_missing_content_length():
         b"Content-Type: application/dns-message\r\n"
         b"\r\n"
     )
+    lines = response.splitlines(keepends=True)
 
     async def fake_connect(*args, **kwargs):
         reader = AsyncMock()
-        reader.readline = AsyncMock(side_effect=[
-            response.splitlines()[0] + b"\r\n",
-            response.splitlines()[1] + b"\r\n",
-            b"\r\n",
-        ])
+        reader.readline = AsyncMock(side_effect=lines)
         writer = MagicMock()
         writer.is_closing = MagicMock(return_value=False)
         writer.write = MagicMock()
@@ -513,7 +500,6 @@ async def test_tcp_fallback_on_truncated_response():
     resolver._forward_tcp = fake_forward_tcp
 
     result = await resolver._try_upstream(resolver.upstreams[0], data)
-    # Instead of exact equality, check that it's a valid response with an answer
     msg = dns.message.from_wire(result)
     assert msg.rcode() == dns.rcode.NOERROR
     assert len(msg.answer) == 1
@@ -563,10 +549,8 @@ def test_set_tc_bit():
 def test_dnssec_requested_detects_do_flag():
     resolver = DNSResolver()
     query = dns.message.make_query("example.com", "A")
-    query.use_edns(payload=1232)
-    if query.opt:
-        for rr in query.opt:
-            rr.flags = dns.flags.DO
+    # Use the correct method to set EDNS flags
+    query.use_edns(payload=1232, flags=dns.flags.DO)
     assert resolver._dnssec_requested(query.to_wire()) is True
 
 
