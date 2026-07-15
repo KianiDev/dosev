@@ -16,15 +16,14 @@ from dosev.resolver import DNSResolver
 
 
 class MockDNSServer:
-    """A simple mock DNS server that responds to queries on both UDP and TCP on different ports."""
+    """A simple mock DNS server that responds to queries on both UDP and TCP on the SAME port."""
     def __init__(self, response_func=None, delay=0, tcp_response_func=None):
         self.response_func = response_func or self.default_response
         self.tcp_response_func = tcp_response_func
         self.delay = delay
         self.udp_transport = None
         self.tcp_server = None
-        self.udp_port = 0
-        self.tcp_port = 0
+        self.port = 0
         self.queries_received = []
 
     def default_response(self, data, addr):
@@ -95,33 +94,41 @@ class MockDNSServer:
     async def start(self, host='127.0.0.1', timeout=5.0):
         loop = asyncio.get_running_loop()
 
-        # UDP on a random port
+        # Create a UDP socket and bind to a random port
+        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        udp_sock.bind((host, 0))
+        self.port = udp_sock.getsockname()[1]
+
+        # Create a TCP socket and bind to the SAME port with SO_REUSEADDR
+        tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        tcp_sock.bind((host, self.port))
+
+        # UDP transport
         udp_transport, udp_protocol = await asyncio.wait_for(
             loop.create_datagram_endpoint(
                 lambda: self.UDPProtocol(self),
-                local_addr=(host, 0)
+                sock=udp_sock
             ),
             timeout=timeout
         )
-        self.udp_port = udp_transport.get_extra_info('socket').getsockname()[1]
+        self.udp_transport = udp_transport
 
-        # TCP on a different random port (avoids Windows permission issues with same port)
+        # TCP server
         tcp_server = await asyncio.wait_for(
             loop.create_server(
                 lambda: self.TCPProtocol(self),
-                host=host, port=0
+                sock=tcp_sock
             ),
             timeout=timeout
         )
-        self.tcp_port = tcp_server.sockets[0].getsockname()[1]
         self.tcp_server = tcp_server
-        self.udp_transport = udp_transport
         return self
 
     async def stop(self, timeout=5.0):
         if self.udp_transport:
             self.udp_transport.close()
-            # Wait for transport to be fully closed
             await asyncio.sleep(0.1)
         if self.tcp_server:
             self.tcp_server.close()
@@ -144,7 +151,7 @@ async def test_integration_udp_forward(mock_dns_server):
         upstreams=[{
             "address": "127.0.0.1",
             "protocol": "udp",
-            "port": mock_dns_server.udp_port,
+            "port": mock_dns_server.port,
             "ip": "127.0.0.1"
         }],
         udp_timeout=2.0,
@@ -166,7 +173,7 @@ async def test_integration_tcp_forward(mock_dns_server):
         upstreams=[{
             "address": "127.0.0.1",
             "protocol": "tcp",
-            "port": mock_dns_server.tcp_port,
+            "port": mock_dns_server.port,
             "ip": "127.0.0.1"
         }],
         tcp_timeout=2.0,
@@ -213,7 +220,7 @@ async def test_integration_truncation_fallback(mock_dns_server):
             upstreams=[{
                 "address": "127.0.0.1",
                 "protocol": "udp",
-                "port": udp_server.udp_port,
+                "port": udp_server.port,
                 "ip": "127.0.0.1"
             }],
             tcp_fallback_enabled=True,
@@ -250,7 +257,7 @@ async def test_integration_nxdomain_caching(mock_dns_server):
             upstreams=[{
                 "address": "127.0.0.1",
                 "protocol": "udp",
-                "port": server.udp_port,
+                "port": server.port,
                 "ip": "127.0.0.1"
             }],
             negative_cache_ttl=5,
@@ -281,8 +288,8 @@ async def test_integration_parallel_load_balancing(mock_dns_server):
     try:
         resolver = DNSResolver(
             upstreams=[
-                {"address": "127.0.0.1", "protocol": "udp", "port": server1.udp_port, "ip": "127.0.0.1"},
-                {"address": "127.0.0.1", "protocol": "udp", "port": server2.udp_port, "ip": "127.0.0.1"},
+                {"address": "127.0.0.1", "protocol": "udp", "port": server1.port, "ip": "127.0.0.1"},
+                {"address": "127.0.0.1", "protocol": "udp", "port": server2.port, "ip": "127.0.0.1"},
             ],
             load_balancing="parallel",
             udp_timeout=2.0,
