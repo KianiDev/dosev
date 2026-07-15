@@ -2644,13 +2644,9 @@ class DNSResolver:
             return False
         try:
             msg = dns.message.from_wire(query_data)
-            if msg.opt is None:
-                return False
-            # The DO flag is stored in the TTL field of the OPT record (bit 15)
-            for rr in msg.opt:
-                if rr.ttl & dns.flags.DO:
-                    return True
-            return False
+            # ednsflags property returns the EDNS flags from the OPT record's TTL field
+            # DO bit is 0x8000 (dns.flags.DO)
+            return bool(msg.ednsflags & dns.flags.DO)
         except Exception:
             return False
 
