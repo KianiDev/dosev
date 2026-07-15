@@ -86,7 +86,6 @@ async def test_forward_udp_connection_lost():
 # ---------- Forward TCP Edge Cases ----------
 @pytest.mark.asyncio
 async def test_forward_tcp_pool_reuse():
-    """TCP should reuse connections from the pool."""
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "tcp", "port": 53, "ip": "1.1.1.1"}]
     )
@@ -95,10 +94,13 @@ async def test_forward_tcp_pool_reuse():
 
     async def fake_connect(*args, **kwargs):
         reader = AsyncMock()
-        reader.readexactly = AsyncMock(side_effect=[
-            len(resp).to_bytes(2, "big"),
-            resp
-        ])
+        # Use a function that returns the next value each time
+        def readexactly_side_effect(n):
+            if n == 2:
+                return len(resp).to_bytes(2, "big")
+            else:
+                return resp
+        reader.readexactly = AsyncMock(side_effect=readexactly_side_effect)
         writer = MagicMock()
         writer.is_closing = MagicMock(return_value=False)
         writer.write = MagicMock()
@@ -109,13 +111,13 @@ async def test_forward_tcp_pool_reuse():
         result = await resolver._forward_tcp(data, resolver.upstreams[0])
         assert result == resp
 
+        # Second call should reuse the pool
         result2 = await resolver._forward_tcp(data, resolver.upstreams[0])
         assert result2 == resp
 
 
 @pytest.mark.asyncio
 async def test_forward_tcp_closed_connection_creates_new():
-    """TCP should create a new connection if pooled connection is closed."""
     resolver = DNSResolver(
         upstreams=[{"address": "1.1.1.1", "protocol": "tcp", "port": 53, "ip": "1.1.1.1"}]
     )
@@ -128,15 +130,16 @@ async def test_forward_tcp_closed_connection_creates_new():
         nonlocal connect_count
         connect_count += 1
         reader = AsyncMock()
-        reader.readexactly = AsyncMock(side_effect=[
-            len(resp).to_bytes(2, "big"),
-            resp
-        ])
+        def readexactly_side_effect(n):
+            if n == 2:
+                return len(resp).to_bytes(2, "big")
+            else:
+                return resp
+        reader.readexactly = AsyncMock(side_effect=readexactly_side_effect)
         writer = MagicMock()
-        # First connection is closing, second is open
+        # First connection is closed, second is open
         if connect_count == 1:
             writer.is_closing = MagicMock(return_value=True)
-            # Ensure close is called on eviction
             writer.close = MagicMock()
         else:
             writer.is_closing = MagicMock(return_value=False)
@@ -149,7 +152,6 @@ async def test_forward_tcp_closed_connection_creates_new():
         assert result == resp
         # The first connection was closed, so a second was created
         assert connect_count == 2
-
 
 @pytest.mark.asyncio
 async def test_forward_tcp_timeout():
@@ -238,7 +240,6 @@ async def test_forward_https1_chunked_response():
     data = dns.message.make_query("example.com", "A").to_wire()
     resp = make_a_response("example.com")
 
-    # Correct chunked response
     chunked_response = (
         b"HTTP/1.1 200 OK\r\n"
         b"Transfer-Encoding: chunked\r\n"
@@ -252,8 +253,8 @@ async def test_forward_https1_chunked_response():
         b"\r\n"
     )
 
-    # Split into lines for readline mock
-    lines = chunked_response.splitlines(keepends=True)
+    # Split into lines without keeping newlines
+    lines = [line + b"\r\n" for line in chunked_response.splitlines() if line]
 
     async def fake_connect(*args, **kwargs):
         reader = AsyncMock()
@@ -549,8 +550,8 @@ def test_set_tc_bit():
 def test_dnssec_requested_detects_do_flag():
     resolver = DNSResolver()
     query = dns.message.make_query("example.com", "A")
-    # Use the correct method to set EDNS flags
-    query.use_edns(payload=1232, flags=dns.flags.DO)
+    # Correct: use ednsflags parameter
+    query.use_edns(edns=0, ednsflags=dns.flags.DO, payload=1232)
     assert resolver._dnssec_requested(query.to_wire()) is True
 
 
