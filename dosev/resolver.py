@@ -332,6 +332,8 @@ class DNSResolver:
                   retries: int = 1,
                   dns_logging_enabled: bool = False,
                   dns_log_dir: str = DEFAULT_LOG_DIR,
+                  dns_log_prefix: str = "dns-requests",
+                  dns_log_retention_days: int = 7,
                   pinned_certs: Optional[Dict[str, str]] = None,
                   dnssec_enabled: bool = False,
                   trust_anchors: Optional[Union[Dict[str, str], str]] = None,
@@ -407,7 +409,11 @@ class DNSResolver:
             try:
                 from logging.handlers import TimedRotatingFileHandler
                 os.makedirs(dns_log_dir, exist_ok=True)
-                fh = TimedRotatingFileHandler(os.path.join(dns_log_dir, 'dns-requests.log'), when='midnight', backupCount=7)
+                fh = TimedRotatingFileHandler(
+                    os.path.join(dns_log_dir, f"{dns_log_prefix}.log"),
+                    when='midnight',
+                    backupCount=dns_log_retention_days
+                )
                 fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
                 flog = logging.getLogger("dosev.DNSRequests")
                 flog.setLevel(logging.INFO)
@@ -1459,8 +1465,6 @@ class DNSResolver:
             raise ValueError(f"Unsupported upstream protocol: {proto}")
 
     # ---------- Scrub unsolicited NS records ----------
-    # ---------- Scrub unsolicited NS records ----------
-    # ---------- Scrub unsolicited NS records ----------
     def _scrub_authority_section(self, response_bytes: bytes, qname: str) -> bytes:
         """
         Remove unsolicited NS records from the authority section that are not within
@@ -1513,7 +1517,7 @@ class DNSResolver:
         except Exception as e:
             self.logger.debug("NS scrubbing failed: %s", e)
             return response_bytes
-        
+
     # ---------- Refactored forward_dns_query with CD flag ----------
     async def forward_dns_query(self, data: bytes) -> bytes:
         original_data = data
