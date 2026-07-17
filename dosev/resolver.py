@@ -3039,32 +3039,43 @@ class DNSResolver:
                     except Exception:
                         qpart = request_data[12:]
                 flags = 0x8000
-                header = tid.to_bytes(2, 'big') + flags.to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (0).to_bytes(2, 'big') + (0).to_bytes(2, 'big')
                 name_ptr = b'\xc0\x0c'
                 if qtype == 1:
+                    # A record – 1 answer
+                    header = tid.to_bytes(2, 'big') + flags.to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (0).to_bytes(2, 'big') + (0).to_bytes(2, 'big')
                     rtype = (1).to_bytes(2, 'big')
                     rclass = (1).to_bytes(2, 'big')
                     ttl = (60).to_bytes(4, 'big')
                     rdlen = (4).to_bytes(2, 'big')
                     rdata = b'\x00\x00\x00\x00'
+                    ans = name_ptr + rtype + rclass + ttl + rdlen + rdata
+                    return header + qpart + ans
                 elif qtype == 28:
+                    # AAAA record – 1 answer
                     if self.disable_ipv6:
                         return self._make_nxdomain_response(request_data)
+                    header = tid.to_bytes(2, 'big') + flags.to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (0).to_bytes(2, 'big') + (0).to_bytes(2, 'big')
                     rtype = (28).to_bytes(2, 'big')
                     rclass = (1).to_bytes(2, 'big')
                     ttl = (60).to_bytes(4, 'big')
                     rdlen = (16).to_bytes(2, 'big')
                     rdata = b'\x00' * 16
+                    ans = name_ptr + rtype + rclass + ttl + rdlen + rdata
+                    return header + qpart + ans
                 elif qtype == 255:
+                    # ANY query – answer count depends on whether IPv6 is disabled
                     a_ans = name_ptr + (1).to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (60).to_bytes(4, 'big') + (4).to_bytes(2, 'big') + b'\x00\x00\x00\x00'
                     if self.disable_ipv6:
+                        # Only A record – 1 answer
+                        header = tid.to_bytes(2, 'big') + flags.to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (0).to_bytes(2, 'big') + (0).to_bytes(2, 'big')
                         return header + qpart + a_ans
-                    aaaa_ans = name_ptr + (28).to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (60).to_bytes(4, 'big') + (16).to_bytes(2, 'big') + (b'\x00' * 16)
-                    return header + qpart + a_ans + aaaa_ans
+                    else:
+                        # A + AAAA – 2 answers
+                        aaaa_ans = name_ptr + (28).to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (60).to_bytes(4, 'big') + (16).to_bytes(2, 'big') + (b'\x00' * 16)
+                        header = tid.to_bytes(2, 'big') + flags.to_bytes(2, 'big') + (2).to_bytes(2, 'big') + (2).to_bytes(2, 'big') + (0).to_bytes(2, 'big') + (0).to_bytes(2, 'big')
+                        return header + qpart + a_ans + aaaa_ans
                 else:
                     return self._make_nxdomain_response(request_data)
-                ans = name_ptr + rtype + rclass + ttl + rdlen + rdata
-                return header + qpart + ans
         except Exception:
             return self._make_nxdomain_response(request_data)
 
