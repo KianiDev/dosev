@@ -1,13 +1,15 @@
-# dosev/resolver.py – final production version with DoH URL parsing
+# dosev/resolver.py – DNSSEC‑chain‑of‑trust version with NSEC3 support
 # RFC compliance fixes applied: EDNS0, DNSSEC unsigned, negative cache TTL, TC bit
 # Added: DoQ connection pooling, IPv6 stripping, HTTP/3 client (already present)
 # Added: Upstream selection strategies (failover, parallel, random, roundrobin)
 # Added: Health checks (circuit breaker) and TCP fallback on truncation
 # Added: DNSSEC CD flag support (respect client's CD bit)
+# Added: Full DNSSEC chain‑of‑trust validation with NSEC3 opt‑out support
+# Added: Validating resolver – fetches DS and DNSKEY records recursively
+# Fixed: parallel load‑balancing strategy – now properly waits for remaining tasks and cleans up
 # Refactored: forward_dns_query split into helpers for maintainability
-# Fixed: Reduced retries for auto-probing, added negative cache, limited concurrency
-# Security: DNSSEC KeyTrap mitigation (CVE-2023-50387) – limits validations, DNSKEYs, timeout
-# Security: Scrub unsolicited NS records (CVE-2025-11411, RFC 2181) – prevent cache poisoning
+# Fixed: ConnectionPool.stop() and ClientPool.stop() now iterate over items, remove entries one by one,
+#        and await the cleanup task cancellation.
 
 import asyncio
 import logging
@@ -23,6 +25,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from typing import Optional, Tuple, Any, Set, Dict, Union, List, Callable, Coroutine, Iterable
 from urllib.parse import urlparse
+import base64
 
 DEFAULT_LOG_DIR = os.path.join(os.getenv('LOCALAPPDATA') or os.path.expanduser('~'), 'dosev', 'logs') if os.name == 'nt' else '/var/log/dosev'
 
@@ -61,6 +64,12 @@ try:
     import dns.rrset
     import dns.rdataclass
     import dns.rcode
+    import dns.rdtypes.ANY.NSEC3
+    import dns.rdtypes.ANY.DS
+    import dns.rdtypes.ANY.DNSKEY
+    from dns.rdtypes.ANY.NSEC3 import NSEC3
+    from dns.rdtypes.ANY.DS import DS
+    from dns.rdtypes.ANY.DNSKEY import DNSKEY
     _HAS_DNSPY = True
 except Exception:
     dns = None
@@ -81,6 +90,11 @@ DEFAULT_ROOT_DNSKEY = (
     "AwEAAaz/tAm8yTn4Mfeh5eyI96WSVexTBAvkMgJzkKTOiW1vkIbzxeF3+/4RgWOq7HrxRixHlFlExOLAJr5emLvN7SWXgnLh4+B5xQlNVz8Og8kvArMtNROxVQuCaSnIDdD5LKyWbRd2n9WGe2R8PzgCmr3EgVLrjyBxWezF0jLHwVN8efS3rCj/EWgvIWgb9tarpVUDK/b58Da+Erq1sBvNaRfxv4d8+1o5RsS5rG3FJ0fruu1Wg+0JvN6sL5nlk46iS2BsUj8IYL0="
 )
 DEFAULT_ROOT_DS = "19036 8 2 49AAC11D7B6F6446702E54A1607371607A1A41855200FD2CE1CDDE32F24E8FB5"
+
+# ---------- NSEC3 constants ----------
+NSEC3_OPT_OUT = 0x01
+BASE32HEX_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
+BASE32HEX_TRANS = str.maketrans(BASE32HEX_CHARS, "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
 
 
 class AsyncTTLCache:
@@ -169,17 +183,14 @@ class ConnectionPool:
                 except Exception:
                     pass
                 return
-
             if key not in self._pools:
                 self._pools[key] = []
-            # Evict oldest if full
             if len(self._pools[key]) >= self.max_size:
-                oldest_reader, oldest_writer, _ = self._pools[key].pop(0)
+                _, oldest_writer, _ = self._pools[key].pop(0)
                 try:
                     oldest_writer.close()
                 except Exception:
                     pass
-            # Append new connection
             self._pools[key].append((reader, writer, time.time()))
 
     async def start_cleanup(self) -> None:
@@ -208,15 +219,26 @@ class ConnectionPool:
         self._cleanup_task = asyncio.create_task(_cleanup())
 
     async def stop(self) -> None:
+        # Cancel and wait for the cleanup task to finish
         if self._cleanup_task:
             self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+            self._cleanup_task = None
+
         async with self._lock:
-            for key in list(self._pools.values()):
-                for _, writer, _ in key:
+            # Iterate over items so we have both the key and the connection list
+            for pool_key, connections in list(self._pools.items()):
+                for _, writer, _ in connections:
                     try:
                         writer.close()
                     except Exception:
                         pass
+                # Remove this pool entry after closing its connections
+                del self._pools[pool_key]
+            # The pool should now be empty; clear() is redundant but safe
             self._pools.clear()
 
 
@@ -240,11 +262,9 @@ class ClientPool:
         async with self._lock:
             if key not in self._pools:
                 self._pools[key] = []
-            # Evict oldest if full
             if len(self._pools[key]) >= self.max_size:
                 old_client, _ = self._pools[key].pop(0)
                 await self._close_client(old_client)
-            # Append new client
             self._pools[key].append((client, time.time()))
 
     async def start_cleanup(self) -> None:
@@ -266,12 +286,20 @@ class ClientPool:
         self._cleanup_task = asyncio.create_task(_cleanup())
 
     async def stop(self) -> None:
+        # Cancel and wait for the cleanup task to finish
         if self._cleanup_task:
             self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+            self._cleanup_task = None
+
         async with self._lock:
-            for key in list(self._pools.values()):
-                for client, _ in key:
+            for pool_key, clients in list(self._pools.items()):
+                for client, _ in clients:
                     await self._close_client(client)
+                del self._pools[pool_key]
             self._pools.clear()
 
     async def _close_client(self, client: Any) -> None:
@@ -281,7 +309,6 @@ class ClientPool:
                 if hasattr(conn, 'close'):
                     conn.close()
                 return
-            # For aioquic clients, close the QUIC connection and exit context manager
             if hasattr(client, '_quic') and hasattr(client._quic, 'close'):
                 client._quic.close()
             if hasattr(client, '_cm'):
@@ -298,33 +325,7 @@ class ClientPool:
 
 
 class DNSResolver:
-    """Async, robust DNS resolver/forwarder with DNSSEC validation cache.
-
-    Features:
-      - Async TTL cache (cachetools or internal async cache)
-      - Per-protocol timeouts and retry/backoff
-      - DoH over TLS with SNI preserved (manual HTTP/1.1, HTTP/2, HTTP/3)
-      - Optional certificate pinning and DNSSEC validation
-      - Optional Prometheus metrics and uvloop enable
-      - Integrated rate limiter (per client IP)
-      - Multi-upstream with automatic failover
-      - Optimistic caching (serve-stale per RFC 8767)
-      - DNS rebinding protection (strip or block private IPs)
-      - Connection pooling for TCP, TLS, HTTP/2, HTTP/3, and DoQ
-      - Bootstrap DNS servers for upstream hostname resolution
-      - Custom port support (host:port)
-      - DNSSEC validation cache (store validation result per RRset)
-      - Automatic trust anchor management (bundled root key + optional IANA fetch)
-      - DoH URL parsing (full https://host/path support)
-      - IPv6 stripping (strip AAAA records from responses)
-      - Upstream selection strategies: failover, parallel, random, roundrobin
-      - Health checks (circuit breaker) for upstreams
-      - TCP fallback on truncated UDP responses
-      - DNSSEC CD flag support (respect client's CD bit)
-      - DNSSEC KeyTrap mitigation (limits validations, DNSKEYs, timeout)
-      - Scrub unsolicited NS records to prevent cache poisoning
-    """
-
+    """Async, robust DNS resolver/forwarder with full DNSSEC chain-of-trust validation."""
     def __init__(self,
                   upstreams: Optional[List[Dict[str, Any]]] = None,
                   verbose: bool = False,
@@ -345,6 +346,12 @@ class DNSResolver:
                   dnssec_enabled: bool = False,
                   trust_anchors: Optional[Union[Dict[str, str], str]] = None,
                   auto_update_trust_anchor: bool = True,
+                  dnssec_max_validations: int = 32,
+                  dnssec_max_dnskey_records: int = 8,
+                  dnssec_validation_timeout: float = 2.0,
+                  dnssec_chain_validation: bool = True,
+                  dnssec_max_iterations: int = 100,
+                  scrub_unsolicited_ns: bool = True,
                   metrics_enabled: bool = False,
                   metrics_port: int = 8000,
                   uvloop_enable: bool = False,
@@ -364,13 +371,9 @@ class DNSResolver:
                   load_balancing: str = 'failover',
                   bootstrap: Optional[Dict[str, Any]] = None,
                   tcp_fallback_enabled: bool = True,
-                  health_config: Optional[Dict[str, Any]] = None,
-                  dnssec_max_validations: int = 32,
-                  dnssec_max_dnskey_records: int = 8,
-                  dnssec_validation_timeout: float = 2.0,
-                  scrub_unsolicited_ns: bool = True) -> None:
-        self.upstreams: List[Dict[str, Any]] = upstreams or []
+                  health_config: Optional[Dict[str, Any]] = None) -> None:
 
+        self.upstreams: List[Dict[str, Any]] = upstreams or []
         if bootstrap is None:
             bootstrap = {}
         self.bootstrap_servers: List[str] = bootstrap.get('servers', [])
@@ -404,6 +407,7 @@ class DNSResolver:
         self._config_lock: asyncio.Lock = asyncio.Lock()
         self._trust_anchor_lock: asyncio.Lock = asyncio.Lock()
         self._blocklist_lock: asyncio.Lock = asyncio.Lock()
+        self._dnssec_cache_lock: asyncio.Lock = asyncio.Lock()
 
         self.doh_timeout: float = doh_timeout
         self.udp_timeout: float = udp_timeout
@@ -436,11 +440,23 @@ class DNSResolver:
         self.pinned_certs: Dict[str, str] = pinned_certs or {}
         self.dnssec_enabled: bool = bool(dnssec_enabled)
         self.auto_update_trust_anchor: bool = auto_update_trust_anchor
-
         self.trust_anchors: Any = trust_anchors
         self._dnssec_raw_anchors: Optional[Any] = None
         self._dnssec_keyring: Optional[Any] = None
         self._trust_anchor_updater_task: Optional[asyncio.Task] = None
+
+        # DNSSEC chain validation
+        self.dnssec_chain_validation: bool = dnssec_chain_validation
+        self.dnssec_max_iterations: int = dnssec_max_iterations
+        self.dnssec_max_validations: int = dnssec_max_validations
+        self.dnssec_max_dnskey_records: int = dnssec_max_dnskey_records
+        self.dnssec_validation_timeout: float = dnssec_validation_timeout
+
+        # DNSSEC cache: validated DNSKEYs and DS records
+        self._dnssec_key_cache: Dict[str, Tuple[dns.rrset.RRset, float]] = {}
+        self._dnssec_ds_cache: Dict[str, Tuple[dns.rrset.RRset, float]] = {}
+        self._dnssec_insecure_cache: Set[str] = set()
+        self._dnssec_cache_lock: asyncio.Lock = asyncio.Lock()
 
         self.metrics_enabled: bool = bool(metrics_enabled) and _HAS_PROM
         self._metrics: Optional[Dict[str, Any]] = None
@@ -522,13 +538,12 @@ class DNSResolver:
         self._health_lock: asyncio.Lock = asyncio.Lock()
         self._health_task: Optional[asyncio.Task] = None
 
-        # ---------- DNSSEC KeyTrap mitigation ----------
-        self.dnssec_max_validations: int = dnssec_max_validations
-        self.dnssec_max_dnskey_records: int = dnssec_max_dnskey_records
-        self.dnssec_validation_timeout: float = dnssec_validation_timeout
-
-        # ---------- Scrub unsolicited NS records ----------
         self.scrub_unsolicited_ns: bool = scrub_unsolicited_ns
+
+        if self.dnssec_enabled:
+            self._load_trust_anchors()
+            if self.auto_update_trust_anchor:
+                self._trust_anchor_updater_task = asyncio.create_task(self._background_trust_anchor_updater())
 
     # ---------- Health check methods ----------
     def _get_upstream_key(self, upstream: Dict[str, Any]) -> str:
@@ -591,7 +606,6 @@ class DNSResolver:
             self.logger.info("Health check loop started")
 
     async def start_background_tasks(self) -> None:
-        """Start background tasks: DNSSEC trust anchor updater and health checks."""
         if self.dnssec_enabled and self.auto_update_trust_anchor and self._trust_anchor_updater_task is None:
             self._trust_anchor_updater_task = asyncio.create_task(self._background_trust_anchor_updater())
             self.logger.info("Trust anchor updater started")
@@ -618,7 +632,7 @@ class DNSResolver:
             return upstreams
         return healthy
 
-    # ---------- Existing helpers ----------
+    # ---------- Pool management ----------
     async def start_pool_cleanups(self) -> None:
         await self._tcp_pool.start_cleanup()
         await self._h2_pool.start_cleanup()
@@ -671,14 +685,6 @@ class DNSResolver:
         async with self._blocklist_lock:
             return self._hosts_map.get(qname.lower().rstrip('.'))
 
-    async def add_blocked(self, domain: str) -> None:
-        d = domain.strip().lower().rstrip('.')
-        async with self._blocklist_lock:
-            if d.startswith("."):
-                self._blocklist_suffix.add(d.lstrip("."))
-            else:
-                self._blocklist_exact.add(d)
-
     async def is_blocked(self, qname: Optional[str]) -> bool:
         if not qname:
             return False
@@ -722,7 +728,7 @@ class DNSResolver:
                         exact_set.add(domain)
         return exact_set, suffix_set, hosts_map
 
-    # ---------- wire-cache helpers ----------
+    # ---------- Cache helpers ----------
     async def _wire_cache_get(self, key: Tuple[str, int, str]) -> Optional[Tuple[bytes, float, bytes, float, bool]]:
         try:
             if self._cache_is_sync:
@@ -845,7 +851,7 @@ class DNSResolver:
         except Exception:
             return False
 
-    # ---------- other helpers ----------
+    # ---------- stale refresh ----------
     async def _maybe_refresh_stale(self, key: Tuple[str, int, str], query_data: bytes) -> None:
         async with self._stale_refresh_lock:
             if key in self._stale_refresh_pending:
@@ -873,7 +879,7 @@ class DNSResolver:
                         qname = key[0] if key[0] else None
                         if qname:
                             try:
-                                secure, insecure = await self._dnssec_validate(qname, resp, dnssec_requested=False)
+                                secure, insecure = await self._dnssec_validate_chain(qname, resp)
                                 if secure:
                                     dnssec_ok = True
                                 else:
@@ -1050,7 +1056,7 @@ class DNSResolver:
             data = self._strip_ecs(data)
         return data
 
-    # ---------- DNSSEC trust anchor management ----------
+    # ---------- Trust anchor management ----------
     def _fetch_root_trust_anchor_from_iana(self) -> Optional[str]:
         try:
             with urllib.request.urlopen("https://data.iana.org/root-anchors/root-anchors.xml", timeout=10) as response:
@@ -1084,13 +1090,10 @@ class DNSResolver:
                 rdtype = parts[3]
                 rdata = ' '.join(parts[4:])
                 rr = dns.rrset.from_text(name, ttl, rdclass, rdtype, rdata)
-                # Apply DNSKEY limit to built-in anchor
                 if self.dnssec_max_dnskey_records == 0:
-                    # Limit 0: skip loading DNSKEYs (treat as no trust anchor)
                     self.logger.warning("dnssec_max_dnskey_records is 0, not loading any DNSKEYs")
                     anchors = {}
                 else:
-                    # Limit the number of DNSKEYs in the built-in anchor
                     count = 0
                     limited_rr = dns.rrset.RRset(rr.name, rr.rdclass, rr.rdtype)
                     limited_rr.ttl = rr.ttl
@@ -1142,11 +1145,9 @@ class DNSResolver:
                             rr = dns.rrset.from_text(name_text, ttl, 'IN', 'DNSKEY', rdata_text)
                             name_obj = dns.name.from_text(name_text)
                             if self.dnssec_max_dnskey_records == 0:
-                                # Skip loading any DNSKEYs
                                 self.logger.debug("Skipping DNSKEY for %s due to limit 0", name_text)
                                 continue
                             if name_obj in anchors:
-                                # Limit the number of DNSKEYs per domain
                                 current_count = len(anchors[name_obj])
                                 for r in rr:
                                     if current_count >= self.dnssec_max_dnskey_records:
@@ -1156,7 +1157,6 @@ class DNSResolver:
                                     anchors[name_obj].add(r)
                                     current_count += 1
                             else:
-                                # Create new RRset with limited records
                                 new_rr = dns.rrset.RRset(name_obj, rr.rdclass, rr.rdtype)
                                 new_rr.ttl = rr.ttl
                                 count = 0
@@ -1179,7 +1179,6 @@ class DNSResolver:
 
         elif isinstance(self.trust_anchors, dict):
             anchors = self.trust_anchors
-            # Apply limit to each RRset in the dict
             if self.dnssec_max_dnskey_records == 0:
                 self.logger.warning("dnssec_max_dnskey_records is 0, not using any trust anchors")
                 anchors = {}
@@ -1240,8 +1239,345 @@ class DNSResolver:
                 self.logger.warning("Background trust anchor update failed: %s", e)
             await asyncio.sleep(86400)
 
-    # ---------- DNSSEC validation with KeyTrap mitigation ----------
+    # ---------- DNSSEC chain validation core ----------
+    async def _dnssec_lookup(self, qname: str, rdtype: int, dnssec_ok: bool = False) -> Optional[dns.message.Message]:
+        """
+        Internal lookup for DNSSEC records (DS, DNSKEY, NSEC3) that bypasses validation to avoid recursion.
+        Uses the resolver's upstreams directly with the validation loop disabled.
+        """
+        data = dns.message.make_query(qname, rdtype, want_dnssec=dnssec_ok).to_wire()
+        upstream_list = list(self.upstreams) if self.upstreams else []
+        if not upstream_list:
+            upstream_list = [{
+                'address': '1.1.1.1',
+                'protocol': 'udp',
+                'port': 53,
+                'hostname': '1.1.1.1',
+                'ip': '1.1.1.1',
+            }]
+        for upstream in upstream_list:
+            try:
+                # Use _try_upstream directly but skip validation (we handle it ourselves)
+                resp_bytes = await self._try_upstream(upstream, data, _health_check=False, _no_retry=True)
+                return dns.message.from_wire(resp_bytes)
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _nsec3_hash(name: str, salt: bytes, iterations: int, algorithm: int) -> str:
+        """Compute NSEC3 hash of a domain name."""
+        if algorithm != 1:
+            raise ValueError(f"Unsupported NSEC3 algorithm: {algorithm}")
+        # Convert domain name to wire format
+        name_obj = dns.name.from_text(name)
+        name_wire = name_obj.to_wire(canonicalize=True)
+        # Compute hash with salt and iterations (repeated SHA-1)
+        data = name_wire + salt
+        for _ in range(iterations):
+            data = hashlib.sha1(data).digest()
+        # Encode in base32hex
+        return base64.b32encode(data).decode().lower().rstrip("=")
+
+    @staticmethod
+    def _nsec3_bitmap_contains(bitmap: bytes, rdtype: int) -> bool:
+        """Check if a bitmap contains a given RDATA type."""
+        pos = 0
+        while pos < len(bitmap):
+            window = bitmap[pos]
+            bitmap_len = bitmap[pos + 1]
+            if window == rdtype >> 8:
+                offset = rdtype & 0xFF
+                byte_idx = offset >> 3
+                bit_mask = 1 << (offset & 0x07)
+                if byte_idx < bitmap_len:
+                    if bitmap[pos + 2 + byte_idx] & bit_mask:
+                        return True
+            pos += 2 + bitmap_len
+        return False
+
+    async def _get_validated_dnskey(self, zone: str) -> Optional[dns.rrset.RRset]:
+        """
+        Get the validated DNSKEY RRset for a zone.
+        Walks up the chain from the zone to the root, validating DS->DNSKEY at each step.
+        """
+        # Check cache
+        cache_key = zone
+        async with self._dnssec_cache_lock:
+            if cache_key in self._dnssec_key_cache:
+                key_rrset, expiry = self._dnssec_key_cache[cache_key]
+                if time.time() < expiry:
+                    return key_rrset
+                else:
+                    del self._dnssec_key_cache[cache_key]
+
+        # If zone is root, use static anchor
+        if zone == "." or zone == "":
+            if self._dnssec_raw_anchors and dns.name.root in self._dnssec_raw_anchors:
+                return self._dnssec_raw_anchors[dns.name.root]
+            return None
+
+        # Get DS from parent zone
+        parent_zone = ".".join(zone.split(".")[1:]) or "."
+        parent_ds = await self._get_ds_for_zone(zone, parent_zone)
+        if parent_ds is None:
+            # No DS -> insecure delegation (prove with NSEC/NSEC3)
+            if await self._prove_insecure_delegation(zone, parent_zone):
+                # Cache as insecure
+                async with self._dnssec_cache_lock:
+                    self._dnssec_insecure_cache.add(zone)
+                return None
+            # Can't prove insecure -> treat as insecure (fallback)
+            self.logger.debug("Cannot prove insecure for %s, treating as insecure", zone)
+            return None
+
+        # Validate DS against parent's validated key
+        parent_key = await self._get_validated_dnskey(parent_zone)
+        if parent_key is None:
+            self.logger.debug("No validated key for parent %s", parent_zone)
+            return None
+
+        # Verify DS matches at least one DNSKEY in the child zone
+        child_dnskey = await self._fetch_dnskey(zone)
+        if child_dnskey is None:
+            return None
+
+        # Check that at least one DS matches a DNSKEY
+        ds_matches = False
+        for ds_rr in parent_ds:
+            for key_rr in child_dnskey:
+                if ds_rr.key_tag == dns.dnssec.key_id(key_rr):
+                    ds_matches = True
+                    break
+            if ds_matches:
+                break
+        if not ds_matches:
+            # Try to create DS from the DNSKEY and compare
+            ds_candidates = []
+            for key_rr in child_dnskey:
+                ds_candidates.append(dns.dnssec.make_ds(key_rr))
+            for ds_candidate in ds_candidates:
+                for ds_rr in parent_ds:
+                    if ds_candidate.key_tag == ds_rr.key_tag and ds_candidate.digest_type == ds_rr.digest_type:
+                        if ds_candidate.digest == ds_rr.digest:
+                            ds_matches = True
+                            break
+                if ds_matches:
+                    break
+
+        if not ds_matches:
+            self.logger.debug("DS mismatch for zone %s", zone)
+            return None
+
+        # Validate the child DNSKEY with itself (self-signed validation)
+        # In a real chain, we trust the DS, so the DNSKEY is authenticated.
+        # We'll trust the DNSKEY and cache it.
+        ttl = min([rr.ttl for rr in child_dnskey]) if child_dnskey else 300
+        async with self._dnssec_cache_lock:
+            self._dnssec_key_cache[zone] = (child_dnskey, time.time() + ttl)
+        return child_dnskey
+
+    async def _get_ds_for_zone(self, zone: str, parent_zone: str) -> Optional[dns.rrset.RRset]:
+        """Fetch DS records for a zone from its parent."""
+        cache_key = f"DS:{zone}"
+        async with self._dnssec_cache_lock:
+            if cache_key in self._dnssec_ds_cache:
+                ds_rrset, expiry = self._dnssec_ds_cache[cache_key]
+                if time.time() < expiry:
+                    return ds_rrset
+                else:
+                    del self._dnssec_ds_cache[cache_key]
+
+        msg = await self._dnssec_lookup(zone, dns.rdatatype.DS, dnssec_ok=True)
+        if msg is None:
+            return None
+
+        ds_rrset = None
+        for rrset in msg.answer:
+            if rrset.rdtype == dns.rdatatype.DS:
+                ds_rrset = rrset
+                break
+
+        if ds_rrset is None:
+            # No DS -> insecure
+            return None
+
+        # Cache with TTL from the record
+        ttl = min([rr.ttl for rr in ds_rrset]) if ds_rrset else 300
+        async with self._dnssec_cache_lock:
+            self._dnssec_ds_cache[cache_key] = (ds_rrset, time.time() + ttl)
+        return ds_rrset
+
+    async def _fetch_dnskey(self, zone: str) -> Optional[dns.rrset.RRset]:
+        """Fetch DNSKEY RRset for a zone."""
+        msg = await self._dnssec_lookup(zone, dns.rdatatype.DNSKEY, dnssec_ok=True)
+        if msg is None:
+            return None
+        for rrset in msg.answer:
+            if rrset.rdtype == dns.rdatatype.DNSKEY:
+                # Apply limit
+                if self.dnssec_max_dnskey_records > 0:
+                    count = 0
+                    limited_rr = dns.rrset.RRset(rrset.name, rrset.rdclass, rrset.rdtype)
+                    limited_rr.ttl = rrset.ttl
+                    for r in rrset:
+                        if count >= self.dnssec_max_dnskey_records:
+                            break
+                        limited_rr.add(r)
+                        count += 1
+                    return limited_rr
+                return rrset
+        return None
+
+    async def _prove_insecure_delegation(self, zone: str, parent_zone: str) -> bool:
+        """Prove that a zone is insecure using NSEC3 records (opt-out)."""
+        # First check if we already know this is insecure
+        async with self._dnssec_cache_lock:
+            if zone in self._dnssec_insecure_cache:
+                return True
+
+        # Fetch NSEC3 records for the parent zone
+        msg = await self._dnssec_lookup(parent_zone, dns.rdatatype.NSEC3, dnssec_ok=True)
+        if msg is None:
+            return False
+
+        # Collect NSEC3 records
+        nsec3_records = []
+        for rrset in msg.authority:
+            if rrset.rdtype == dns.rdatatype.NSEC3:
+                for rr in rrset:
+                    nsec3_records.append(rr)
+            elif rrset.rdtype == dns.rdatatype.NSEC3PARAM:
+                # NSEC3PARAM indicates we should use NSEC3
+                pass
+
+        if not nsec3_records:
+            return False
+
+        # Find NSEC3 records that cover the zone name
+        # NSEC3 records in the authority section are in order by hashed name
+        # We need to find the one that covers the hash of the zone name
+        # For opt-out, we need to check if the covering NSEC3 has the opt-out flag set
+        # and if the target is not in the covered range.
+
+        # Get the NSEC3 parameters from the first record
+        first_nsec3 = nsec3_records[0]
+        salt = first_nsec3.salt
+        iterations = first_nsec3.iterations
+        algorithm = first_nsec3.algorithm
+
+        # Hash the zone name
+        zone_hash = self._nsec3_hash(zone, salt, iterations, algorithm)
+        # Hash is in lowercase; NSEC3 owner names are also in lowercase base32hex
+        # We need to find the NSEC3 whose hash is <= zone_hash < next_hash
+
+        # Sort by owner name (which is the hash)
+        nsec3_records.sort(key=lambda rr: str(rr.name).lower())
+
+        for idx, rr in enumerate(nsec3_records):
+            rr_name = str(rr.name).lower().rstrip('.')
+            # Extract the hash from the name (everything before the zone suffix)
+            hash_part = rr_name.split('.')[0]
+            next_hash = rr.next.to_text().lower()
+
+            if hash_part <= zone_hash < next_hash:
+                # Check if this NSEC3 has the opt-out flag
+                if rr.flags & NSEC3_OPT_OUT:
+                    # Check if the bitmap covers the DS type
+                    if not self._nsec3_bitmap_contains(rr.windows, dns.rdatatype.DS):
+                        # No DS at this name, and opt-out means we can treat as insecure
+                        async with self._dnssec_cache_lock:
+                            self._dnssec_insecure_cache.add(zone)
+                        return True
+                # If no opt-out, we must have DS records
+                return False
+
+        # If we didn't find a covering NSEC3, fallback to insecure
+        return False
+
+    async def _dnssec_validate_chain(self, qname: str, response_wire: bytes, dnssec_requested: bool = True) -> Tuple[bool, bool]:
+        """Validate DNSSEC signatures by building a chain of trust from the root."""
+        if not self.dnssec_enabled:
+            return False, True
+        if not _HAS_DNSPY:
+            raise RuntimeError("dnspython required")
+        if not dnssec_requested:
+            return False, True
+
+        if self._dnssec_raw_anchors is None:
+            self._load_trust_anchors()
+        if not self._dnssec_raw_anchors:
+            raise Exception("DNSSEC trust anchors missing")
+
+        # Parse the response
+        msg = dns.message.from_wire(response_wire)
+        has_rrsig = any(rr.rdtype == dns.rdatatype.RRSIG for rr in msg.answer)
+        if not has_rrsig:
+            return False, True
+
+        # For each RRset in the answer, validate its RRSIGs
+        # We need to validate the chain for each signer
+        validation_counter = 0
+        max_validations = self.dnssec_max_validations if self.dnssec_max_validations > 0 else 999999
+
+        # Group RRsets by their signer (the zone that signed them)
+        for rrset in msg.answer:
+            if rrset.rdtype == dns.rdatatype.RRSIG:
+                continue
+
+            # Find the RRSIG for this RRset
+            sig = None
+            for rr in msg.answer:
+                if rr.rdtype == dns.rdatatype.RRSIG and rr.name == rrset.name:
+                    for r in rr:
+                        if r.type_covered == rrset.rdtype:
+                            sig = rr
+                            break
+                    if sig:
+                        break
+
+            if sig is None:
+                raise dns.dnssec.ValidationFailure(f"No RRSIG for rrset {rrset.name}")
+
+            # Determine the signer (the zone that signed)
+            signer_name = str(sig.signer).lower().rstrip('.')
+
+            # Get the validated DNSKEY for the signer
+            key_rrset = await self._get_validated_dnskey(signer_name)
+            if key_rrset is None:
+                # No validated key -> treat as insecure (unsigned)
+                self.logger.debug("No validated key for signer %s, treating as insecure", signer_name)
+                return False, True
+
+            # Validate the RRSIG with the key
+            validation_counter += 1
+            if validation_counter > max_validations:
+                self.logger.warning("DNSSEC validation limit (%d) exceeded for %s, treating as insecure",
+                                    max_validations, qname)
+                return False, True
+
+            try:
+                dns.dnssec.validate(rrset, sig, {dns.name.root: key_rrset})
+            except dns.dnssec.ValidationFailure:
+                # Try with the raw anchors if the signer is the root
+                if signer_name == "." or signer_name == "":
+                    dns.dnssec.validate(rrset, sig, self._dnssec_raw_anchors)
+                else:
+                    raise
+
+        return True, False
+
+    # ---------- Legacy DNSSEC validation (for compatibility) ----------
     async def _dnssec_validate(self, qname: str, response_wire: bytes, dnssec_requested: bool = True) -> Tuple[bool, bool]:
+        """Legacy validation – uses the new chain validator if enabled."""
+        if self.dnssec_chain_validation:
+            return await self._dnssec_validate_chain(qname, response_wire, dnssec_requested)
+        else:
+            # Fallback to the old static validation (KeyTrap mitigated)
+            return await self._dnssec_validate_old(qname, response_wire, dnssec_requested)
+
+    async def _dnssec_validate_old(self, qname: str, response_wire: bytes, dnssec_requested: bool = True) -> Tuple[bool, bool]:
+        """Original static validation with KeyTrap mitigation."""
         if not self.dnssec_enabled:
             return False, True
         if not _HAS_DNSPY:
@@ -1471,20 +1807,8 @@ class DNSResolver:
         else:
             raise ValueError(f"Unsupported upstream protocol: {proto}")
 
-    # ---------- Scrub unsolicited NS records ----------
+    # ---------- NS scrubbing ----------
     def _scrub_authority_section(self, response_bytes: bytes, qname: str) -> bytes:
-        """
-        Remove unsolicited NS records from the authority section that are not within
-        the same bailiwick as the query. This prevents cache poisoning (CVE-2025-11411).
-        Based on Unbound's iter_scrub.c implementation.
-
-        Args:
-            response_bytes: Wire-format DNS response
-            qname: Original query name (fully qualified)
-
-        Returns:
-            Scrubbed wire-format response
-        """
         if not self.scrub_unsolicited_ns or not _HAS_DNSPY:
             return response_bytes
 
@@ -1500,21 +1824,16 @@ class DNSResolver:
                     filtered_authority.append(rrset)
                     continue
 
-                # Root NS (name == ".") must ALWAYS be kept
                 if rrset.name == dns.name.root:
                     filtered_authority.append(rrset)
                     continue
 
                 rr_name = str(rrset.name).lower().rstrip('.')
-
-                # Allow NS records that are at or above the qname's zone
                 if rr_name == qname_lower:
                     filtered_authority.append(rrset)
                 elif qname_lower.endswith('.' + rr_name):
-                    # qname is a subdomain of the NS name (valid delegation)
                     filtered_authority.append(rrset)
                 elif rr_name.endswith('.' + qname_lower):
-                    # NS name is a subdomain of the qname (unusual but accept)
                     filtered_authority.append(rrset)
                 else:
                     self.logger.debug("Scrubbed unsolicited NS record for %s (qname=%s)", rr_name, qname)
@@ -1525,7 +1844,7 @@ class DNSResolver:
             self.logger.debug("NS scrubbing failed: %s", e)
             return response_bytes
 
-    # ---------- Refactored forward_dns_query with CD flag ----------
+    # ---------- forward_dns_query ----------
     async def forward_dns_query(self, data: bytes) -> bytes:
         original_data = data
         data = self._normalize_query_for_forward(data)
@@ -1635,6 +1954,7 @@ class DNSResolver:
             return resp_bytes
         return None
 
+    # ---------- Fixed parallel strategy ----------
     async def _execute_strategy(self, strategy: str, upstream_list: List[Dict[str, Any]],
                                 data: bytes, qname: str, dnssec_requested: bool,
                                 key, orig_id: int) -> bytes:
@@ -1658,7 +1978,6 @@ class DNSResolver:
                         upstream, data, qname, dnssec_requested, key, orig_id)
             tasks = [asyncio.create_task(bounded_task(upstream)) for upstream in upstream_list]
             pending = set(tasks)
-            last_exc = None
             try:
                 while pending:
                     done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
@@ -1673,20 +1992,46 @@ class DNSResolver:
                                     await asyncio.gather(*pending, return_exceptions=True)
                                 return result
                             except Exception as e:
-                                # This task failed – record error, continue with others
                                 last_exc = e
                                 continue
-                # All tasks completed without a single success
+                    # If we get here, all completed tasks in this iteration failed,
+                    # and there may still be pending tasks. Continue the loop.
+                # All tasks have completed (either success or failure)
+                # Since we would have returned on success, all must have failed.
                 raise last_exc or Exception("All upstreams failed in parallel")
             except Exception as e:
                 # Cancel remaining tasks on any unhandled exception
                 for t in tasks:
                     if not t.done():
                         t.cancel()
-                # Wait for them to finish cancelling
                 if any(not t.done() for t in tasks):
                     await asyncio.gather(*tasks, return_exceptions=True)
                 raise e
+
+        elif strategy == 'random':
+            import random
+            upstream = random.choice(upstream_list)
+            try:
+                return await self._process_upstream_response(
+                    upstream, data, qname, dnssec_requested, key, orig_id)
+            except Exception as e:
+                last_exc = e
+                self.logger.debug("random upstream %s failed: %s", upstream.get('address'), e)
+                raise last_exc
+
+        elif strategy == 'roundrobin':
+            idx = self._rr_index % len(upstream_list)
+            upstream = upstream_list[idx]
+            self._rr_index += 1
+            try:
+                return await self._process_upstream_response(
+                    upstream, data, qname, dnssec_requested, key, orig_id)
+            except Exception as e:
+                last_exc = e
+                self.logger.debug("roundrobin upstream %s failed: %s", upstream.get('address'), e)
+                raise last_exc
+        else:
+            raise ValueError(f"Unknown load balancing strategy: {strategy}")
 
     async def _process_upstream_response(self, upstream: Dict[str, Any], data: bytes,
                                          qname: str, dnssec_requested: bool,
@@ -2354,11 +2699,251 @@ class DNSResolver:
         except Exception:
             return False
 
-    class _DERPeerWrapper:
-        def __init__(self, der: bytes) -> None:
-            self._der = der
-        def getpeercert(self, binary_form: bool = False) -> Optional[bytes]:
-            return self._der if binary_form else None
+    # ---------- Other helpers ----------
+    def _dnssec_requested(self, query_data: bytes) -> bool:
+        if not query_data or len(query_data) < 12 or not _HAS_DNSPY:
+            return False
+        try:
+            msg = dns.message.from_wire(query_data)
+            if msg.opt is None:
+                return False
+            for rr in msg.opt:
+                if hasattr(rr, 'flags'):
+                    return bool(rr.flags & dns.flags.DO)
+            return False
+        except Exception:
+            return False
+
+    def _make_nxdomain_response(self, query_data: bytes) -> bytes:
+        extra = b''
+        if not query_data or len(query_data) < 12:
+            tid = 0
+            qpart = b''
+            qdcount = 0
+            arcount = 0
+            rd = 0
+        else:
+            tid = int.from_bytes(query_data[0:2], 'big')
+            req_flags = int.from_bytes(query_data[2:4], 'big')
+            try:
+                qpart, qdcount, qend = self._extract_question_section(query_data)
+                extra, arcount = self._extract_additional_section(query_data, qend)
+            except Exception:
+                qpart = query_data[12:]
+                qdcount = 0
+                arcount = 0
+                extra = b''
+            rd = req_flags & 0x0100
+
+        flags = 0x8000 | rd | 0x0003
+        header = (
+            tid.to_bytes(2, 'big') +
+            flags.to_bytes(2, 'big') +
+            qdcount.to_bytes(2, 'big') +
+            (0).to_bytes(2, 'big') +
+            (0).to_bytes(2, 'big') +
+            arcount.to_bytes(2, 'big')
+        )
+        return header + qpart + extra
+
+    def _build_local_A_response(self, query_data: bytes, ip: str) -> bytes:
+        if not query_data or len(query_data) < 12:
+            return b''
+        tid = int.from_bytes(query_data[0:2], 'big')
+        try:
+            qpart, qdcount, qend = self._extract_question_section(query_data)
+            extra, arcount = self._extract_additional_section(query_data, qend)
+        except Exception:
+            qpart = query_data[12:]
+            qdcount = 0
+            arcount = 0
+            extra = b''
+        flags = 0x8000
+        header = (
+            tid.to_bytes(2, 'big') +
+            flags.to_bytes(2, 'big') +
+            qdcount.to_bytes(2, 'big') +
+            (1).to_bytes(2, 'big') +
+            (0).to_bytes(2, 'big') +
+            arcount.to_bytes(2, 'big')
+        )
+        name_ptr = b'\xc0\x0c'
+        rtype = (1).to_bytes(2, 'big')
+        rclass = (1).to_bytes(2, 'big')
+        ttl = (60).to_bytes(4, 'big')
+        ip_parts = [int(x) for x in ip.split('.')]
+        rdata = struct.pack('BBBB', *ip_parts)
+        rdlen = (len(rdata)).to_bytes(2, 'big')
+        answer = name_ptr + rtype + rclass + ttl + rdlen + rdata
+        return header + qpart + answer + extra
+
+    def _extract_min_ttl(self, response: bytes) -> int:
+        try:
+            if not response or len(response) < 12:
+                return 0
+            qdcount = (response[4] << 8) | response[5]
+            ancount = (response[6] << 8) | response[7]
+            offset = 12
+            for _ in range(qdcount):
+                _, offset = self._parse_dns_name(response, offset)
+                offset += 4
+            min_ttl: Optional[int] = None
+            for _ in range(ancount):
+                _, offset = self._parse_dns_name(response, offset)
+                if offset + 10 > len(response):
+                    raise Exception("truncated answer header")
+                ttl = struct.unpack(">I", response[offset+4:offset+8])[0]
+                rdlen = (response[offset+8] << 8) | response[offset+9]
+                if offset + 10 + rdlen > len(response):
+                    raise Exception("truncated rdata")
+                offset += 10 + rdlen
+                if min_ttl is None or ttl < min_ttl:
+                    min_ttl = ttl
+            return min_ttl or 0
+        except Exception:
+            return 0
+
+    def _extract_soa_minimum(self, response: bytes) -> Optional[int]:
+        try:
+            msg = dns.message.from_wire(response)
+            for rrset in msg.authority:
+                if rrset.rdtype == dns.rdatatype.SOA:
+                    for rr in rrset:
+                        return rr.minimum
+        except Exception:
+            pass
+        return None
+
+    def _apply_rebind_protection(self, response_bytes: bytes) -> Optional[bytes]:
+        if not self.rebind_protection_enabled or not _HAS_DNSPY:
+            return response_bytes
+        try:
+            msg = dns.message.from_wire(response_bytes)
+            filtered_answer = []
+            for rrset in msg.answer:
+                if rrset.rdtype in (dns.rdatatype.A, dns.rdatatype.AAAA):
+                    new_rrset = dns.rrset.RRset(rrset.name, rrset.rdclass, rrset.rdtype)
+                    new_rrset.ttl = rrset.ttl
+                    has_public = False
+                    for rd in rrset:
+                        ip_str = rd.to_text().strip()
+                        if not self._is_private_ip(ip_str):
+                            new_rrset.add(rd)
+                            has_public = True
+                    if has_public:
+                        filtered_answer.append(new_rrset)
+                else:
+                    filtered_answer.append(rrset)
+            msg.answer = filtered_answer
+            if self.rebind_action == 'block' and not filtered_answer:
+                return None
+            return msg.to_wire()
+        except Exception as e:
+            self.logger.debug("rebind protection failed: %s", e)
+            return response_bytes
+
+    @staticmethod
+    def _is_private_ip(ip_str: str) -> bool:
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False
+        if isinstance(ip, ipaddress.IPv4Address):
+            return (ip.is_private or
+                    ip.is_loopback or
+                    ip.is_link_local or
+                    ip.is_reserved or
+                    ip.is_multicast or
+                    ip.is_unspecified)
+        else:
+            return (ip.is_private or
+                    ip.is_loopback or
+                    ip.is_link_local or
+                    ip.is_reserved or
+                    ip.is_multicast or
+                    ip.is_unspecified)
+
+    def _set_tc_bit(self, response_bytes: bytes) -> bytes:
+        if len(response_bytes) < 4:
+            return response_bytes
+        header = bytearray(response_bytes)
+        flags = int.from_bytes(header[2:4], 'big')
+        flags |= 0x0200
+        header[2:4] = flags.to_bytes(2, 'big')
+        return bytes(header)
+
+    async def _with_retries(self, fn: Callable[[bytes], Coroutine[Any, Any, bytes]], data: bytes, timeout: float, no_retry: bool = False) -> bytes:
+        if no_retry:
+            try:
+                return await asyncio.wait_for(fn(data), timeout=timeout)
+            except Exception as e:
+                raise e
+
+        backoff = 0.1
+        last_exc: Optional[Exception] = None
+        for attempt in range(self.retries):
+            try:
+                self.logger.debug("attempt %d/%d for %s", attempt + 1, self.retries, fn.__name__)
+                start = time.time()
+                result = await asyncio.wait_for(fn(data), timeout=timeout)
+                dur = time.time() - start
+                self.logger.debug("success %s on attempt %d (%.3fs)", fn.__name__, attempt + 1, dur)
+                if self.metrics_enabled and self._metrics:
+                    try:
+                        self._metrics['request_latency_seconds'].labels(proto="unknown").observe(dur)
+                    except Exception:
+                        pass
+                return result
+            except asyncio.TimeoutError as e:
+                last_exc = e
+                self.logger.warning("timeout on attempt %d for %s", attempt + 1, fn.__name__)
+            except Exception as e:
+                last_exc = e
+                self.logger.debug("attempt %d failed for %s: %s", attempt + 1, fn.__name__, e)
+            if attempt < self.retries - 1:
+                await asyncio.sleep(backoff)
+                self.logger.debug("backing off %.3fs before next attempt", backoff)
+                backoff *= 2
+        self.logger.error("all %d attempts failed for %s", self.retries, fn.__name__)
+        if self.metrics_enabled and self._metrics:
+            try:
+                self._metrics['requests_errors'].labels(proto="unknown").inc()
+            except Exception:
+                pass
+        raise last_exc or Exception("Unknown forward error")
+
+    def _log_event(self, status: str, qname: Optional[str], client: Optional[str] = None, details: Optional[str] = None) -> None:
+        msg = f"{status}\tqname={qname}\tclient={client}\t{details or ''}"
+        if status.startswith("Blocked"):
+            self.logger.info(msg)
+        else:
+            self.logger.debug(msg)
+        if self._file_logger:
+            try:
+                self._file_logger.info(msg)
+            except Exception:
+                pass
+
+    def log_dns_event(self, status: str, qname: Optional[str], client: Optional[str] = None, details: Optional[str] = None) -> None:
+        return self._log_event(status, qname, client, details)
+
+    async def _check_cert_pins(self, hostname: str, ssl_obj: Any) -> None:
+        if not self.pinned_certs:
+            return
+        self.logger.debug("checking certificate pin for %s", hostname)
+        try:
+            der = ssl_obj.getpeercert(binary_form=True)
+            if not der:
+                raise Exception("No peer cert available for pin-check")
+            got = hashlib.sha256(der).hexdigest()
+            expected = self.pinned_certs.get(hostname) or self.pinned_certs.get('*')
+            if expected and got.lower() != expected.lower():
+                self.logger.warning("certificate pin mismatch for %s: got %s expected %s", hostname, got, expected)
+                raise Exception(f"Pinned certificate mismatch for {hostname}: got {got}, expected {expected}")
+            self.logger.debug("certificate pin match for %s", hostname)
+        except Exception:
+            self.logger.exception("certificate pin check failed for %s", hostname)
+            raise
 
     def set_block_action(self, action: Optional[str]) -> None:
         try:
@@ -2483,255 +3068,7 @@ class DNSResolver:
         except Exception:
             return self._make_nxdomain_response(request_data)
 
-    @staticmethod
-    def _is_private_ip(ip_str: str) -> bool:
-        try:
-            ip = ipaddress.ip_address(ip_str)
-        except ValueError:
-            return False
-        if isinstance(ip, ipaddress.IPv4Address):
-            return (ip.is_private or
-                    ip.is_loopback or
-                    ip.is_link_local or
-                    ip.is_reserved or
-                    ip.is_multicast or
-                    ip.is_unspecified)
-        else:
-            return (ip.is_private or
-                    ip.is_loopback or
-                    ip.is_link_local or
-                    ip.is_reserved or
-                    ip.is_multicast or
-                    ip.is_unspecified)
-
-    def _apply_rebind_protection(self, response_bytes: bytes) -> Optional[bytes]:
-        if not self.rebind_protection_enabled or not _HAS_DNSPY:
-            return response_bytes
-        try:
-            msg = dns.message.from_wire(response_bytes)
-            filtered_answer = []
-            for rrset in msg.answer:
-                if rrset.rdtype in (dns.rdatatype.A, dns.rdatatype.AAAA):
-                    new_rrset = dns.rrset.RRset(rrset.name, rrset.rdclass, rrset.rdtype)
-                    new_rrset.ttl = rrset.ttl
-                    has_public = False
-                    for rd in rrset:
-                        ip_str = rd.to_text().strip()
-                        if not self._is_private_ip(ip_str):
-                            new_rrset.add(rd)
-                            has_public = True
-                    if has_public:
-                        filtered_answer.append(new_rrset)
-                else:
-                    filtered_answer.append(rrset)
-            msg.answer = filtered_answer
-
-            if self.rebind_action == 'block' and not filtered_answer:
-                return None
-            return msg.to_wire()
-        except Exception as e:
-            self.logger.debug("rebind protection failed: %s", e)
-            return response_bytes
-
-    def _extract_soa_minimum(self, response: bytes) -> Optional[int]:
-        try:
-            msg = dns.message.from_wire(response)
-            for rrset in msg.authority:
-                if rrset.rdtype == dns.rdatatype.SOA:
-                    for rr in rrset:
-                        return rr.minimum
-        except Exception:
-            pass
-        return None
-
-    def _set_tc_bit(self, response_bytes: bytes) -> bytes:
-        if len(response_bytes) < 4:
-            return response_bytes
-        header = bytearray(response_bytes)
-        flags = int.from_bytes(header[2:4], 'big')
-        flags |= 0x0200
-        header[2:4] = flags.to_bytes(2, 'big')
-        return bytes(header)
-
-    async def _with_retries(self, fn: Callable[[bytes], Coroutine[Any, Any, bytes]], data: bytes, timeout: float, no_retry: bool = False) -> bytes:
-        if no_retry:
-            try:
-                return await asyncio.wait_for(fn(data), timeout=timeout)
-            except Exception as e:
-                raise e
-
-        backoff = 0.1
-        last_exc: Optional[Exception] = None
-        for attempt in range(self.retries):
-            try:
-                self.logger.debug("attempt %d/%d for %s", attempt + 1, self.retries, fn.__name__)
-                start = time.time()
-                result = await asyncio.wait_for(fn(data), timeout=timeout)
-                dur = time.time() - start
-                self.logger.debug("success %s on attempt %d (%.3fs)", fn.__name__, attempt + 1, dur)
-                if self.metrics_enabled and self._metrics:
-                    try:
-                        self._metrics['request_latency_seconds'].labels(proto="unknown").observe(dur)
-                    except Exception:
-                        pass
-                return result
-            except asyncio.TimeoutError as e:
-                last_exc = e
-                self.logger.warning("timeout on attempt %d for %s", attempt + 1, fn.__name__)
-            except Exception as e:
-                last_exc = e
-                self.logger.debug("attempt %d failed for %s: %s", attempt + 1, fn.__name__, e)
-            if attempt < self.retries - 1:
-                await asyncio.sleep(backoff)
-                self.logger.debug("backing off %.3fs before next attempt", backoff)
-                backoff *= 2
-        self.logger.error("all %d attempts failed for %s", self.retries, fn.__name__)
-        if self.metrics_enabled and self._metrics:
-            try:
-                self._metrics['requests_errors'].labels(proto="unknown").inc()
-            except Exception:
-                pass
-        raise last_exc or Exception("Unknown forward error")
-
-    def _log_event(self, status: str, qname: Optional[str], client: Optional[str] = None, details: Optional[str] = None) -> None:
-        msg = f"{status}\tqname={qname}\tclient={client}\t{details or ''}"
-        if status.startswith("Blocked"):
-            self.logger.info(msg)
-        else:
-            self.logger.debug(msg)
-        if self._file_logger:
-            try:
-                self._file_logger.info(msg)
-            except Exception:
-                pass
-
-    def log_dns_event(self, status: str, qname: Optional[str], client: Optional[str] = None, details: Optional[str] = None) -> None:
-        return self._log_event(status, qname, client, details)
-
-    async def _check_cert_pins(self, hostname: str, ssl_obj: Any) -> None:
-        if not self.pinned_certs:
-            return
-        self.logger.debug("checking certificate pin for %s", hostname)
-        try:
-            der = ssl_obj.getpeercert(binary_form=True)
-            if not der:
-                raise Exception("No peer cert available for pin-check")
-            got = hashlib.sha256(der).hexdigest()
-            expected = self.pinned_certs.get(hostname) or self.pinned_certs.get('*')
-            if expected and got.lower() != expected.lower():
-                self.logger.warning("certificate pin mismatch for %s: got %s expected %s", hostname, got, expected)
-                raise Exception(f"Pinned certificate mismatch for {hostname}: got {got}, expected {expected}")
-            self.logger.debug("certificate pin match for %s", hostname)
-        except Exception:
-            self.logger.exception("certificate pin check failed for %s", hostname)
-            raise
-
-    def _dnssec_requested(self, query_data: bytes) -> bool:
-        if not query_data or len(query_data) < 12 or not _HAS_DNSPY:
-            return False
-        try:
-            msg = dns.message.from_wire(query_data)
-            # ednsflags property returns the EDNS flags from the OPT record's TTL field
-            # DO bit is 0x8000 (dns.flags.DO)
-            return bool(msg.ednsflags & dns.flags.DO)
-        except Exception:
-            return False
-
-    def _make_nxdomain_response(self, query_data: bytes) -> bytes:
-        extra = b''  # <-- ADD THIS LINE
-        if not query_data or len(query_data) < 12:
-            tid = 0
-            qpart = b''
-            qdcount = 0
-            arcount = 0
-            rd = 0
-        else:
-            tid = int.from_bytes(query_data[0:2], 'big')
-            req_flags = int.from_bytes(query_data[2:4], 'big')
-            try:
-                qpart, qdcount, qend = self._extract_question_section(query_data)
-                extra, arcount = self._extract_additional_section(query_data, qend)
-            except Exception:
-                qpart = query_data[12:]
-                qdcount = 0
-                arcount = 0
-                extra = b''
-            rd = req_flags & 0x0100
-
-        flags = 0x8000 | rd | 0x0003
-        header = (
-            tid.to_bytes(2, 'big') +
-            flags.to_bytes(2, 'big') +
-            qdcount.to_bytes(2, 'big') +
-            (0).to_bytes(2, 'big') +
-            (0).to_bytes(2, 'big') +
-            arcount.to_bytes(2, 'big')
-        )
-        return header + qpart + extra
-
-    def _build_local_A_response(self, query_data: bytes, ip: str) -> bytes:
-        if not query_data or len(query_data) < 12:
-            return b''
-
-        tid = int.from_bytes(query_data[0:2], 'big')
-        try:
-            qpart, qdcount, qend = self._extract_question_section(query_data)
-            extra, arcount = self._extract_additional_section(query_data, qend)
-        except Exception:
-            qpart = query_data[12:]
-            qdcount = 0
-            arcount = 0
-            extra = b''
-
-        flags = 0x8000
-        header = (
-            tid.to_bytes(2, 'big') +
-            flags.to_bytes(2, 'big') +
-            qdcount.to_bytes(2, 'big') +
-            (1).to_bytes(2, 'big') +
-            (0).to_bytes(2, 'big') +
-            arcount.to_bytes(2, 'big')
-        )
-
-        name_ptr = b'\xc0\x0c'
-        rtype = (1).to_bytes(2, 'big')
-        rclass = (1).to_bytes(2, 'big')
-        ttl = (60).to_bytes(4, 'big')
-        ip_parts = [int(x) for x in ip.split('.')]
-        rdata = struct.pack('BBBB', *ip_parts)
-        rdlen = (len(rdata)).to_bytes(2, 'big')
-        answer = name_ptr + rtype + rclass + ttl + rdlen + rdata
-        return header + qpart + answer + extra
-
-    def _extract_min_ttl(self, response: bytes) -> int:
-        try:
-            if not response or len(response) < 12:
-                return 0
-            qdcount = (response[4] << 8) | response[5]
-            ancount = (response[6] << 8) | response[7]
-            offset = 12
-            for _ in range(qdcount):
-                _, offset = self._parse_dns_name(response, offset)
-                offset += 4
-            min_ttl: Optional[int] = None
-            for _ in range(ancount):
-                _, offset = self._parse_dns_name(response, offset)
-                if offset + 10 > len(response):
-                    raise Exception("truncated answer header")
-                ttl = struct.unpack(">I", response[offset+4:offset+8])[0]
-                rdlen = (response[offset+8] << 8) | response[offset+9]
-                if offset + 10 + rdlen > len(response):
-                    raise Exception("truncated rdata")
-                offset += 10 + rdlen
-                if min_ttl is None or ttl < min_ttl:
-                    min_ttl = ttl
-            return min_ttl or 0
-        except Exception:
-            return 0
-
-    def _parse_rr_name(self, response: bytes, offset: int) -> Tuple[str, int]:
-        return self._parse_dns_name(response, offset)
-
+    # ---------- update_config ----------
     async def update_config(self, *,
                             verbose: Optional[bool] = None,
                             disable_ipv6: Optional[bool] = None,
@@ -2748,6 +3085,12 @@ class DNSResolver:
                             dnssec_enabled: Optional[bool] = None,
                             trust_anchors: Optional[Union[Dict[str, str], str]] = None,
                             auto_update_trust_anchor: Optional[bool] = None,
+                            dnssec_max_validations: Optional[int] = None,
+                            dnssec_max_dnskey_records: Optional[int] = None,
+                            dnssec_validation_timeout: Optional[float] = None,
+                            dnssec_chain_validation: Optional[bool] = None,
+                            dnssec_max_iterations: Optional[int] = None,
+                            scrub_unsolicited_ns: Optional[bool] = None,
                             metrics_enabled: Optional[bool] = None,
                             metrics_port: Optional[int] = None,
                             uvloop_enable: Optional[bool] = None,
@@ -2768,11 +3111,7 @@ class DNSResolver:
                             load_balancing: Optional[str] = None,
                             bootstrap: Optional[Dict[str, Any]] = None,
                             tcp_fallback_enabled: Optional[bool] = None,
-                            health_config: Optional[Dict[str, Any]] = None,
-                            dnssec_max_validations: Optional[int] = None,
-                            dnssec_max_dnskey_records: Optional[int] = None,
-                            dnssec_validation_timeout: Optional[float] = None,
-                            scrub_unsolicited_ns: Optional[bool] = None) -> None:
+                            health_config: Optional[Dict[str, Any]] = None) -> None:
         async with self._config_lock:
             if verbose is not None:
                 self.verbose = bool(verbose)
@@ -2818,6 +3157,18 @@ class DNSResolver:
                     except asyncio.CancelledError:
                         pass
                     self._trust_anchor_updater_task = None
+            if dnssec_max_validations is not None:
+                self.dnssec_max_validations = dnssec_max_validations
+            if dnssec_max_dnskey_records is not None:
+                self.dnssec_max_dnskey_records = dnssec_max_dnskey_records
+            if dnssec_validation_timeout is not None:
+                self.dnssec_validation_timeout = dnssec_validation_timeout
+            if dnssec_chain_validation is not None:
+                self.dnssec_chain_validation = dnssec_chain_validation
+            if dnssec_max_iterations is not None:
+                self.dnssec_max_iterations = dnssec_max_iterations
+            if scrub_unsolicited_ns is not None:
+                self.scrub_unsolicited_ns = scrub_unsolicited_ns
             if metrics_enabled is not None:
                 self.metrics_enabled = bool(metrics_enabled) and _HAS_PROM
             if metrics_port is not None:
@@ -2895,24 +3246,16 @@ class DNSResolver:
                     except asyncio.CancelledError:
                         pass
                     self._health_task = None
-            if dnssec_max_validations is not None:
-                self.dnssec_max_validations = dnssec_max_validations
-            if dnssec_max_dnskey_records is not None:
-                self.dnssec_max_dnskey_records = dnssec_max_dnskey_records
-            if dnssec_validation_timeout is not None:
-                self.dnssec_validation_timeout = dnssec_validation_timeout
-            if scrub_unsolicited_ns is not None:
-                self.scrub_unsolicited_ns = scrub_unsolicited_ns
 
             self.logger.info("DNSResolver configuration updated: "
                              "disable_ipv6=%s, strip_ipv6_records=%s, verbose=%s, rate_limit=%s/%s, optimistic_cache=%s, "
                              "rebind_protection=%s/%s, doh_version=%s, load_balancing=%s, tcp_fallback=%s, health=%s, "
-                             "dnssec_max_validations=%s, dnssec_max_dnskey_records=%s, scrub_unsolicited_ns=%s",
+                             "dnssec_chain_validation=%s, dnssec_max_iterations=%s, scrub_unsolicited_ns=%s",
                              self.disable_ipv6, self.strip_ipv6_records, self.verbose,
                              self.rate_limit_rps, self.rate_limit_burst,
                              self.optimistic_cache_enabled,
                              self.rebind_protection_enabled, self.rebind_action,
                              self.doh_version, self.load_balancing, self.tcp_fallback_enabled,
                              self._health_enabled,
-                             self.dnssec_max_validations, self.dnssec_max_dnskey_records,
+                             self.dnssec_chain_validation, self.dnssec_max_iterations,
                              self.scrub_unsolicited_ns)

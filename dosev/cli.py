@@ -1,7 +1,9 @@
+# dosev/cli.py – command‑line interface
 import os
 import sys
 import argparse
 from importlib.metadata import version
+
 from .config import load_config, _default_log_dir, get_default_config_path, write_default_config
 from .server import run_server_sync
 
@@ -14,7 +16,6 @@ def main() -> None:
                         help="Validate the configuration and exit without starting the server")
     parser.add_argument("--version", action="store_true",
                         help="Show version and exit")
-
     args = parser.parse_args()
 
     if args.version:
@@ -26,11 +27,10 @@ def main() -> None:
         return
 
     config_path = args.config
-
     if config_path == default_config and not os.path.exists(config_path):
         try:
             write_default_config(config_path)
-            print(f"Default configuration file created at:\n  {config_path}", file=sys.stderr)
+            print(f"Default configuration file created at:\n {config_path}", file=sys.stderr)
             print("Please edit it to your needs and restart dosev.", file=sys.stderr)
             sys.exit(0)
         except Exception as e:
@@ -68,6 +68,8 @@ def main() -> None:
         dnssec_max_validations=config.get("dnssec_max_validations", 32),
         dnssec_max_dnskey_records=config.get("dnssec_max_dnskey_records", 8),
         dnssec_validation_timeout=config.get("dnssec_validation_timeout", 2.0),
+        dnssec_chain_validation=config.get("dnssec_chain_validation", True),
+        dnssec_max_iterations=config.get("dnssec_max_iterations", 100),
         dns_scrub_unsolicited_ns=config.get("dns_scrub_unsolicited_ns", True),
         metrics_enabled=config.get("metrics_enabled", False),
         metrics_port=config.get("metrics_port", 8000),

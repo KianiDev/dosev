@@ -1,3 +1,4 @@
+# dosev/config.py – configuration loading and default content
 import os
 import sys
 import configparser
@@ -9,7 +10,6 @@ DEFAULT_CONFIG_CONTENT = """#
 # dosev configuration file
 # All paths can be absolute or relative to the working directory.
 #
-
 # ============================================================================
 # SERVER – local listener settings
 # ============================================================================
@@ -86,23 +86,19 @@ optimistic_cache_enabled = false
 optimistic_stale_max_age = 86400
 # TTL to set on stale responses (to prevent client caching).
 optimistic_stale_response_ttl = 30
-
 # Connection pooling for TCP/TLS/HTTP/2/HTTP/3/DoQ.
 pool_max_size = 5
 pool_idle_timeout = 60.0
-
 # DoH version preference: auto, 1.1, 2, or 3.
 doh_version = auto
 # TTL for caching the DoH version auto‑detection result.
 doh_auto_cache_ttl = 3600
-
 # Upstream selection strategy: failover, parallel, random, roundrobin.
 # - failover: try upstreams in order until one succeeds.
 # - parallel: query all upstreams concurrently, return the first successful response.
 # - random: pick a random upstream for each query.
 # - roundrobin: cycle through upstreams in order.
 load_balancing = failover
-
 # Automatically retry a UDP query over TCP if the response has the TC (truncation) bit set.
 tcp_fallback_enabled = true
 
@@ -135,7 +131,6 @@ dnssec_enabled = false
 auto_update_trust_anchor = true
 # Path to a file containing additional trust anchors (DNSKEY or DS records).
 trust_anchors_file =
-
 # DNSSEC KeyTrap mitigation (CVE-2023-50387):
 # Limit the number of signatures validated per response.
 # Set to 0 to disable limits (not recommended).
@@ -144,19 +139,20 @@ dnssec_max_validations = 32
 dnssec_max_dnskey_records = 8
 # Timeout in seconds for DNSSEC validation operations.
 dnssec_validation_timeout = 2.0
-
+# Enable the new recursive chain‑of‑trust validation (fetches DS/DNSKEY).
+# If false, falls back to the legacy static validation using only the root anchor.
+dnssec_chain_validation = true
+# Maximum number of iterations (validation steps) to prevent infinite loops.
+dnssec_max_iterations = 100
 # Scrub unsolicited NS records from authority section to prevent cache poisoning.
 # See: CVE-2025-11411, RFC 2181 Section 5.4.1
 dns_scrub_unsolicited_ns = true
-
 # Certificate pinning: comma‑separated list of host=sha256(der) pairs.
 pinned_certs =
-
 # Rebinding protection: prevent responses containing private IPs.
 rebind_protection = false
 # Action: strip (remove private IPs) or block (return NXDOMAIN).
 rebind_action = strip
-
 # Privilege drop (only works on Unix when run as root).
 dns_privilege_drop_user =
 dns_privilege_drop_group =
@@ -207,20 +203,20 @@ retries = 2
 #   doh_version – 1.1, 2, 3, or auto (default: auto)
 #
 # Example with fixed IP (no DNS resolution needed):
-# [upstreams.cloudflare]
-# address = cloudflare-dns.com
-# protocol = https
-# port = 443
-# ip = 1.1.1.1
-# doh_version = auto
+#   [upstreams.cloudflare]
+#   address = cloudflare-dns.com
+#   protocol = https
+#   port = 443
+#   ip = 1.1.1.1
+#   doh_version = auto
 #
 # Example without fixed IP (uses bootstrap servers to resolve):
-# [upstreams.google]
-# address = dns.google
-# protocol = https
-# port = 443
-# doh_version = auto
-#
+#   [upstreams.google]
+#   address = dns.google
+#   protocol = https
+#   port = 443
+#   doh_version = auto
+
 [upstreams]
 # List the active upstreams (comma‑separated names from sections above)
 servers =
@@ -293,12 +289,15 @@ def _validate_and_warn(config: Dict[str, Any]) -> None:
 
     if config.get('dns_enable_dot', False) or config.get('dns_enable_doh', False):
         if config.get('protocol') == 'udp':
-            warnings.warn('Secure listeners are enabled while the main resolver protocol is udp; this is usually intentional but verify your upstream defaults.', RuntimeWarning)
+            warnings.warn(
+                'Secure listeners are enabled while the main resolver protocol is udp; '
+                'this is usually intentional but verify your upstream defaults.',
+                RuntimeWarning
+            )
 
     rate_limit_rps = config.get('rate_limit_rps', 0.0)
     if rate_limit_rps < 0:
         raise ValueError('rate_limit_rps must be non-negative')
-
     rate_limit_burst = config.get('rate_limit_burst', 0.0)
     if rate_limit_burst < 0:
         raise ValueError('rate_limit_burst must be non-negative')
@@ -332,21 +331,26 @@ def _validate_and_warn(config: Dict[str, Any]) -> None:
         if cooldown < 0:
             raise ValueError('health.cooldown must be non‑negative')
 
-    # DNSSEC validation limits (must be non-negative)
+    # DNSSEC validation limits
     dnssec_max_validations = config.get('dnssec_max_validations', 32)
     if dnssec_max_validations < 0:
         raise ValueError('dnssec_max_validations must be non-negative')
-
     dnssec_max_dnskey_records = config.get('dnssec_max_dnskey_records', 8)
     if dnssec_max_dnskey_records < 0:
         raise ValueError('dnssec_max_dnskey_records must be non-negative')
-
     dnssec_validation_timeout = config.get('dnssec_validation_timeout', 2.0)
     if dnssec_validation_timeout <= 0:
         raise ValueError('dnssec_validation_timeout must be positive')
+    dnssec_chain_validation = config.get('dnssec_chain_validation', True)
+    if not isinstance(dnssec_chain_validation, bool):
+        raise ValueError('dnssec_chain_validation must be boolean')
+    dnssec_max_iterations = config.get('dnssec_max_iterations', 100)
+    if dnssec_max_iterations < 0:
+        raise ValueError('dnssec_max_iterations must be non-negative')
 
 def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     config = configparser.ConfigParser()
+
     if not os.path.exists(path):
         # Return defaults
         return {
@@ -371,6 +375,8 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
             'dnssec_max_validations': 32,
             'dnssec_max_dnskey_records': 8,
             'dnssec_validation_timeout': 2.0,
+            'dnssec_chain_validation': True,
+            'dnssec_max_iterations': 100,
             'dns_scrub_unsolicited_ns': True,
             'metrics_enabled': False,
             'metrics_port': 8000,
@@ -396,7 +402,11 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
             'doh_auto_cache_ttl': 3600,
             'load_balancing': 'failover',
             'tcp_fallback_enabled': True,
-            'bootstrap': {'servers': ['1.1.1.1:53', '8.8.8.8:53'], 'timeout': 2.0, 'retries': 2},
+            'bootstrap': {
+                'servers': ['1.1.1.1:53', '8.8.8.8:53'],
+                'timeout': 2.0,
+                'retries': 2,
+            },
             'blocklists': {
                 'enabled': False,
                 'urls': [],
@@ -437,6 +447,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     dns_doh_key_file = config.get('resolver', 'dns_doh_key_file', fallback='')
     dns_doh_path = config.get('resolver', 'dns_doh_path', fallback='/dns-query')
     dns_enable_http3 = config.getboolean('resolver', 'dns_enable_http3', fallback=False)
+
     strip_ipv6_records_raw = config.get('resolver', 'strip_ipv6_records', fallback=None)
     strip_ipv6_records = None if strip_ipv6_records_raw is None else config.getboolean('resolver', 'strip_ipv6_records', fallback=None)
 
@@ -475,6 +486,8 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     dnssec_max_validations = config.getint('security', 'dnssec_max_validations', fallback=32)
     dnssec_max_dnskey_records = config.getint('security', 'dnssec_max_dnskey_records', fallback=8)
     dnssec_validation_timeout = config.getfloat('security', 'dnssec_validation_timeout', fallback=2.0)
+    dnssec_chain_validation = config.getboolean('security', 'dnssec_chain_validation', fallback=True)
+    dnssec_max_iterations = config.getint('security', 'dnssec_max_iterations', fallback=100)
     dns_scrub_unsolicited_ns = config.getboolean('security', 'dns_scrub_unsolicited_ns', fallback=True)
 
     pinned_raw = config.get('security', 'pinned_certs', fallback='')
@@ -621,6 +634,8 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
         'dnssec_max_validations': dnssec_max_validations,
         'dnssec_max_dnskey_records': dnssec_max_dnskey_records,
         'dnssec_validation_timeout': dnssec_validation_timeout,
+        'dnssec_chain_validation': dnssec_chain_validation,
+        'dnssec_max_iterations': dnssec_max_iterations,
         'dns_scrub_unsolicited_ns': dns_scrub_unsolicited_ns,
         'metrics_enabled': metrics_enabled,
         'metrics_port': metrics_port,
