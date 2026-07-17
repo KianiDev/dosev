@@ -1657,49 +1657,36 @@ class DNSResolver:
                     return await self._process_upstream_response(
                         upstream, data, qname, dnssec_requested, key, orig_id)
             tasks = [asyncio.create_task(bounded_task(upstream)) for upstream in upstream_list]
+            pending = set(tasks)
+            last_exc = None
             try:
-                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                for t in done:
-                    if not t.cancelled():
-                        try:
-                            result = t.result()
-                            for p in pending:
-                                p.cancel()
-                            return result
-                        except Exception as e:
-                            pass
+                while pending:
+                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    for task in done:
+                        if not task.cancelled():
+                            try:
+                                result = task.result()
+                                # Success – cancel remaining tasks and clean up
+                                for p in pending:
+                                    p.cancel()
+                                if pending:
+                                    await asyncio.gather(*pending, return_exceptions=True)
+                                return result
+                            except Exception as e:
+                                # This task failed – record error, continue with others
+                                last_exc = e
+                                continue
+                # All tasks completed without a single success
                 raise last_exc or Exception("All upstreams failed in parallel")
             except Exception as e:
+                # Cancel remaining tasks on any unhandled exception
                 for t in tasks:
                     if not t.done():
                         t.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+                # Wait for them to finish cancelling
+                if any(not t.done() for t in tasks):
+                    await asyncio.gather(*tasks, return_exceptions=True)
                 raise e
-
-        elif strategy == 'random':
-            import random
-            upstream = random.choice(upstream_list)
-            try:
-                return await self._process_upstream_response(
-                    upstream, data, qname, dnssec_requested, key, orig_id)
-            except Exception as e:
-                last_exc = e
-                self.logger.debug("random upstream %s failed: %s", upstream.get('address'), e)
-                raise last_exc
-
-        elif strategy == 'roundrobin':
-            idx = self._rr_index % len(upstream_list)
-            upstream = upstream_list[idx]
-            self._rr_index += 1
-            try:
-                return await self._process_upstream_response(
-                    upstream, data, qname, dnssec_requested, key, orig_id)
-            except Exception as e:
-                last_exc = e
-                self.logger.debug("roundrobin upstream %s failed: %s", upstream.get('address'), e)
-                raise last_exc
-        else:
-            raise ValueError(f"Unknown load balancing strategy: {strategy}")
 
     async def _process_upstream_response(self, upstream: Dict[str, Any], data: bytes,
                                          qname: str, dnssec_requested: bool,
