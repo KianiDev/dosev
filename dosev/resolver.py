@@ -1512,32 +1512,30 @@ class DNSResolver:
         if not has_rrsig:
             return False, True
 
-        # For each RRset in the answer, validate its RRSIGs
-        # We need to validate the chain for each signer
         validation_counter = 0
         max_validations = self.dnssec_max_validations if self.dnssec_max_validations > 0 else 999999
 
-        # Group RRsets by their signer (the zone that signed them)
+        # For each RRset in the answer, validate its RRSIGs
         for rrset in msg.answer:
             if rrset.rdtype == dns.rdatatype.RRSIG:
                 continue
 
-            # Find the RRSIG for this RRset
-            sig = None
+            # Find the matching RRSIG record (not the RRset)
+            sig_record = None
             for rr in msg.answer:
                 if rr.rdtype == dns.rdatatype.RRSIG and rr.name == rrset.name:
                     for r in rr:
                         if r.type_covered == rrset.rdtype:
-                            sig = rr
+                            sig_record = r
                             break
-                    if sig:
+                    if sig_record:
                         break
 
-            if sig is None:
+            if sig_record is None:
                 raise dns.dnssec.ValidationFailure(f"No RRSIG for rrset {rrset.name}")
 
             # Determine the signer (the zone that signed)
-            signer_name = str(sig.signer).lower().rstrip('.')
+            signer_name = str(sig_record.signer).lower().rstrip('.')
 
             # Get the validated DNSKEY for the signer
             key_rrset = await self._get_validated_dnskey(signer_name)
@@ -1546,7 +1544,6 @@ class DNSResolver:
                 self.logger.debug("No validated key for signer %s, treating as insecure", signer_name)
                 return False, True
 
-            # Validate the RRSIG with the key
             validation_counter += 1
             if validation_counter > max_validations:
                 self.logger.warning("DNSSEC validation limit (%d) exceeded for %s, treating as insecure",
@@ -1554,11 +1551,13 @@ class DNSResolver:
                 return False, True
 
             try:
-                dns.dnssec.validate(rrset, sig, {dns.name.root: key_rrset})
+                # Validate the RRset against the RRSIG using the key RRset
+                # We need to pass a dictionary mapping signer name to key RRset
+                dns.dnssec.validate(rrset, sig_record, {signer_name: key_rrset})
             except dns.dnssec.ValidationFailure:
-                # Try with the raw anchors if the signer is the root
+                # If signer is root, try with the raw anchors
                 if signer_name == "." or signer_name == "":
-                    dns.dnssec.validate(rrset, sig, self._dnssec_raw_anchors)
+                    dns.dnssec.validate(rrset, sig_record, self._dnssec_raw_anchors)
                 else:
                     raise
 
@@ -2752,10 +2751,8 @@ class DNSResolver:
             msg = dns.message.from_wire(query_data)
             if msg.opt is None:
                 return False
-            for rr in msg.opt:
-                if hasattr(rr, 'flags'):
-                    return bool(rr.flags & dns.flags.DO)
-            return False
+            # The DO flag is stored in the opt.flags attribute
+            return bool(msg.opt.flags & dns.flags.DO)
         except Exception:
             return False
 
