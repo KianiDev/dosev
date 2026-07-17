@@ -1847,17 +1847,29 @@ class DNSResolver:
     # ---------- forward_dns_query ----------
     async def forward_dns_query(self, data: bytes) -> bytes:
         original_data = data
+
+        # === Check CD flag BEFORE normalization ===
+        cd_flag = False
+        if len(original_data) >= 4:
+            flags = int.from_bytes(original_data[2:4], 'big')
+            cd_flag = bool(flags & 0x0010)   # Checking Disabled bit
+
+        # Normalize the query (strip ECS, etc.) – this does NOT change flags
         data = self._normalize_query_for_forward(data)
+
+        # === If CD was set, ensure it remains set in the forwarded query ===
+        if cd_flag:
+            flags = int.from_bytes(data[2:4], 'big')
+            flags |= 0x0010  # Set CD bit
+            data = data[:2] + flags.to_bytes(2, 'big') + data[4:]
+
         qname = self._extract_qname_from_wire(data)
         qtype = self._extract_qtype_from_wire(data) or 1
         key = self._build_cache_key(data)
         orig_id = int.from_bytes(data[:2], 'big')
 
         dnssec_requested = self._dnssec_requested(original_data)
-        cd_flag = False
-        if len(original_data) >= 4:
-            flags = int.from_bytes(original_data[2:4], 'big')
-            cd_flag = bool(flags & 0x0010)
+        # If client set CD, we must NOT validate locally – but we still forward with CD=1
         if cd_flag:
             dnssec_requested = False
 
@@ -1887,10 +1899,17 @@ class DNSResolver:
         strategy = self.load_balancing
         try:
             resp = await self._execute_strategy(strategy, upstream_list, data, qname, dnssec_requested, key, orig_id)
-            return resp
         except Exception as e:
             self.logger.error("Upstream query failed: %s", e)
             raise
+
+        # === RFC 4035: copy CD bit from original query to response ===
+        if cd_flag and len(resp) >= 4:
+            flags = int.from_bytes(resp[2:4], 'big')
+            flags |= 0x0010  # Set CD bit
+            resp = resp[:2] + flags.to_bytes(2, 'big') + resp[4:]
+
+        return resp
 
     # ---------- Helper methods for forward_dns_query ----------
     async def _check_hosts_and_blocklists(self, qname: str, qtype: int, original_data: bytes) -> Optional[bytes]:
@@ -3041,7 +3060,7 @@ class DNSResolver:
                 flags = 0x8000
                 name_ptr = b'\xc0\x0c'
                 if qtype == 1:
-                    # A record – 1 answer
+                    # A – 1 answer
                     header = tid.to_bytes(2, 'big') + flags.to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (0).to_bytes(2, 'big') + (0).to_bytes(2, 'big')
                     rtype = (1).to_bytes(2, 'big')
                     rclass = (1).to_bytes(2, 'big')
@@ -3051,7 +3070,7 @@ class DNSResolver:
                     ans = name_ptr + rtype + rclass + ttl + rdlen + rdata
                     return header + qpart + ans
                 elif qtype == 28:
-                    # AAAA record – 1 answer
+                    # AAAA – 1 answer
                     if self.disable_ipv6:
                         return self._make_nxdomain_response(request_data)
                     header = tid.to_bytes(2, 'big') + flags.to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (0).to_bytes(2, 'big') + (0).to_bytes(2, 'big')
@@ -3063,10 +3082,10 @@ class DNSResolver:
                     ans = name_ptr + rtype + rclass + ttl + rdlen + rdata
                     return header + qpart + ans
                 elif qtype == 255:
-                    # ANY query – answer count depends on whether IPv6 is disabled
+                    # ANY – answer count depends on IPv6 disable
                     a_ans = name_ptr + (1).to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (60).to_bytes(4, 'big') + (4).to_bytes(2, 'big') + b'\x00\x00\x00\x00'
                     if self.disable_ipv6:
-                        # Only A record – 1 answer
+                        # Only A – 1 answer
                         header = tid.to_bytes(2, 'big') + flags.to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (0).to_bytes(2, 'big') + (0).to_bytes(2, 'big')
                         return header + qpart + a_ans
                     else:
