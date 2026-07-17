@@ -1,16 +1,3 @@
-# dosev/resolver.py – DNSSEC‑chain‑of‑trust version with NSEC3 support
-# RFC compliance fixes applied: EDNS0, DNSSEC unsigned, negative cache TTL, TC bit
-# Added: DoQ connection pooling, IPv6 stripping, HTTP/3 client (already present)
-# Added: Upstream selection strategies (failover, parallel, random, roundrobin)
-# Added: Health checks (circuit breaker) and TCP fallback on truncation
-# Added: DNSSEC CD flag support (respect client's CD bit)
-# Added: Full DNSSEC chain‑of‑trust validation with NSEC3 opt‑out support
-# Added: Validating resolver – fetches DS and DNSKEY records recursively
-# Fixed: parallel load‑balancing strategy – now properly waits for remaining tasks and cleans up
-# Refactored: forward_dns_query split into helpers for maintainability
-# Fixed: ConnectionPool.stop() and ClientPool.stop() now iterate over items, remove entries one by one,
-#        and await the cleanup task cancellation.
-
 import asyncio
 import logging
 import socket
@@ -515,6 +502,10 @@ class DNSResolver:
         self._h3_pool: ClientPool = ClientPool(max_size=pool_max_size, idle_timeout=pool_idle_timeout)
         self._quic_pool: ClientPool = ClientPool(max_size=pool_max_size, idle_timeout=pool_idle_timeout)
 
+        # Persistent UDP sockets cache
+        self._udp_sockets: Dict[Tuple[str, int], socket.socket] = {}
+        self._udp_sockets_lock: asyncio.Lock = asyncio.Lock()
+
         self.doh_version: str = doh_version
         self.doh_auto_cache_ttl: int = doh_auto_cache_ttl
         self._doh_auto_cache: Dict[str, Tuple[str, float]] = {}
@@ -644,6 +635,14 @@ class DNSResolver:
         await self._h2_pool.stop()
         await self._h3_pool.stop()
         await self._quic_pool.stop()
+        # Close all persistent UDP sockets
+        async with self._udp_sockets_lock:
+            for sock in self._udp_sockets.values():
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            self._udp_sockets.clear()
 
     async def stop_background_tasks(self) -> None:
         if self._trust_anchor_updater_task is not None:
@@ -1848,7 +1847,7 @@ class DNSResolver:
     async def forward_dns_query(self, data: bytes) -> bytes:
         original_data = data
 
-        # === Check CD flag BEFORE normalization ===
+        # === Check CD flag BEFORE normalization (RFC 4035) ===
         cd_flag = False
         if len(original_data) >= 4:
             flags = int.from_bytes(original_data[2:4], 'big')
@@ -2109,47 +2108,76 @@ class DNSResolver:
         return self._set_query_id(resp, orig_id)
 
     # ---------- Forwarding implementations ----------
+    async def _get_udp_socket(self, key: Tuple[str, int]) -> socket.socket:
+        """Get a connected UDP socket for a given upstream, creating one if needed."""
+        async with self._udp_sockets_lock:
+            if key in self._udp_sockets:
+                sock = self._udp_sockets[key]
+                # Check if the socket is still valid
+                try:
+                    sock.getpeername()
+                    return sock
+                except (OSError, socket.error):
+                    # Socket is dead, remove it and create a new one
+                    del self._udp_sockets[key]
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+
+            # Create a new connected UDP socket
+            resolved, port = key
+            family = socket.AF_INET6 if self._is_ipv6_address(resolved) else socket.AF_INET
+            if self.disable_ipv6 and self._is_ipv6_address(resolved):
+                raise Exception("IPv6 disabled but resolved to IPv6")
+
+            sock = socket.socket(family, socket.SOCK_DGRAM)
+            sock.setblocking(False)
+
+            try:
+                # Connect the socket. This is a synchronous call but is fast.
+                sock.connect((resolved, port))
+            except Exception as e:
+                sock.close()
+                raise e
+
+            self._udp_sockets[key] = sock
+            return sock
+
     async def _forward_udp(self, data: bytes, upstream: Dict[str, Any]) -> bytes:
         host = upstream['address']
         port = upstream.get('port', 53)
         ip_override = upstream.get('ip')
+
+        # 1. Resolve the upstream IP address
         resolved = await self._resolve_upstream_ip(host, ip_override)
-        family = socket.AF_INET6 if self._is_ipv6_address(resolved) else socket.AF_INET
-        if self.disable_ipv6 and self._is_ipv6_address(resolved):
-            raise Exception("IPv6 disabled but resolved to IPv6")
+
+        # 2. Create a unique key for this upstream (using the resolved IP to avoid re-resolving)
+        key = (resolved, int(port))
+
+        # 3. Get or create a connected socket from the cache
+        sock = await self._get_udp_socket(key)
+
         loop = asyncio.get_running_loop()
-
-        on_response: asyncio.Future[bytes] = loop.create_future()
-
-        class _Proto(asyncio.DatagramProtocol):
-            def __init__(self) -> None:
-                self.transport: Optional[asyncio.DatagramTransport] = None
-
-            def connection_made(self, transport: asyncio.DatagramTransport) -> None:
-                self.transport = transport
-                try:
-                    transport.sendto(data)
-                except Exception as e:
-                    if not on_response.done():
-                        on_response.set_exception(e)
-
-            def datagram_received(self, data: bytes, addr: Tuple[str, int]) -> None:
-                if not on_response.done():
-                    on_response.set_result(data)
-
-            def error_received(self, exc: Exception) -> None:
-                if not on_response.done():
-                    on_response.set_exception(exc)
-
-            def connection_lost(self, exc: Optional[Exception]) -> None:
-                if exc and not on_response.done():
-                    on_response.set_exception(exc)
-
-        transport, _ = await loop.create_datagram_endpoint(lambda: _Proto(), remote_addr=(resolved, int(port)), family=family)
         try:
-            return await asyncio.wait_for(on_response, timeout=self.udp_timeout)
-        finally:
-            transport.close()
+            # 4. Send the query (no address needed for a connected socket)
+            await loop.sock_sendall(sock, data)
+
+            # 5. Receive the response with timeout
+            response, _ = await asyncio.wait_for(
+                loop.sock_recvfrom(sock, self.max_edns_payload or 4096),
+                timeout=self.udp_timeout
+            )
+            return response
+        except (OSError, socket.error) as e:
+            # If the socket is broken, remove it from the cache so a new one is created
+            if key in self._udp_sockets:
+                del self._udp_sockets[key]
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            raise e
 
     async def _forward_tcp(self, data: bytes, upstream: Dict[str, Any]) -> bytes:
         host = upstream['address']
@@ -3060,7 +3088,7 @@ class DNSResolver:
                 flags = 0x8000
                 name_ptr = b'\xc0\x0c'
                 if qtype == 1:
-                    # A – 1 answer
+                    # A record – 1 answer
                     header = tid.to_bytes(2, 'big') + flags.to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (0).to_bytes(2, 'big') + (0).to_bytes(2, 'big')
                     rtype = (1).to_bytes(2, 'big')
                     rclass = (1).to_bytes(2, 'big')
@@ -3070,7 +3098,7 @@ class DNSResolver:
                     ans = name_ptr + rtype + rclass + ttl + rdlen + rdata
                     return header + qpart + ans
                 elif qtype == 28:
-                    # AAAA – 1 answer
+                    # AAAA record – 1 answer
                     if self.disable_ipv6:
                         return self._make_nxdomain_response(request_data)
                     header = tid.to_bytes(2, 'big') + flags.to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (0).to_bytes(2, 'big') + (0).to_bytes(2, 'big')
@@ -3082,10 +3110,10 @@ class DNSResolver:
                     ans = name_ptr + rtype + rclass + ttl + rdlen + rdata
                     return header + qpart + ans
                 elif qtype == 255:
-                    # ANY – answer count depends on IPv6 disable
+                    # ANY query – answer count depends on whether IPv6 is disabled
                     a_ans = name_ptr + (1).to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (60).to_bytes(4, 'big') + (4).to_bytes(2, 'big') + b'\x00\x00\x00\x00'
                     if self.disable_ipv6:
-                        # Only A – 1 answer
+                        # Only A record – 1 answer
                         header = tid.to_bytes(2, 'big') + flags.to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (0).to_bytes(2, 'big') + (0).to_bytes(2, 'big')
                         return header + qpart + a_ans
                     else:
