@@ -76,19 +76,16 @@ async def test_forward_udp_uses_ip_override():
     }
     data = dns.message.make_query("test.com", "A").to_wire()
 
-    # Mock _resolve_upstream_ip to verify call
     with patch.object(resolver, "_resolve_upstream_ip") as mock_resolve:
         mock_resolve.return_value = "192.0.2.1"
-        # Mock the datagram endpoint to avoid real UDP and return dummy response
+
+        mock_sock = MagicMock()
         loop = asyncio.get_running_loop()
-        def fake_create_datagram_endpoint(protocol_factory, remote_addr, **kwargs):
-            proto = protocol_factory()
-            loop.call_soon(proto.datagram_received, b"dummy_response", ("192.0.2.1", 5353))
-            return MagicMock(), None
-        with patch.object(loop, "create_datagram_endpoint", side_effect=fake_create_datagram_endpoint):
-            result = await resolver._forward_udp(data, upstream)
-            assert result == b"dummy_response"
-            mock_resolve.assert_called_once_with("example.com", "192.0.2.1")
+        with patch.object(loop, "sock_recvfrom", new=AsyncMock(return_value=(b"dummy_response", ("192.0.2.1", 5353)))):
+            with patch.object(resolver, "_get_udp_socket", new=AsyncMock(return_value=mock_sock)):
+                result = await resolver._forward_udp(data, upstream)
+                assert result == b"dummy_response"
+                mock_resolve.assert_called_once_with("example.com", "192.0.2.1")
 
 
 @pytest.mark.asyncio

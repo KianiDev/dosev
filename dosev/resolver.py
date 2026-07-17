@@ -1399,8 +1399,8 @@ class DNSResolver:
             # No DS -> insecure
             return None
 
-        # Cache with TTL from the record
-        ttl = min([rr.ttl for rr in ds_rrset]) if ds_rrset else 300
+        # Cache with TTL from the RRset
+        ttl = ds_rrset.ttl if ds_rrset else 300
         async with self._dnssec_cache_lock:
             self._dnssec_ds_cache[cache_key] = (ds_rrset, time.time() + ttl)
         return ds_rrset
@@ -1438,58 +1438,42 @@ class DNSResolver:
         if msg is None:
             return False
 
-        # Collect NSEC3 records
-        nsec3_records = []
+        # Collect NSEC3 RRsets (not individual records)
+        nsec3_rrsets = []
         for rrset in msg.authority:
             if rrset.rdtype == dns.rdatatype.NSEC3:
-                for rr in rrset:
-                    nsec3_records.append(rr)
-            elif rrset.rdtype == dns.rdatatype.NSEC3PARAM:
-                # NSEC3PARAM indicates we should use NSEC3
-                pass
+                nsec3_rrsets.append(rrset)
 
-        if not nsec3_records:
+        if not nsec3_rrsets:
             return False
 
-        # Find NSEC3 records that cover the zone name
-        # NSEC3 records in the authority section are in order by hashed name
-        # We need to find the one that covers the hash of the zone name
-        # For opt-out, we need to check if the covering NSEC3 has the opt-out flag set
-        # and if the target is not in the covered range.
+        # Sort RRsets by owner name
+        nsec3_rrsets.sort(key=lambda rrset: str(rrset.name).lower())
 
-        # Get the NSEC3 parameters from the first record
-        first_nsec3 = nsec3_records[0]
-        salt = first_nsec3.salt
-        iterations = first_nsec3.iterations
-        algorithm = first_nsec3.algorithm
+        # Get NSEC3 parameters from the first RRset's first record
+        first_rrset = nsec3_rrsets[0]
+        first_rr = first_rrset[0]
+        salt = first_rr.salt
+        iterations = first_rr.iterations
+        algorithm = first_rr.algorithm
 
         # Hash the zone name
         zone_hash = self._nsec3_hash(zone, salt, iterations, algorithm)
-        # Hash is in lowercase; NSEC3 owner names are also in lowercase base32hex
-        # We need to find the NSEC3 whose hash is <= zone_hash < next_hash
 
-        # Sort by owner name (which is the hash)
-        nsec3_records.sort(key=lambda rr: str(rr.name).lower())
+        for rrset in nsec3_rrsets:
+            for rr in rrset:
+                rr_name = str(rrset.name).lower().rstrip('.')
+                hash_part = rr_name.split('.')[0]
+                next_hash = rr.next.to_text().lower()
 
-        for idx, rr in enumerate(nsec3_records):
-            rr_name = str(rr.name).lower().rstrip('.')
-            # Extract the hash from the name (everything before the zone suffix)
-            hash_part = rr_name.split('.')[0]
-            next_hash = rr.next.to_text().lower()
+                if hash_part <= zone_hash < next_hash:
+                    if rr.flags & NSEC3_OPT_OUT:
+                        if not self._nsec3_bitmap_contains(rr.windows, dns.rdatatype.DS):
+                            async with self._dnssec_cache_lock:
+                                self._dnssec_insecure_cache.add(zone)
+                            return True
+                    return False
 
-            if hash_part <= zone_hash < next_hash:
-                # Check if this NSEC3 has the opt-out flag
-                if rr.flags & NSEC3_OPT_OUT:
-                    # Check if the bitmap covers the DS type
-                    if not self._nsec3_bitmap_contains(rr.windows, dns.rdatatype.DS):
-                        # No DS at this name, and opt-out means we can treat as insecure
-                        async with self._dnssec_cache_lock:
-                            self._dnssec_insecure_cache.add(zone)
-                        return True
-                # If no opt-out, we must have DS records
-                return False
-
-        # If we didn't find a covering NSEC3, fallback to insecure
         return False
 
     async def _dnssec_validate_chain(self, qname: str, response_wire: bytes, dnssec_requested: bool = True) -> Tuple[bool, bool]:
@@ -1551,13 +1535,12 @@ class DNSResolver:
                 return False, True
 
             try:
-                # Validate the RRset against the RRSIG using the key RRset
-                # We need to pass a dictionary mapping signer name to key RRset
-                dns.dnssec.validate(rrset, sig_record, {signer_name: key_rrset})
+                # Use validate_rrsig which accepts an RRset and a single RRSIG rdata
+                dns.dnssec.validate_rrsig(rrset, sig_record, {signer_name: key_rrset})
             except dns.dnssec.ValidationFailure:
                 # If signer is root, try with the raw anchors
                 if signer_name == "." or signer_name == "":
-                    dns.dnssec.validate(rrset, sig_record, self._dnssec_raw_anchors)
+                    dns.dnssec.validate_rrsig(rrset, sig_record, self._dnssec_raw_anchors)
                 else:
                     raise
 
@@ -2749,10 +2732,10 @@ class DNSResolver:
             return False
         try:
             msg = dns.message.from_wire(query_data)
-            if msg.opt is None:
+            if msg.opt is None or len(msg.opt) == 0:
                 return False
-            # The DO flag is stored in the opt.flags attribute
-            return bool(msg.opt.flags & dns.flags.DO)
+            # The DO flag is on the OPT rdata's flags attribute
+            return bool(msg.opt[0].flags & dns.flags.DO)
         except Exception:
             return False
 

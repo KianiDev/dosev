@@ -145,6 +145,7 @@ class TestDNSSECChain(unittest.IsolatedAsyncioTestCase):
         )
         # The above NSEC3 has flags=0, we need to set opt‑out flag (0x01) manually.
         # We'll create the RR from scratch.
+        # Create NSEC3 record with opt‑out flag and no DS in bitmap.
         nsec3 = dns.rdtypes.ANY.NSEC3.NSEC3(
             rdclass=dns.rdataclass.IN,
             rdtype=dns.rdatatype.NSEC3,
@@ -153,7 +154,7 @@ class TestDNSSECChain(unittest.IsolatedAsyncioTestCase):
             iterations=0,
             salt=b'',
             next=b'aaaaaaaaaaaaaaaa',  # next hash
-            windows=b'\x00\x01\x00'   # bitmap: A only, no DS
+            windows=[(0, b'\x00')]     # bitmap: no types (including DS)
         )
         nsec3_rrset = dns.rrset.RRset(dns.name.from_text("aaaaaaaaaaaaaaaa.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
         nsec3_rrset.ttl = 3600

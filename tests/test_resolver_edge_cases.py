@@ -77,8 +77,10 @@ async def test_forward_udp_connection_lost():
         upstreams=[{"address": "1.1.1.1", "protocol": "udp", "port": 53, "ip": "1.1.1.1"}]
     )
     data = dns.message.make_query("example.com", "A").to_wire()
-    loop = asyncio.get_running_loop()
-    with patch.object(loop, "create_datagram_endpoint", new=AsyncMock(side_effect=ConnectionError("Lost"))):
+
+    mock_sock = MagicMock()
+    mock_sock.sendall = MagicMock(side_effect=ConnectionError("Lost"))
+    with patch.object(resolver, "_get_udp_socket", new=AsyncMock(return_value=mock_sock)):
         with pytest.raises(ConnectionError, match="Lost"):
             await resolver._forward_udp(data, resolver.upstreams[0])
 
