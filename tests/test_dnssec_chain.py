@@ -8,6 +8,7 @@ import asyncio
 import unittest
 from unittest.mock import patch, MagicMock, AsyncMock
 import time
+import calendar
 
 import dns.message
 import dns.rrset
@@ -42,10 +43,9 @@ class TestDNSSECChain(unittest.IsolatedAsyncioTestCase):
             dnssec_max_validations=10,
             dnssec_max_dnskey_records=5,
             dnssec_validation_timeout=2.0,
-            trust_anchors=None,  # uses default root key
+            trust_anchors=None,
         )
 
-        # Mock the internal _dnssec_lookup to return pre‑canned responses
         ds_rrset = make_ds_rrset(
             "example.com",
             key_tag=12345,
@@ -60,12 +60,13 @@ class TestDNSSECChain(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch('dns.dnssec.validate_rrsig', return_value=None) as mock_validate:
+            # Mocks must match the resolver's internal names (no trailing dot)
             async def fake_lookup(qname, rdtype, dnssec_ok=False):
-                if rdtype == dns.rdatatype.DS and qname == "example.com.":
+                if rdtype == dns.rdatatype.DS and qname == "example.com":
                     msg = dns.message.Message()
                     msg.answer.append(ds_rrset)
                     return msg
-                if rdtype == dns.rdatatype.DNSKEY and qname == "example.com.":
+                if rdtype == dns.rdatatype.DNSKEY and qname == "example.com":
                     msg = dns.message.Message()
                     msg.answer.append(dnskey_rrset)
                     return msg
@@ -73,8 +74,6 @@ class TestDNSSECChain(unittest.IsolatedAsyncioTestCase):
 
             resolver._dnssec_lookup = fake_lookup
 
-            # Build a response with RRSIG using future dates so it's not expired.
-            # We'll patch time.time to a fixed value within the signature window.
             msg = dns.message.make_query("example.com.", dns.rdatatype.A)
             a_rr = dns.rrset.from_text("example.com.", 3600, "IN", "A", "1.2.3.4")
             msg.answer.append(a_rr)
@@ -85,7 +84,6 @@ class TestDNSSECChain(unittest.IsolatedAsyncioTestCase):
             msg.answer.append(rrsig_rr)
             response_wire = msg.to_wire()
 
-            # Patch time.time to a value within the signature window (2030-01-01)
             with patch('time.time', return_value=1893456000):  # 2030-01-01 00:00:00 UTC
                 secure, insecure = await resolver._dnssec_validate_chain("example.com", response_wire, dnssec_requested=True)
                 self.assertTrue(secure)
@@ -147,7 +145,7 @@ class TestDNSSECChain(unittest.IsolatedAsyncioTestCase):
 
         with patch('dns.dnssec.validate_rrsig', side_effect=dns.dnssec.ValidationFailure("Bogus")):
             async def fake_get_key(zone):
-                if zone == "example.com.":
+                if zone == "example.com":   # no trailing dot
                     return make_dnskey_rrset("example.com.", 256, 3, 8, b"deadbeef")
                 return None
             resolver._get_validated_dnskey = fake_get_key
@@ -161,7 +159,7 @@ class TestDNSSECChain(unittest.IsolatedAsyncioTestCase):
             )
             msg.answer.append(rrsig)
 
-            with patch('time.time', return_value=1893456000):  # 2030-01-01
+            with patch('time.time', return_value=1893456000):
                 with self.assertRaises(dns.dnssec.ValidationFailure):
                     await resolver._dnssec_validate_chain("example.com", msg.to_wire(), dnssec_requested=True)
 

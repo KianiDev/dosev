@@ -1488,6 +1488,19 @@ class DNSResolver:
         if not self._dnssec_raw_anchors:
             raise Exception("DNSSEC trust anchors missing")
 
+        # Wrap the whole validation in the configured timeout
+        try:
+            return await asyncio.wait_for(
+                self._dnssec_validate_chain_no_timeout(qname, response_wire, dnssec_requested),
+                timeout=self.dnssec_validation_timeout
+            )
+        except asyncio.TimeoutError:
+            self.logger.warning("DNSSEC chain validation timeout for %s after %.1fs",
+                                qname, self.dnssec_validation_timeout)
+            return False, True
+
+    async def _dnssec_validate_chain_no_timeout(self, qname: str, response_wire: bytes, dnssec_requested: bool = True) -> Tuple[bool, bool]:
+        """Internal implementation of chain validation without timeout (called from _dnssec_validate_chain)."""
         # Parse the response
         msg = dns.message.from_wire(response_wire)
         has_rrsig = any(rr.rdtype == dns.rdatatype.RRSIG for rr in msg.answer)

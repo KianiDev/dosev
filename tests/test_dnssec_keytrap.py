@@ -10,6 +10,7 @@ import pytest
 import tempfile
 import os
 import time
+import calendar
 import dns.message
 import dns.dnssec
 import dns.rdatatype
@@ -36,31 +37,10 @@ def resolver():
 
 
 def create_rrsig(covered_type: int, name: str) -> dns.rrset.RRset:
-    """Helper to create a valid RRSIG RRset for testing."""
-    from dns.rdtypes.ANY.RRSIG import RRSIG
-
-    rrsig_rrset = dns.rrset.RRset(
-        dns.name.from_text(name),
-        dns.rdataclass.IN,
-        dns.rdatatype.RRSIG
-    )
-    rrsig_rrset.ttl = 300
-
-    rrsig = RRSIG(
-        dns.rdataclass.IN,
-        dns.rdatatype.RRSIG,
-        covered_type,
-        8,
-        1,
-        300,
-        20350101000000,   # far future expiration
-        20300101000000,   # inception (2030)
-        12345,
-        dns.name.from_text(name),
-        b"dummy_signature"
-    )
-    rrsig_rrset.add(rrsig)
-    return rrsig_rrset
+    """Helper to create a valid RRSIG RRset for testing using from_text."""
+    # Use from_text to parse human-readable dates, avoiding uint32 issues
+    rrsig_text = f"{covered_type} 8 1 300 20350101000000 20300101000000 12345 {name} dummy_signature"
+    return dns.rrset.from_text(name, 300, dns.rdataclass.IN, dns.rdatatype.RRSIG, rrsig_text)
 
 
 @pytest.mark.asyncio

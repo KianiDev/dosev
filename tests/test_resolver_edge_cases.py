@@ -33,23 +33,8 @@ def make_a_response(qname: str, ip: str = "192.0.2.1", ttl: int = 60) -> bytes:
 def make_rrsig(covered_type: int, name: str) -> dns.rrset.RRset:
     if not name.endswith('.'):
         name = name + '.'
-    rrsig_rrset = dns.rrset.RRset(dns.name.from_text(name), dns.rdataclass.IN, dns.rdatatype.RRSIG)
-    rrsig_rrset.ttl = 300
-    sig = RRSIG(
-        dns.rdataclass.IN,
-        dns.rdatatype.RRSIG,
-        covered_type,
-        8,
-        1,
-        300,
-        20350101000000,   # far future
-        20300101000000,   # inception
-        12345,
-        dns.name.from_text(name),
-        b"dummy_signature"
-    )
-    rrsig_rrset.add(sig)
-    return rrsig_rrset
+    rrsig_text = f"{covered_type} 8 1 300 20350101000000 20300101000000 12345 {name} dummy_signature"
+    return dns.rrset.from_text(name, 300, dns.rdataclass.IN, dns.rdatatype.RRSIG, rrsig_text)
 
 
 # ---------- Forward UDP Edge Cases ----------
