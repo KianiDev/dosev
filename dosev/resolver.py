@@ -204,7 +204,6 @@ class ConnectionPool:
         self._cleanup_task = asyncio.create_task(_cleanup())
 
     async def stop(self) -> None:
-        # Cancel and wait for the cleanup task to finish
         if self._cleanup_task:
             self._cleanup_task.cancel()
             try:
@@ -214,16 +213,13 @@ class ConnectionPool:
             self._cleanup_task = None
 
         async with self._lock:
-            # Iterate over items so we have both the key and the connection list
             for pool_key, connections in list(self._pools.items()):
                 for _, writer, _ in connections:
                     try:
                         writer.close()
                     except Exception:
                         pass
-                # Remove this pool entry after closing its connections
                 del self._pools[pool_key]
-            # The pool should now be empty; clear() is redundant but safe
             self._pools.clear()
 
 
@@ -271,7 +267,6 @@ class ClientPool:
         self._cleanup_task = asyncio.create_task(_cleanup())
 
     async def stop(self) -> None:
-        # Cancel and wait for the cleanup task to finish
         if self._cleanup_task:
             self._cleanup_task.cancel()
             try:
@@ -1351,8 +1346,13 @@ class DNSResolver:
         if not ds_matches:
             # Try to create DS from the DNSKEY and compare
             ds_candidates = []
+            zone_name = dns.name.from_text(zone)
             for key_rr in child_dnskey:
-                ds_candidates.append(dns.dnssec.make_ds(key_rr))
+                try:
+                    ds_candidates.append(dns.dnssec.make_ds(zone_name, key_rr, "SHA256"))
+                except Exception:
+                    # Fallback to SHA-1 if SHA-256 fails
+                    ds_candidates.append(dns.dnssec.make_ds(zone_name, key_rr, "SHA1"))
             for ds_candidate in ds_candidates:
                 for ds_rr in parent_ds:
                     if ds_candidate.key_tag == ds_rr.key_tag and ds_candidate.digest_type == ds_rr.digest_type:
@@ -1366,10 +1366,8 @@ class DNSResolver:
             self.logger.debug("DS mismatch for zone %s", zone)
             return None
 
-        # Validate the child DNSKEY with itself (self-signed validation)
-        # In a real chain, we trust the DS, so the DNSKEY is authenticated.
-        # We'll trust the DNSKEY and cache it.
-        ttl = min([rr.ttl for rr in child_dnskey]) if child_dnskey else 300
+        # Cache the validated DNSKEY
+        ttl = child_dnskey.ttl if child_dnskey else 300
         async with self._dnssec_cache_lock:
             self._dnssec_key_cache[zone] = (child_dnskey, time.time() + ttl)
         return child_dnskey
@@ -1464,7 +1462,8 @@ class DNSResolver:
             for rr in rrset:
                 rr_name = str(rrset.name).lower().rstrip('.')
                 hash_part = rr_name.split('.')[0]
-                next_hash = rr.next.to_text().lower()
+                # rr.next is bytes, convert to base32hex string for comparison
+                next_hash = base64.b32encode(rr.next).decode().lower().rstrip('=')
 
                 if hash_part <= zone_hash < next_hash:
                     if rr.flags & NSEC3_OPT_OUT:
@@ -1474,6 +1473,7 @@ class DNSResolver:
                             return True
                     return False
 
+        # If we didn't find a covering NSEC3, fallback to insecure
         return False
 
     async def _dnssec_validate_chain(self, qname: str, response_wire: bytes, dnssec_requested: bool = True) -> Tuple[bool, bool]:
@@ -1520,6 +1520,7 @@ class DNSResolver:
 
             # Determine the signer (the zone that signed)
             signer_name = str(sig_record.signer).lower().rstrip('.')
+            signer_name_obj = dns.name.from_text(signer_name)
 
             # Get the validated DNSKEY for the signer
             key_rrset = await self._get_validated_dnskey(signer_name)
@@ -1536,7 +1537,8 @@ class DNSResolver:
 
             try:
                 # Use validate_rrsig which accepts an RRset and a single RRSIG rdata
-                dns.dnssec.validate_rrsig(rrset, sig_record, {signer_name: key_rrset})
+                # The keys dict must map dns.name.Name to RRset
+                dns.dnssec.validate_rrsig(rrset, sig_record, {signer_name_obj: key_rrset})
             except dns.dnssec.ValidationFailure:
                 # If signer is root, try with the raw anchors
                 if signer_name == "." or signer_name == "":

@@ -62,13 +62,10 @@ async def test_forward_udp_timeout():
     data = dns.message.make_query("example.com", "A").to_wire()
 
     loop = asyncio.get_running_loop()
-    with patch.object(loop, "create_datagram_endpoint", new=AsyncMock()) as mock_endpoint:
-        mock_transport = MagicMock()
-        mock_protocol = MagicMock()
-        mock_endpoint.return_value = (mock_transport, mock_protocol)
-
-        with pytest.raises(asyncio.TimeoutError):
-            await resolver._forward_udp(data, resolver.upstreams[0])
+    with patch.object(loop, "sock_recvfrom", new=AsyncMock(side_effect=asyncio.TimeoutError)):
+        with patch.object(resolver, "_get_udp_socket", new=AsyncMock(return_value=MagicMock())):
+            with pytest.raises(asyncio.TimeoutError):
+                await resolver._forward_udp(data, resolver.upstreams[0])
 
 
 @pytest.mark.asyncio
@@ -78,11 +75,11 @@ async def test_forward_udp_connection_lost():
     )
     data = dns.message.make_query("example.com", "A").to_wire()
 
-    mock_sock = MagicMock()
-    mock_sock.sendall = MagicMock(side_effect=ConnectionError("Lost"))
-    with patch.object(resolver, "_get_udp_socket", new=AsyncMock(return_value=mock_sock)):
-        with pytest.raises(ConnectionError, match="Lost"):
-            await resolver._forward_udp(data, resolver.upstreams[0])
+    loop = asyncio.get_running_loop()
+    with patch.object(loop, "sock_sendall", new=AsyncMock(side_effect=ConnectionError("Lost"))):
+        with patch.object(resolver, "_get_udp_socket", new=AsyncMock(return_value=MagicMock())):
+            with pytest.raises(ConnectionError, match="Lost"):
+                await resolver._forward_udp(data, resolver.upstreams[0])
 
 
 # ---------- Forward TCP Edge Cases ----------

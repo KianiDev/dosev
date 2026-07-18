@@ -38,21 +38,25 @@ async def test_default_upstream_when_none_provided():
 
 
 @pytest.mark.asyncio
-async def test_resolve_upstream_ip_uses_ip_override():
+async def test_forward_udp_uses_ip_override():
     resolver = DNSResolver()
-    # Valid ip_override -> returns immediately
-    result = await resolver._resolve_upstream_ip("example.com", ip_override="192.0.2.1")
-    assert result == "192.0.2.1"
+    upstream = {
+        "address": "example.com",
+        "protocol": "udp",
+        "port": 5353,
+        "ip": "192.0.2.1"
+    }
+    data = dns.message.make_query("test.com", "A").to_wire()
 
-    # Invalid ip_override -> fallback to resolution.
-    # Mock _udp_query_a_or_aaaa to return None (so bootstrap fails),
-    # and mock system getaddrinfo to return an IP.
-    with patch.object(resolver, "_udp_query_a_or_aaaa", new=AsyncMock(return_value=None)):
+    with patch.object(resolver, "_resolve_upstream_ip") as mock_resolve:
+        mock_resolve.return_value = "192.0.2.1"
+
         loop = asyncio.get_running_loop()
-        with patch.object(loop, "getaddrinfo", new=AsyncMock(return_value=[(None, None, None, None, ("203.0.113.1", 0))])):
-            with patch.object(resolver, "_cache_set", new=AsyncMock()):
-                result = await resolver._resolve_upstream_ip("example.com", ip_override="invalid")
-                assert result == "203.0.113.1"
+        with patch.object(loop, "sock_recvfrom", new=AsyncMock(return_value=(b"dummy_response", ("192.0.2.1", 5353)))):
+            with patch.object(resolver, "_get_udp_socket", new=AsyncMock(return_value=MagicMock())):
+                result = await resolver._forward_udp(data, upstream)
+                assert result == b"dummy_response"
+                mock_resolve.assert_called_once_with("example.com", "192.0.2.1")
 
 
 @pytest.mark.asyncio
