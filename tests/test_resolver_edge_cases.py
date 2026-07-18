@@ -35,7 +35,7 @@ def make_rrsig(covered_type: int, name: str) -> dns.rrset.RRset:
     if not name.endswith('.'):
         name = name + '.'
     covered_text = dns.rdatatype.to_text(covered_type)
-    rrsig_text = f"{covered_text} 8 1 300 20350101000000 20300101000000 12345 {name} dummy_signature"
+    rrsig_text = f"{covered_text} 8 2 300 20350101000000 20250101000000 12345 example.com. AAAA"
     return dns.rrset.from_text(name, 300, dns.rdataclass.IN, dns.rdatatype.RRSIG, rrsig_text)
 
 

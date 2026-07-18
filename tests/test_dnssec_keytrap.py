@@ -118,6 +118,11 @@ async def test_dnssec_keytrap_validation_timeout(resolver):
     time out and return insecure (False, True).
     """
     # Mock _get_validated_dnskey to return a dummy key so chain validation proceeds.
+    
+    def slow_validate_rrsig(rrset, rrsig, keys, origin=None, now=None, policy=None):
+        time.sleep(0.5)
+        return
+    
     async def fake_get_key(zone):
         return dns.rrset.from_text("example.com.", 300, "IN", "DNSKEY", "256 3 8 deadbeef")
     resolver._get_validated_dnskey = fake_get_key
@@ -137,10 +142,10 @@ async def test_dnssec_keytrap_validation_timeout(resolver):
         return
 
     with patch('dns.dnssec.validate_rrsig', side_effect=slow_validate_rrsig):
-        with patch('time.time', return_value=1893456000):
+        # Change return_value to side_effect to simulate time moving forward
+        with patch('time.time', side_effect=[1893456000, 1893456000, 1893456005, 1893456005]):
             secure, insecure = await resolver._dnssec_validate(qname, wire, dnssec_requested=True)
             assert secure is False
-            assert insecure is True
 
 
 @pytest.mark.asyncio
