@@ -76,7 +76,8 @@ async def test_forward_udp_uses_ip_override():
         mock_resolve.return_value = "192.0.2.1"
 
         loop = asyncio.get_running_loop()
-        with patch.object(loop, "sock_recvfrom", new=AsyncMock(return_value=(b"dummy_response", ("192.0.2.1", 10053)))):
+        # Mock run_in_executor to return dummy response
+        with patch.object(loop, "run_in_executor", new=AsyncMock(return_value=(b"dummy_response", ("192.0.2.1", 10053)))):
             with patch.object(resolver, "_get_udp_socket", new=AsyncMock(return_value=MagicMock())):
                 result = await resolver._forward_udp(data, upstream)
                 assert result == b"dummy_response"

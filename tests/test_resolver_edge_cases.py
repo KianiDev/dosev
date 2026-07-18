@@ -50,7 +50,8 @@ async def test_forward_udp_timeout():
 
     loop = asyncio.get_running_loop()
     with patch.object(loop, "sock_sendall", new=AsyncMock()):
-        with patch.object(loop, "sock_recvfrom", new=AsyncMock(side_effect=asyncio.TimeoutError)):
+        # Mock run_in_executor to raise TimeoutError (simulate recv timeout)
+        with patch.object(loop, "run_in_executor", new=AsyncMock(side_effect=asyncio.TimeoutError)):
             with patch.object(resolver, "_get_udp_socket", new=AsyncMock(return_value=MagicMock())):
                 with pytest.raises(asyncio.TimeoutError):
                     await resolver._forward_udp(data, resolver.upstreams[0])

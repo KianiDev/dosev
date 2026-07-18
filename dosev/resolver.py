@@ -1514,31 +1514,31 @@ class DNSResolver:
             return False, True
 
         # For each RRset in the answer, validate its RRSIGs
-        # We need to validate the chain for each signer
         validation_counter = 0
         max_validations = self.dnssec_max_validations if self.dnssec_max_validations > 0 else 999999
 
-        # Group RRsets by their signer (the zone that signed them)
+        loop = asyncio.get_running_loop()
+
         for rrset in msg.answer:
             if rrset.rdtype == dns.rdatatype.RRSIG:
                 continue
 
-            # Find the RRSIG for this RRset
-            sig = None
+            # Find the RRSIG rdata (not the RRset) for this RRset
+            sig_rdata = None
             for rr in msg.answer:
                 if rr.rdtype == dns.rdatatype.RRSIG and rr.name == rrset.name:
                     for r in rr:
                         if r.type_covered == rrset.rdtype:
-                            sig = rr
+                            sig_rdata = r
                             break
-                    if sig:
+                    if sig_rdata:
                         break
 
-            if sig is None:
+            if sig_rdata is None:
                 raise dns.dnssec.ValidationFailure(f"No RRSIG for rrset {rrset.name}")
 
-            # Determine the signer (the zone that signed)
-            signer_name = str(sig[0].signer).lower().rstrip('.')
+            # Determine the signer (the zone that signed) from the RRSIG rdata
+            signer_name = str(sig_rdata.signer).lower().rstrip('.')
             signer_name_obj = dns.name.from_text(signer_name)
 
             # Get the validated DNSKEY for the signer
@@ -1555,13 +1555,24 @@ class DNSResolver:
                 return False, True
 
             try:
-                # Validate the RRset against the RRSIG using the key RRset
-                # We need to pass a dictionary mapping signer name to key RRset
-                dns.dnssec.validate_rrsig(rrset, sig, {signer_name_obj: key_rrset})
+                # Offload the synchronous crypto validation to a thread so it can be interrupted by timeout
+                await loop.run_in_executor(
+                    None,
+                    dns.dnssec.validate_rrsig,
+                    rrset,
+                    sig_rdata,
+                    {signer_name_obj: key_rrset}
+                )
             except dns.dnssec.ValidationFailure:
                 # If signer is root, try with the raw anchors
                 if signer_name == "." or signer_name == "":
-                    dns.dnssec.validate_rrsig(rrset, sig, self._dnssec_raw_anchors)
+                    await loop.run_in_executor(
+                        None,
+                        dns.dnssec.validate_rrsig,
+                        rrset,
+                        sig_rdata,
+                        self._dnssec_raw_anchors
+                    )
                 else:
                     raise
 
@@ -2164,8 +2175,9 @@ class DNSResolver:
             await loop.sock_sendall(sock, data)
 
             # 5. Receive the response with timeout
-            response, _ = await asyncio.wait_for(
-                loop.sock_recvfrom(sock, self.max_edns_payload or 4096),
+            # Use run_in_executor for Python 3.10 compatibility (sock_recvfrom is 3.11+)
+            response, addr = await asyncio.wait_for(
+                loop.run_in_executor(None, sock.recvfrom, self.max_edns_payload or 4096),
                 timeout=self.udp_timeout
             )
             return response
