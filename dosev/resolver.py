@@ -1272,20 +1272,18 @@ class DNSResolver:
         return base64.b32encode(data).decode().lower().rstrip("=")
 
     @staticmethod
-    def _nsec3_bitmap_contains(bitmap: bytes, rdtype: int) -> bool:
-        """Check if a bitmap contains a given RDATA type."""
-        pos = 0
-        while pos < len(bitmap):
-            window = bitmap[pos]
-            bitmap_len = bitmap[pos + 1]
+    def _nsec3_bitmap_contains(windows: Tuple[Tuple[int, bytes], ...], rdtype: int) -> bool:
+        """Check if a bitmap contains a given RDATA type.
+        windows is a tuple of (window_number, bitmap_bytes) pairs.
+        """
+        for window, bitmap in windows:
             if window == rdtype >> 8:
                 offset = rdtype & 0xFF
                 byte_idx = offset >> 3
                 bit_mask = 1 << (offset & 0x07)
-                if byte_idx < bitmap_len:
-                    if bitmap[pos + 2 + byte_idx] & bit_mask:
+                if byte_idx < len(bitmap):
+                    if bitmap[byte_idx] & bit_mask:
                         return True
-            pos += 2 + bitmap_len
         return False
 
     async def _get_validated_dnskey(self, zone: str) -> Optional[dns.rrset.RRset]:
@@ -2734,10 +2732,8 @@ class DNSResolver:
             return False
         try:
             msg = dns.message.from_wire(query_data)
-            if msg.opt is None or len(msg.opt) == 0:
-                return False
-            # The DO flag is on the OPT rdata's flags attribute
-            return bool(msg.opt[0].flags & dns.flags.DO)
+            # The DO flag is stored in the message's ednsflags attribute
+            return bool(msg.ednsflags & dns.flags.DO)
         except Exception:
             return False
 

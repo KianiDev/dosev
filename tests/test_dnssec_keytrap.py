@@ -46,20 +46,18 @@ def create_rrsig(covered_type: int, name: str) -> dns.rrset.RRset:
     )
     rrsig_rrset.ttl = 300
 
-    # RRSIG constructor: rdclass, rdtype, type_covered, algorithm, labels,
-    # original_ttl, expiration, inception, key_tag, signer, signature
     rrsig = RRSIG(
         dns.rdataclass.IN,
         dns.rdatatype.RRSIG,
-        covered_type,          # type_covered (positional)
-        8,                     # algorithm (RSA-SHA256)
-        1,                     # labels
-        300,                   # original_ttl
-        2000000000,            # expiration
-        1000000000,            # inception
-        12345,                 # key_tag
-        dns.name.from_text(name),  # signer
-        b"dummy_signature"     # signature
+        covered_type,
+        8,
+        1,
+        300,
+        20350101000000,   # far future expiration
+        20300101000000,   # inception (2030)
+        12345,
+        dns.name.from_text(name),
+        b"dummy_signature"
     )
     rrsig_rrset.add(rrsig)
     return rrsig_rrset
@@ -74,7 +72,6 @@ async def test_dnssec_max_validations_limit(resolver):
     query = dns.message.make_query("example.com", "A")
     resp = dns.message.make_response(query)
 
-    # Add 3 A records with RRSIGs
     for i in range(3):
         name = f"example{i}.com."
         a_rrset = dns.rrset.from_text(name, 300, dns.rdataclass.IN, dns.rdatatype.A, f"192.0.2.{i+1}")
@@ -83,7 +80,7 @@ async def test_dnssec_max_validations_limit(resolver):
 
     validate_calls = 0
 
-    def fake_validate(rrset, sig, anchors):
+    def fake_validate_rrsig(rrset, rrsig, keys, origin=None, now=None, policy=None):
         nonlocal validate_calls
         validate_calls += 1
         return
@@ -91,15 +88,12 @@ async def test_dnssec_max_validations_limit(resolver):
     wire = resp.to_wire()
     qname = "example.com"
 
-    with patch('dns.dnssec.validate', side_effect=fake_validate):
-        secure, insecure = await resolver._dnssec_validate(qname, wire, dnssec_requested=True)
-
-        # Should return insecure (False, True) because limit was exceeded
-        assert secure is False
-        assert insecure is True
-
-        # validate should have been called exactly max_validations (2) times
-        assert validate_calls == 2
+    with patch('dns.dnssec.validate_rrsig', side_effect=fake_validate_rrsig):
+        with patch('time.time', return_value=1893456000):  # 2030-01-01
+            secure, insecure = await resolver._dnssec_validate(qname, wire, dnssec_requested=True)
+            assert secure is False
+            assert insecure is True
+            assert validate_calls == 2
 
 
 @pytest.mark.asyncio
@@ -127,7 +121,6 @@ async def test_dnssec_keytrap_dnskey_limit():
         assert resolver._dnssec_raw_anchors is not None
         root_anchor = resolver._dnssec_raw_anchors.get(dns.name.root)
         assert root_anchor is not None
-        # Should be limited to 1 DNSKEY
         assert len(root_anchor) == 1
 
     finally:
@@ -150,16 +143,15 @@ async def test_dnssec_keytrap_validation_timeout(resolver):
     wire = resp.to_wire()
     qname = "example.com"
 
-    # Must be synchronous because dns.dnssec.validate is called via run_in_executor
-    def slow_validate(rrset, sig, anchors):
-        time.sleep(0.5)  # synchronous sleep
+    def slow_validate_rrsig(rrset, rrsig, keys, origin=None, now=None, policy=None):
+        time.sleep(0.5)
         return
 
-    with patch('dns.dnssec.validate', side_effect=slow_validate):
-        secure, insecure = await resolver._dnssec_validate(qname, wire, dnssec_requested=True)
-        # Should return insecure (False, True) due to timeout
-        assert secure is False
-        assert insecure is True
+    with patch('dns.dnssec.validate_rrsig', side_effect=slow_validate_rrsig):
+        with patch('time.time', return_value=1893456000):
+            secure, insecure = await resolver._dnssec_validate(qname, wire, dnssec_requested=True)
+            assert secure is False
+            assert insecure is True
 
 
 @pytest.mark.asyncio
@@ -180,7 +172,7 @@ async def test_dnssec_no_validation_when_cd_flag_set():
 
     validate_called = False
 
-    def fake_validate(rrset, sig, anchors):
+    def fake_validate_rrsig(*args, **kwargs):
         nonlocal validate_called
         validate_called = True
         return
@@ -195,9 +187,8 @@ async def test_dnssec_no_validation_when_cd_flag_set():
         return wire
     resolver._try_upstream = fake_try_upstream
 
-    with patch('dns.dnssec.validate', side_effect=fake_validate):
+    with patch('dns.dnssec.validate_rrsig', side_effect=fake_validate_rrsig):
         result = await resolver.forward_dns_query(qwire)
-        # validate should NOT have been called because CD flag is set
         assert validate_called is False
         msg = dns.message.from_wire(result)
         assert msg.rcode() == 0

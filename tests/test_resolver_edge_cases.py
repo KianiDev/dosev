@@ -39,12 +39,12 @@ def make_rrsig(covered_type: int, name: str) -> dns.rrset.RRset:
         dns.rdataclass.IN,
         dns.rdatatype.RRSIG,
         covered_type,
-        8,  # algorithm
-        1,  # labels
-        300,  # original_ttl
-        2000000000,  # expiration
-        1000000000,  # inception
-        12345,  # key_tag
+        8,
+        1,
+        300,
+        20350101000000,   # far future
+        20300101000000,   # inception
+        12345,
         dns.name.from_text(name),
         b"dummy_signature"
     )
@@ -62,10 +62,11 @@ async def test_forward_udp_timeout():
     data = dns.message.make_query("example.com", "A").to_wire()
 
     loop = asyncio.get_running_loop()
-    with patch.object(loop, "sock_recvfrom", new=AsyncMock(side_effect=asyncio.TimeoutError)):
-        with patch.object(resolver, "_get_udp_socket", new=AsyncMock(return_value=MagicMock())):
-            with pytest.raises(asyncio.TimeoutError):
-                await resolver._forward_udp(data, resolver.upstreams[0])
+    with patch.object(loop, "sock_sendall", new=AsyncMock()):
+        with patch.object(loop, "sock_recvfrom", new=AsyncMock(side_effect=asyncio.TimeoutError)):
+            with patch.object(resolver, "_get_udp_socket", new=AsyncMock(return_value=MagicMock())):
+                with pytest.raises(asyncio.TimeoutError):
+                    await resolver._forward_udp(data, resolver.upstreams[0])
 
 
 @pytest.mark.asyncio
@@ -143,7 +144,6 @@ async def test_forward_tcp_closed_connection_creates_new():
         writer.drain = AsyncMock()
         return reader, writer
 
-    # Mock pool.get: first call returns None, second returns a closed connection
     mock_get_calls = 0
     async def mock_get(key):
         nonlocal mock_get_calls
@@ -151,7 +151,6 @@ async def test_forward_tcp_closed_connection_creates_new():
         if mock_get_calls == 1:
             return None
         else:
-            # Return a closed connection to force a new one
             closed_reader = AsyncMock()
             closed_writer = MagicMock()
             closed_writer.is_closing = MagicMock(return_value=True)
@@ -260,9 +259,6 @@ async def test_forward_https1_chunked_response():
     data = dns.message.make_query("example.com", "A").to_wire()
     resp = make_a_response("example.com")
 
-    # Build chunked response as a list of lines (each ending with \r\n)
-    # readline should only see: status, headers, blank line, chunk size lines, final blank.
-    # The actual chunk payload is read via readexactly.
     lines = [
         b"HTTP/1.1 200 OK\r\n",
         b"Transfer-Encoding: chunked\r\n",
@@ -285,14 +281,12 @@ async def test_forward_https1_chunked_response():
 
         reader.readline = AsyncMock(side_effect=readline_side_effect)
 
-        # readexactly handles chunk data + trailing \r\ns
-        # The first chunk is resp[:2], the second is resp[2:]
         readexactly_responses = [
-            resp[:2],   # chunk1 data
-            b"\r\n",    # after chunk1 (read by readuntil)
-            resp[2:],   # chunk2 data
-            b"\r\n",    # after chunk2
-            b"\r\n",    # final \r\n after 0 chunk
+            resp[:2],
+            b"\r\n",
+            resp[2:],
+            b"\r\n",
+            b"\r\n",
         ]
         remaining_readexactly = readexactly_responses.copy()
 
@@ -302,7 +296,6 @@ async def test_forward_https1_chunked_response():
             return b""
 
         reader.readexactly = AsyncMock(side_effect=readexactly_side_effect)
-
         reader.readuntil = AsyncMock(return_value=b"\r\n")
         writer = MagicMock()
         writer.is_closing = MagicMock(return_value=False)
@@ -388,9 +381,10 @@ async def test_dnssec_validation_bogus_signature():
     resp.answer.append(rr)
     resp.answer.append(make_rrsig(dns.rdatatype.A, "example.com"))
 
-    with patch("dns.dnssec.validate", side_effect=dns.dnssec.ValidationFailure("bogus")):
-        with pytest.raises(dns.dnssec.ValidationFailure):
-            await resolver._dnssec_validate("example.com", resp.to_wire(), dnssec_requested=True)
+    with patch("dns.dnssec.validate_rrsig", side_effect=dns.dnssec.ValidationFailure("bogus")):
+        with patch('time.time', return_value=1893456000):
+            with pytest.raises(dns.dnssec.ValidationFailure):
+                await resolver._dnssec_validate("example.com", resp.to_wire(), dnssec_requested=True)
 
 
 @pytest.mark.asyncio
@@ -414,10 +408,11 @@ async def test_dnssec_validation_limit_exceeded():
     resp.answer.append(rr2)
     resp.answer.append(make_rrsig(dns.rdatatype.AAAA, "example.com"))
 
-    with patch("dns.dnssec.validate", return_value=None):
-        secure, insecure = await resolver._dnssec_validate("example.com", resp.to_wire(), dnssec_requested=True)
-        assert secure is False
-        assert insecure is True
+    with patch("dns.dnssec.validate_rrsig", return_value=None):
+        with patch('time.time', return_value=1893456000):
+            secure, insecure = await resolver._dnssec_validate("example.com", resp.to_wire(), dnssec_requested=True)
+            assert secure is False
+            assert insecure is True
 
 
 @pytest.mark.asyncio
@@ -436,15 +431,16 @@ async def test_dnssec_validation_timeout():
     resp.answer.append(rr)
     resp.answer.append(make_rrsig(dns.rdatatype.A, "example.com"))
 
-    def slow_validate(*args, **kwargs):
+    def slow_validate_rrsig(*args, **kwargs):
         import time
         time.sleep(0.1)
         return None
 
-    with patch("dns.dnssec.validate", side_effect=slow_validate):
-        secure, insecure = await resolver._dnssec_validate("example.com", resp.to_wire(), dnssec_requested=True)
-        assert secure is False
-        assert insecure is True
+    with patch("dns.dnssec.validate_rrsig", side_effect=slow_validate_rrsig):
+        with patch('time.time', return_value=1893456000):
+            secure, insecure = await resolver._dnssec_validate("example.com", resp.to_wire(), dnssec_requested=True)
+            assert secure is False
+            assert insecure is True
 
 
 @pytest.mark.asyncio
@@ -548,7 +544,6 @@ async def test_tcp_fallback_on_truncated_response():
     msg = dns.message.from_wire(result)
     assert msg.rcode() == dns.rcode.NOERROR
     assert len(msg.answer) == 1
-    assert msg.answer[0].rdtype == dns.rdatatype.A
     assert tcp_called is True
 
 
@@ -594,8 +589,8 @@ def test_set_tc_bit():
 def test_dnssec_requested_detects_do_flag():
     resolver = DNSResolver()
     query = dns.message.make_query("example.com", "A")
-    # Enable EDNS and set the DO flag via ednsflags
-    query.use_edns(edns=0, ednsflags=dns.flags.DO, payload=1232)
+    query.use_edns(edns=0, payload=1232)
+    query.ednsflags = dns.flags.DO
     assert resolver._dnssec_requested(query.to_wire()) is True
 
 

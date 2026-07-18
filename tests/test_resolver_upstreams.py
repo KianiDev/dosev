@@ -38,25 +38,17 @@ async def test_default_upstream_when_none_provided():
 
 
 @pytest.mark.asyncio
-async def test_forward_udp_uses_ip_override():
+async def test_resolve_upstream_ip_uses_ip_override():
     resolver = DNSResolver()
-    upstream = {
-        "address": "example.com",
-        "protocol": "udp",
-        "port": 5353,
-        "ip": "192.0.2.1"
-    }
-    data = dns.message.make_query("test.com", "A").to_wire()
+    result = await resolver._resolve_upstream_ip("example.com", ip_override="192.0.2.1")
+    assert result == "192.0.2.1"
 
-    with patch.object(resolver, "_resolve_upstream_ip") as mock_resolve:
-        mock_resolve.return_value = "192.0.2.1"
-
+    with patch.object(resolver, "_udp_query_a_or_aaaa", new=AsyncMock(return_value=None)):
         loop = asyncio.get_running_loop()
-        with patch.object(loop, "sock_recvfrom", new=AsyncMock(return_value=(b"dummy_response", ("192.0.2.1", 5353)))):
-            with patch.object(resolver, "_get_udp_socket", new=AsyncMock(return_value=MagicMock())):
-                result = await resolver._forward_udp(data, upstream)
-                assert result == b"dummy_response"
-                mock_resolve.assert_called_once_with("example.com", "192.0.2.1")
+        with patch.object(loop, "getaddrinfo", new=AsyncMock(return_value=[(None, None, None, None, ("203.0.113.1", 0))])):
+            with patch.object(resolver, "_cache_set", new=AsyncMock()):
+                result = await resolver._resolve_upstream_ip("example.com", ip_override="invalid")
+                assert result == "203.0.113.1"
 
 
 @pytest.mark.asyncio
@@ -83,10 +75,9 @@ async def test_forward_udp_uses_ip_override():
     with patch.object(resolver, "_resolve_upstream_ip") as mock_resolve:
         mock_resolve.return_value = "192.0.2.1"
 
-        mock_sock = MagicMock()
         loop = asyncio.get_running_loop()
         with patch.object(loop, "sock_recvfrom", new=AsyncMock(return_value=(b"dummy_response", ("192.0.2.1", 5353)))):
-            with patch.object(resolver, "_get_udp_socket", new=AsyncMock(return_value=mock_sock)):
+            with patch.object(resolver, "_get_udp_socket", new=AsyncMock(return_value=MagicMock())):
                 result = await resolver._forward_udp(data, upstream)
                 assert result == b"dummy_response"
                 mock_resolve.assert_called_once_with("example.com", "192.0.2.1")
@@ -107,7 +98,6 @@ async def test_forward_tcp_uses_ip_override():
         mock_pool.get = AsyncMock(return_value=None)
         mock_pool.put = AsyncMock()
 
-        # Mock reader.readexactly as AsyncMock
         reader = MagicMock()
         reader.readexactly = AsyncMock(side_effect=[b"\x00\x0d", b"dummy_response"])
         writer = MagicMock()
@@ -135,20 +125,6 @@ async def test_forward_quic_uses_ip_override():
     }
     data = dns.message.make_query("test.com", "A").to_wire()
 
-    # We'll mock the _forward_quic entirely to avoid real connection logic
-    with patch.object(resolver, "_forward_quic", new=AsyncMock(return_value=b"dummy_response")) as mock_forward:
-        # We still want to verify that _resolve_upstream_ip is called with ip_override
-        with patch.object(resolver, "_resolve_upstream_ip") as mock_resolve:
-            mock_resolve.return_value = "192.0.2.1"
-
-            # The actual call to forward_dns_query will call _try_upstream, which calls _forward_quic.
-            # But we are not testing the whole flow; we can directly call _forward_quic.
-            # However, to test the ip_override, we need to ensure that _resolve_upstream_ip is called
-            # with the correct arguments. Since we mocked _forward_quic, we can't test that.
-            # So we'll test _forward_quic's logic by patching the connect and checking the call.
-
-    # Actually, we want to test that _forward_quic calls _resolve_upstream_ip with ip_override.
-    # So we can't mock _forward_quic entirely. Instead, we mock the connect and wait_connected.
     with patch.object(resolver, "_resolve_upstream_ip") as mock_resolve:
         mock_resolve.return_value = "192.0.2.1"
         with patch("aioquic.asyncio.client.connect") as mock_connect:
@@ -172,36 +148,6 @@ async def test_forward_quic_uses_ip_override():
                     result = await resolver._forward_quic(data, upstream)
                     assert result == dummy_response
                     mock_resolve.assert_called_once_with("example.com", ip_override="192.0.2.1")
-
-
-@pytest.mark.asyncio
-async def test_forward_quic_uses_ip_override():
-    resolver = DNSResolver()
-    upstream = {
-        "address": "example.com",
-        "protocol": "quic",
-        "port": 853,
-        "ip": "192.0.2.1",
-        "hostname": "example.com"
-    }
-    data = dns.message.make_query("test.com", "A").to_wire()
-
-    with patch.object(resolver, "_resolve_upstream_ip") as mock_resolve:
-        mock_resolve.return_value = "192.0.2.1"
-        with patch("aioquic.asyncio.client.connect") as mock_connect:
-            class CM:
-                async def __aenter__(self):
-                    return MagicMock()
-                async def __aexit__(self, *args):
-                    pass
-            mock_connect.return_value = CM()
-            with patch("aioquic.asyncio.protocol.QuicConnectionProtocol.wait_connected", new=AsyncMock()):
-                dummy_response = b"dummy_response"
-                response_data = len(dummy_response).to_bytes(2, "big") + dummy_response
-                with patch("asyncio.wait_for", new=AsyncMock(return_value=response_data)):
-                    result = await resolver._forward_quic(data, upstream)
-                    assert result == dummy_response
-                    mock_resolve.assert_called_once_with("example.com", "192.0.2.1")
 
 
 @pytest.mark.asyncio
@@ -237,7 +183,6 @@ async def test_forward_dns_query_fallback_default_upstream():
     response = await resolver.forward_dns_query(query)
     assert response is not None
     assert len(calls) == 1
-    # The default fallback in forward_dns_query is 1.1.1.1
     assert calls[0] == "1.1.1.1"
 
 
