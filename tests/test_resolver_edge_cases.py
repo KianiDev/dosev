@@ -31,9 +31,11 @@ def make_a_response(qname: str, ip: str = "192.0.2.1", ttl: int = 60) -> bytes:
 
 
 def make_rrsig(covered_type: int, name: str) -> dns.rrset.RRset:
+    """Helper to create a valid RRSIG RRset using from_text with mnemonic type."""
     if not name.endswith('.'):
         name = name + '.'
-    rrsig_text = f"{covered_type} 8 1 300 20350101000000 20300101000000 12345 {name} dummy_signature"
+    covered_text = dns.rdatatype.to_text(covered_type)
+    rrsig_text = f"{covered_text} 8 1 300 20350101000000 20300101000000 12345 {name} dummy_signature"
     return dns.rrset.from_text(name, 300, dns.rdataclass.IN, dns.rdatatype.RRSIG, rrsig_text)
 
 
@@ -360,6 +362,11 @@ async def test_dnssec_validation_bogus_signature():
     )
     resolver._dnssec_raw_anchors = {dns.name.root: b"dummy"}
 
+    # Mock _get_validated_dnskey to return a dummy key so chain validation proceeds.
+    async def fake_get_key(zone):
+        return dns.rrset.from_text("example.com.", 300, "IN", "DNSKEY", "256 3 8 deadbeef")
+    resolver._get_validated_dnskey = fake_get_key
+
     query = dns.message.make_query("example.com", "A")
     resp = dns.message.make_response(query)
     rr = dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "192.0.2.1")
@@ -381,6 +388,11 @@ async def test_dnssec_validation_limit_exceeded():
         dnssec_max_validations=1,
     )
     resolver._dnssec_raw_anchors = {dns.name.root: b"dummy"}
+
+    # Mock _get_validated_dnskey to return a dummy key so chain validation proceeds.
+    async def fake_get_key(zone):
+        return dns.rrset.from_text("example.com.", 300, "IN", "DNSKEY", "256 3 8 deadbeef")
+    resolver._get_validated_dnskey = fake_get_key
 
     query = dns.message.make_query("example.com", "A")
     resp = dns.message.make_response(query)
@@ -409,6 +421,11 @@ async def test_dnssec_validation_timeout():
         dnssec_validation_timeout=0.01,
     )
     resolver._dnssec_raw_anchors = {dns.name.root: b"dummy"}
+
+    # Mock _get_validated_dnskey to return a dummy key so chain validation proceeds.
+    async def fake_get_key(zone):
+        return dns.rrset.from_text("example.com.", 300, "IN", "DNSKEY", "256 3 8 deadbeef")
+    resolver._get_validated_dnskey = fake_get_key
 
     query = dns.message.make_query("example.com", "A")
     resp = dns.message.make_response(query)

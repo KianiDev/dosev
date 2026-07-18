@@ -8,7 +8,6 @@ import asyncio
 import unittest
 from unittest.mock import patch, MagicMock, AsyncMock
 import time
-import calendar
 
 import dns.message
 import dns.rrset
@@ -46,33 +45,16 @@ class TestDNSSECChain(unittest.IsolatedAsyncioTestCase):
             trust_anchors=None,
         )
 
-        ds_rrset = make_ds_rrset(
-            "example.com",
-            key_tag=12345,
-            algorithm=8,
-            digest_type=2,
-            digest=bytes.fromhex("49aac11d7b6f6446702e54a1607371607a1a41855200fd2ce1cdde32f24e8fb5")
-        )
-        dnskey_rrset = make_dnskey_rrset(
-            "example.com",
-            flags=256, protocol=3, algorithm=8,
-            key=bytes.fromhex("deadbeef")
-        )
+        # Mock _get_validated_dnskey to return a dummy key directly,
+        # bypassing the recursive chain walk which is not the focus of this test.
+        dnskey_rrset = make_dnskey_rrset("example.com.", 256, 3, 8, bytes.fromhex("deadbeef"))
 
         with patch('dns.dnssec.validate_rrsig', return_value=None) as mock_validate:
-            # Mocks must match the resolver's internal names (no trailing dot)
-            async def fake_lookup(qname, rdtype, dnssec_ok=False):
-                if rdtype == dns.rdatatype.DS and qname == "example.com":
-                    msg = dns.message.Message()
-                    msg.answer.append(ds_rrset)
-                    return msg
-                if rdtype == dns.rdatatype.DNSKEY and qname == "example.com":
-                    msg = dns.message.Message()
-                    msg.answer.append(dnskey_rrset)
-                    return msg
+            async def fake_get_key(zone):
+                if zone == "example.com":
+                    return dnskey_rrset
                 return None
-
-            resolver._dnssec_lookup = fake_lookup
+            resolver._get_validated_dnskey = fake_get_key
 
             msg = dns.message.make_query("example.com.", dns.rdatatype.A)
             a_rr = dns.rrset.from_text("example.com.", 3600, "IN", "A", "1.2.3.4")
@@ -84,7 +66,7 @@ class TestDNSSECChain(unittest.IsolatedAsyncioTestCase):
             msg.answer.append(rrsig_rr)
             response_wire = msg.to_wire()
 
-            with patch('time.time', return_value=1893456000):  # 2030-01-01 00:00:00 UTC
+            with patch('time.time', return_value=1893456000):  # 2030-01-01
                 secure, insecure = await resolver._dnssec_validate_chain("example.com", response_wire, dnssec_requested=True)
                 self.assertTrue(secure)
                 self.assertFalse(insecure)
@@ -145,7 +127,7 @@ class TestDNSSECChain(unittest.IsolatedAsyncioTestCase):
 
         with patch('dns.dnssec.validate_rrsig', side_effect=dns.dnssec.ValidationFailure("Bogus")):
             async def fake_get_key(zone):
-                if zone == "example.com":   # no trailing dot
+                if zone == "example.com":
                     return make_dnskey_rrset("example.com.", 256, 3, 8, b"deadbeef")
                 return None
             resolver._get_validated_dnskey = fake_get_key

@@ -1475,7 +1475,10 @@ class DNSResolver:
         return False
 
     async def _dnssec_validate_chain(self, qname: str, response_wire: bytes, dnssec_requested: bool = True) -> Tuple[bool, bool]:
-        """Validate DNSSEC signatures by building a chain of trust from the root."""
+        """
+        Validate DNSSEC signatures by building a chain of trust from the root.
+        This method wraps the actual validation in a timeout to prevent hanging.
+        """
         if not self.dnssec_enabled:
             return False, True
         if not _HAS_DNSPY:
@@ -1488,10 +1491,10 @@ class DNSResolver:
         if not self._dnssec_raw_anchors:
             raise Exception("DNSSEC trust anchors missing")
 
-        # Wrap the whole validation in the configured timeout
+        # Wrap the entire chain validation in the configured timeout
         try:
             return await asyncio.wait_for(
-                self._dnssec_validate_chain_no_timeout(qname, response_wire, dnssec_requested),
+                self._dnssec_validate_chain_internal(qname, response_wire, dnssec_requested),
                 timeout=self.dnssec_validation_timeout
             )
         except asyncio.TimeoutError:
@@ -1499,38 +1502,43 @@ class DNSResolver:
                                 qname, self.dnssec_validation_timeout)
             return False, True
 
-    async def _dnssec_validate_chain_no_timeout(self, qname: str, response_wire: bytes, dnssec_requested: bool = True) -> Tuple[bool, bool]:
-        """Internal implementation of chain validation without timeout (called from _dnssec_validate_chain)."""
+    async def _dnssec_validate_chain_internal(self, qname: str, response_wire: bytes, dnssec_requested: bool = True) -> Tuple[bool, bool]:
+        """
+        Internal implementation of chain validation (no timeout wrapper).
+        This is called from _dnssec_validate_chain with a timeout.
+        """
         # Parse the response
         msg = dns.message.from_wire(response_wire)
         has_rrsig = any(rr.rdtype == dns.rdatatype.RRSIG for rr in msg.answer)
         if not has_rrsig:
             return False, True
 
+        # For each RRset in the answer, validate its RRSIGs
+        # We need to validate the chain for each signer
         validation_counter = 0
         max_validations = self.dnssec_max_validations if self.dnssec_max_validations > 0 else 999999
 
-        # For each RRset in the answer, validate its RRSIGs
+        # Group RRsets by their signer (the zone that signed them)
         for rrset in msg.answer:
             if rrset.rdtype == dns.rdatatype.RRSIG:
                 continue
 
-            # Find the matching RRSIG record (not the RRset)
-            sig_record = None
+            # Find the RRSIG for this RRset
+            sig = None
             for rr in msg.answer:
                 if rr.rdtype == dns.rdatatype.RRSIG and rr.name == rrset.name:
                     for r in rr:
                         if r.type_covered == rrset.rdtype:
-                            sig_record = r
+                            sig = rr
                             break
-                    if sig_record:
+                    if sig:
                         break
 
-            if sig_record is None:
+            if sig is None:
                 raise dns.dnssec.ValidationFailure(f"No RRSIG for rrset {rrset.name}")
 
             # Determine the signer (the zone that signed)
-            signer_name = str(sig_record.signer).lower().rstrip('.')
+            signer_name = str(sig.signer).lower().rstrip('.')
             signer_name_obj = dns.name.from_text(signer_name)
 
             # Get the validated DNSKEY for the signer
@@ -1547,18 +1555,17 @@ class DNSResolver:
                 return False, True
 
             try:
-                # Use validate_rrsig which accepts an RRset and a single RRSIG rdata
-                # The keys dict must map dns.name.Name to RRset
-                dns.dnssec.validate_rrsig(rrset, sig_record, {signer_name_obj: key_rrset})
+                # Validate the RRset against the RRSIG using the key RRset
+                # We need to pass a dictionary mapping signer name to key RRset
+                dns.dnssec.validate_rrsig(rrset, sig, {signer_name_obj: key_rrset})
             except dns.dnssec.ValidationFailure:
                 # If signer is root, try with the raw anchors
                 if signer_name == "." or signer_name == "":
-                    dns.dnssec.validate_rrsig(rrset, sig_record, self._dnssec_raw_anchors)
+                    dns.dnssec.validate_rrsig(rrset, sig, self._dnssec_raw_anchors)
                 else:
                     raise
 
         return True, False
-
     # ---------- Legacy DNSSEC validation (for compatibility) ----------
     async def _dnssec_validate(self, qname: str, response_wire: bytes, dnssec_requested: bool = True) -> Tuple[bool, bool]:
         """Legacy validation – uses the new chain validator if enabled."""

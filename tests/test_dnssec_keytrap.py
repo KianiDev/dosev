@@ -10,7 +10,6 @@ import pytest
 import tempfile
 import os
 import time
-import calendar
 import dns.message
 import dns.dnssec
 import dns.rdatatype
@@ -37,9 +36,9 @@ def resolver():
 
 
 def create_rrsig(covered_type: int, name: str) -> dns.rrset.RRset:
-    """Helper to create a valid RRSIG RRset for testing using from_text."""
-    # Use from_text to parse human-readable dates, avoiding uint32 issues
-    rrsig_text = f"{covered_type} 8 1 300 20350101000000 20300101000000 12345 {name} dummy_signature"
+    """Helper to create a valid RRSIG RRset using from_text with mnemonic type."""
+    covered_text = dns.rdatatype.to_text(covered_type)   # "A", "MX", etc.
+    rrsig_text = f"{covered_text} 8 1 300 20350101000000 20300101000000 12345 {name} dummy_signature"
     return dns.rrset.from_text(name, 300, dns.rdataclass.IN, dns.rdatatype.RRSIG, rrsig_text)
 
 
@@ -49,6 +48,11 @@ async def test_dnssec_max_validations_limit(resolver):
     If a response has more RRsets requiring validation than max_validations,
     the resolver should treat the response as insecure after exceeding the limit.
     """
+    # Mock _get_validated_dnskey to return a dummy key so chain validation proceeds.
+    async def fake_get_key(zone):
+        return dns.rrset.from_text("example.com.", 300, "IN", "DNSKEY", "256 3 8 deadbeef")
+    resolver._get_validated_dnskey = fake_get_key
+
     query = dns.message.make_query("example.com", "A")
     resp = dns.message.make_response(query)
 
@@ -113,6 +117,11 @@ async def test_dnssec_keytrap_validation_timeout(resolver):
     If validation takes longer than dnssec_validation_timeout, it should
     time out and return insecure (False, True).
     """
+    # Mock _get_validated_dnskey to return a dummy key so chain validation proceeds.
+    async def fake_get_key(zone):
+        return dns.rrset.from_text("example.com.", 300, "IN", "DNSKEY", "256 3 8 deadbeef")
+    resolver._get_validated_dnskey = fake_get_key
+
     query = dns.message.make_query("example.com", "A")
     resp = dns.message.make_response(query)
 
