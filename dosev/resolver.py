@@ -2174,12 +2174,17 @@ class DNSResolver:
             # 4. Send the query (no address needed for a connected socket)
             await loop.sock_sendall(sock, data)
 
-            # 5. Receive the response with timeout
-            # Use run_in_executor for Python 3.10 compatibility (sock_recvfrom is 3.11+)
-            response, addr = await asyncio.wait_for(
-                loop.run_in_executor(None, sock.recvfrom, self.max_edns_payload or 4096),
-                timeout=self.udp_timeout
-            )
+            # 5. Temporarily set the socket to blocking mode for the recvfrom call
+            #    to avoid BlockingIOError when no data is immediately available.
+            sock.setblocking(True)
+            try:
+                response, addr = await asyncio.wait_for(
+                    loop.run_in_executor(None, sock.recvfrom, self.max_edns_payload or 4096),
+                    timeout=self.udp_timeout
+                )
+            finally:
+                # Restore non‑blocking mode for future operations
+                sock.setblocking(False)
             return response
         except (OSError, socket.error) as e:
             # If the socket is broken, remove it from the cache so a new one is created
