@@ -1538,7 +1538,7 @@ class DNSResolver:
                 raise dns.dnssec.ValidationFailure(f"No RRSIG for rrset {rrset.name}")
 
             # Determine the signer (the zone that signed)
-            signer_name = str(sig.signer).lower().rstrip('.')
+            signer_name = str(sig[0].signer).lower().rstrip('.')
             signer_name_obj = dns.name.from_text(signer_name)
 
             # Get the validated DNSKEY for the signer

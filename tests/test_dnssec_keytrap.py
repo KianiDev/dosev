@@ -38,7 +38,7 @@ def resolver():
 def create_rrsig(covered_type: int, name: str) -> dns.rrset.RRset:
     """Helper to create a valid RRSIG RRset using from_text with mnemonic type."""
     covered_text = dns.rdatatype.to_text(covered_type)   # "A", "MX", etc.
-    rrsig_text = f"{covered_text} 8 1 300 20350101000000 20300101000000 12345 {name} dummy_signature"
+    rrsig_text = f"{covered_text} 8 1 300 20350101000000 20300101000000 12345 {name} deadbeef"
     return dns.rrset.from_text(name, 300, dns.rdataclass.IN, dns.rdatatype.RRSIG, rrsig_text)
 
 
