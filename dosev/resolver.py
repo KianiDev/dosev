@@ -1,5 +1,6 @@
 # dosev/resolver.py – DNSSEC‑chain‑of‑trust version with NSEC3 support
-# Full corrected version – all known issues fixed, including proper H3 DoH pooling.
+# Full corrected version – all background tasks are started via `start()` to avoid
+# `RuntimeError: no running event loop` when constructing the resolver outside an async context.
 
 import asyncio
 import logging
@@ -726,24 +727,11 @@ class DNSResolver:
         self._flights: Dict[Tuple[str, int, bool], asyncio.Future] = {}
         self._flight_lock: asyncio.Lock = asyncio.Lock()
         self._background_tasks: Set[asyncio.Task] = set()
+        self._started: bool = False
 
+        # Load trust anchors synchronously (safe)
         if self.dnssec_enabled:
             self._load_trust_anchors()
-            if self.auto_update_trust_anchor:
-                self._trust_anchor_updater_task = asyncio.create_task(self._background_trust_anchor_updater())
-                self._background_tasks.add(self._trust_anchor_updater_task)
-
-        if self.rate_limiter:
-            task = asyncio.create_task(self.rate_limiter.start_cleanup())
-            self._background_tasks.add(task)
-
-        if self.dnssec_enabled:
-            self._insecure_cleanup_task = asyncio.create_task(self._cleanup_insecure_cache())
-            self._background_tasks.add(self._insecure_cleanup_task)
-
-        # Start H3 pool cleanup
-        task = asyncio.create_task(self._h3_pool.start_cleanup())
-        self._background_tasks.add(task)
 
     def _init_caches(self, cache_ttl: int, cache_max_size: int, negative_cache_ttl: int) -> None:
         if _HAS_CACHETOOLS:
@@ -756,6 +744,35 @@ class DNSResolver:
             self._wire_cache: Any = AsyncTTLCache(maxsize=cache_max_size, ttl=cache_ttl)
             self._negative_cache: Any = AsyncTTLCache(maxsize=cache_max_size, ttl=negative_cache_ttl)
             self._cache_is_sync: bool = False
+
+    async def start(self) -> None:
+        """Start all background tasks (rate limiter cleanup, insecure cache cleanup, H3 pool cleanup, etc.)."""
+        if self._started:
+            return
+        self._started = True
+
+        if self.dnssec_enabled and self.auto_update_trust_anchor and self._trust_anchor_updater_task is None:
+            self._trust_anchor_updater_task = asyncio.create_task(self._background_trust_anchor_updater())
+            self._background_tasks.add(self._trust_anchor_updater_task)
+
+        if self.rate_limiter:
+            task = asyncio.create_task(self.rate_limiter.start_cleanup())
+            self._background_tasks.add(task)
+
+        if self.dnssec_enabled:
+            self._insecure_cleanup_task = asyncio.create_task(self._cleanup_insecure_cache())
+            self._background_tasks.add(self._insecure_cleanup_task)
+
+        # H3 pool cleanup
+        task = asyncio.create_task(self._h3_pool.start_cleanup())
+        self._background_tasks.add(task)
+
+        # Health checks
+        if self._health_enabled and self.upstreams and self._health_task is None:
+            self._health_task = asyncio.create_task(self._health_check_loop())
+            self._background_tasks.add(self._health_task)
+
+        self.logger.info("Background tasks started")
 
     # ---------- Health check methods ----------
     def _get_upstream_key(self, upstream: Dict[str, Any]) -> str:
@@ -813,20 +830,12 @@ class DNSResolver:
                 self.logger.warning("Health check loop error: %s", e)
 
     async def start_health_checks(self) -> None:
-        if self._health_enabled and self.upstreams and self._health_task is None:
-            self._health_task = asyncio.create_task(self._health_check_loop())
-            self._background_tasks.add(self._health_task)
-            self.logger.info("Health check loop started")
+        # Deprecated: use start() instead
+        await self.start()
 
     async def start_background_tasks(self) -> None:
-        if self.dnssec_enabled and self.auto_update_trust_anchor and self._trust_anchor_updater_task is None:
-            self._trust_anchor_updater_task = asyncio.create_task(self._background_trust_anchor_updater())
-            self._background_tasks.add(self._trust_anchor_updater_task)
-            self.logger.info("Trust anchor updater started")
-        if self._health_enabled and self.upstreams and self._health_task is None:
-            self._health_task = asyncio.create_task(self._health_check_loop())
-            self._background_tasks.add(self._health_task)
-            self.logger.info("Health check loop started")
+        # Deprecated: use start() instead
+        await self.start()
 
     async def _get_healthy_upstreams(self, upstreams: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not self._health_enabled:

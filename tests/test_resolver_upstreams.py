@@ -71,17 +71,23 @@ async def test_forward_udp_uses_ip_override():
         "ip": "192.0.2.1"
     }
     data = dns.message.make_query("test.com", "A").to_wire()
+    orig_id = int.from_bytes(data[:2], 'big')
 
     with patch.object(resolver, "_resolve_upstream_ip") as mock_resolve:
         mock_resolve.return_value = "192.0.2.1"
 
+        # Build a proper DNS response with matching ID
+        resp = dns.message.make_response(dns.message.from_wire(data))
+        rr = dns.rrset.from_text("test.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "192.0.2.1")
+        resp.answer.append(rr)
+        resp_wire = resp.to_wire()
+
         loop = asyncio.get_running_loop()
-        # Mock both sock_sendall (to avoid selector registration) and run_in_executor
         with patch.object(loop, "sock_sendall", new=AsyncMock()):
-            with patch.object(loop, "run_in_executor", new=AsyncMock(return_value=(b"dummy_response", ("192.0.2.1", 10053)))):
+            with patch.object(loop, "run_in_executor", new=AsyncMock(return_value=(resp_wire, ("192.0.2.1", 10053)))):
                 with patch.object(resolver, "_get_udp_socket", new=AsyncMock(return_value=MagicMock())):
                     result = await resolver._forward_udp(data, upstream)
-                    assert result == b"dummy_response"
+                    assert result == resp_wire
                     mock_resolve.assert_called_once_with("example.com", "192.0.2.1")
 
 
