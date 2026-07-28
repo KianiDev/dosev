@@ -1,11 +1,11 @@
 """
-Integration tests using a mock DNS server to test full query flow.
+Consolidated integration tests.
+Combines: test_integration_mock_server.py, test_integration_upstreams.py
 """
-
 import asyncio
-import pytest
 import socket
 import struct
+import pytest
 import dns.message
 import dns.rdatatype
 import dns.rdataclass
@@ -15,8 +15,8 @@ import dns.rcode
 from dosev.resolver import DNSResolver
 
 
+# ---------- Mock DNS Server ----------
 class MockDNSServer:
-    """A simple mock DNS server that responds to queries on both UDP and TCP on the SAME port."""
     def __init__(self, response_func=None, delay=0, tcp_response_func=None):
         self.response_func = response_func or self.default_response
         self.tcp_response_func = tcp_response_func
@@ -93,19 +93,15 @@ class MockDNSServer:
 
     async def start(self, host='127.0.0.1', timeout=5.0):
         loop = asyncio.get_running_loop()
-
-        # Create a UDP socket and bind to a random port
         udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         udp_sock.bind((host, 0))
         self.port = udp_sock.getsockname()[1]
 
-        # Create a TCP socket and bind to the SAME port with SO_REUSEADDR
         tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         tcp_sock.bind((host, self.port))
 
-        # UDP transport
         udp_transport, udp_protocol = await asyncio.wait_for(
             loop.create_datagram_endpoint(
                 lambda: self.UDPProtocol(self),
@@ -115,7 +111,6 @@ class MockDNSServer:
         )
         self.udp_transport = udp_transport
 
-        # TCP server
         tcp_server = await asyncio.wait_for(
             loop.create_server(
                 lambda: self.TCPProtocol(self),
@@ -129,17 +124,13 @@ class MockDNSServer:
     async def stop(self, timeout=5.0):
         if self.udp_transport:
             self.udp_transport.close()
-            # Wait a tiny bit for the transport to close
             await asyncio.sleep(0.1)
             self.udp_transport = None
-
         if self.tcp_server:
             self.tcp_server.close()
             try:
-                # Use a timeout to avoid hanging, but don't let cancellation break it
                 await asyncio.wait_for(self.tcp_server.wait_closed(), timeout=timeout)
             except (asyncio.TimeoutError, asyncio.CancelledError):
-                # If it times out or is cancelled, just continue
                 pass
             finally:
                 self.tcp_server = None
@@ -155,6 +146,7 @@ async def mock_dns_server():
         await server.stop()
 
 
+# ---------- Integration tests ----------
 @pytest.mark.asyncio
 async def test_integration_udp_forward(mock_dns_server):
     resolver = DNSResolver(
@@ -209,7 +201,6 @@ async def test_integration_truncation_fallback(mock_dns_server):
         except Exception:
             return b""
 
-    # TCP response function returns normal response
     def tcp_response(data, addr):
         try:
             msg = dns.message.from_wire(data)
@@ -222,7 +213,6 @@ async def test_integration_truncation_fallback(mock_dns_server):
         except Exception:
             return b""
 
-    # Create a server that returns TC for UDP, normal for TCP
     udp_server = MockDNSServer(response_func=response_with_tc, tcp_response_func=tcp_response)
     await udp_server.start()
     try:
@@ -316,3 +306,74 @@ async def test_integration_parallel_load_balancing(mock_dns_server):
     finally:
         await server1.stop()
         await server2.stop()
+
+
+# ---------- Real upstream tests (skipped if no network) ----------
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def test_forward_dns_query_udp_real_upstream():
+    async def _test():
+        resolver = DNSResolver(
+            upstreams=[{"address": "1.1.1.1", "protocol": "udp", "port": 53, "ip": "1.1.1.1"}],
+            udp_timeout=5.0
+        )
+        query = dns.message.make_query("example.com", "A").to_wire()
+        response = await resolver.forward_dns_query(query)
+        msg = dns.message.from_wire(response)
+        assert msg.rcode() == dns.rcode.NOERROR
+        assert msg.answer
+        assert any(rr.rdtype == dns.rdatatype.A for rr in msg.answer)
+
+    _run(_test())
+
+
+def test_forward_dns_query_tcp_real_upstream():
+    async def _test():
+        resolver = DNSResolver(
+            upstreams=[{"address": "8.8.8.8", "protocol": "tcp", "port": 53, "ip": "8.8.8.8"}],
+            tcp_timeout=5.0
+        )
+        query = dns.message.make_query("example.com", "A").to_wire()
+        response = await resolver.forward_dns_query(query)
+        msg = dns.message.from_wire(response)
+        assert msg.rcode() == dns.rcode.NOERROR
+        assert msg.answer
+        assert any(rr.rdtype == dns.rdatatype.A for rr in msg.answer)
+
+    _run(_test())
+
+
+try:
+    import httpx
+    HTTPX_AVAILABLE = True
+except ImportError:
+    HTTPX_AVAILABLE = False
+
+
+@pytest.mark.skipif(
+    not HTTPX_AVAILABLE,
+    reason="Requires httpx for DoH tests"
+)
+def test_forward_dns_query_https_real_upstream():
+    async def _test():
+        resolver = DNSResolver(
+            upstreams=[{
+                "address": "cloudflare-dns.com",
+                "protocol": "https",
+                "port": 443,
+                "hostname": "cloudflare-dns.com",
+                "path": "/dns-query",
+                "doh_version": "1.1",
+            }],
+            doh_timeout=10.0
+        )
+        query = dns.message.make_query("example.com", "A").to_wire()
+        response = await resolver.forward_dns_query(query)
+        msg = dns.message.from_wire(response)
+        assert msg.rcode() == dns.rcode.NOERROR
+        assert msg.answer
+        assert any(rr.rdtype == dns.rdatatype.A for rr in msg.answer)
+
+    _run(_test())
