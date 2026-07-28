@@ -11,6 +11,7 @@ import time
 import socket
 import random
 import pytest
+import ssl
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import dns.message
@@ -23,6 +24,20 @@ from dns.rdtypes.ANY.RRSIG import RRSIG
 
 from dosev.resolver import DNSResolver, RateLimiter, AsyncTTLCache, ConnectionPool
 
+# ---------- Fixtures ----------
+@pytest.fixture
+def resolver():
+    """Basic resolver with a default upstream."""
+    return DNSResolver(upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}])
+
+
+@pytest.fixture
+def resolver_with_scrub():
+    """Resolver with NS scrubbing enabled."""
+    return DNSResolver(
+        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
+        scrub_unsolicited_ns=True,
+    )
 
 # ---------- Helpers ----------
 def make_a_response(qname: str, ip: str = "192.0.2.1", ttl: int = 60) -> bytes:
