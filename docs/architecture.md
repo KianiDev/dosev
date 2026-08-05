@@ -187,7 +187,7 @@ The modular design makes it easy to add:
 
 - **Unit tests**: cover all core logic with mocked network calls.
 - **Integration tests**: test against real upstreams (using `dig` or stub servers).
-- **CI**: runs on Linux, macOS, and Windows for Python 3.10–3.14.
+- **CI**: runs on Linux, macOS, and Windows for Python 3.11–3.14.
 
 ---
 
