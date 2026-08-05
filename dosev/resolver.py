@@ -2611,7 +2611,7 @@ class DNSResolver:
             return self.build_block_response(original_data)
 
         # 5. Build cache key (without ECS for negative cache)
-        cache_key = (qname, qtype, "global")
+        cache_key = (qname.lower(), qtype, "global")
 
         # 6. Negative cache lookup
         neg_entry = await self._negative_cache_get(cache_key)
@@ -2658,10 +2658,10 @@ class DNSResolver:
         # 8. Scope-aware wire cache lookup (positive)
         cached_entry = None
         if client_subnet_prefix > 0:
-            subnet_key = (qname, qtype, f"{client_ip}/{client_subnet_prefix}")
+            subnet_key = (qname.lower(), qtype, f"{client_ip}/{client_subnet_prefix}")
             cached_entry = await self._wire_cache_get_valid(subnet_key)
         if cached_entry is None:
-            global_key = (qname, qtype, "global")
+            global_key = (qname.lower(), qtype, "global")
             cached_entry = await self._wire_cache_get_valid(global_key)
 
         if cached_entry is not None:
@@ -2670,22 +2670,32 @@ class DNSResolver:
             return self._set_query_id(resp_bytes, orig_id)
 
         # 9. Flight coalescing (in-flight query deduplication)
-        flight_key = (qname, qtype, client_subnet_prefix, client_ip if client_subnet_prefix else None)
-        async with self._flight_lock:
-            existing_future = self._flights.get(flight_key)
-            if existing_future and not existing_future.done():
-                self.logger.debug("Coalescing flight for %s", qname)
-                # Wait for the existing flight to complete, then return its result.
+        flight_key = (qname.lower(), qtype, client_subnet_prefix, client_ip if client_subnet_prefix else None)
+        
+        while True:
+            existing_future = None
+            future = None
+            
+            async with self._flight_lock:
+                existing_future = self._flights.get(flight_key)
+                if existing_future and not existing_future.done():
+                    self.logger.debug("Coalescing flight for %s", qname)
+                else:
+                    existing_future = None
+                    future = asyncio.get_running_loop().create_future()
+                    self._flights[flight_key] = future
+
+            if existing_future:
+                # Wait for the existing flight to complete OUTSIDE the lock
                 try:
                     return await existing_future
                 except Exception as e:
                     self.logger.debug("Coalesced flight failed: %s", e)
-                    # If the existing flight failed, remove it and continue to retry.
-                    self._flights.pop(flight_key, None)
-                    # fall through to create a new flight
-            # Create a new future and store it
-            future = asyncio.get_running_loop().create_future()
-            self._flights[flight_key] = future
+                    # Loop around and try to become the leader again
+                    continue
+            
+            # We are the leader; exit the loop
+            break
 
         # At this point, we are the "leader" – we must set the future result/exception.
         try:
@@ -2759,9 +2769,9 @@ class DNSResolver:
                             returned_scope = opt.data[3]
                             break
                     if returned_scope > 0 and client_ip:
-                        final_key = (qname, qtype, f"{client_ip}/{returned_scope}")
+                        final_key = (qname.lower(), qtype, f"{client_ip}/{returned_scope}")
                     else:
-                        final_key = (qname, qtype, "global")
+                        final_key = (qname.lower(), qtype, "global")
                     if min_ttl > 0:
                         expiry = time.time() + min_ttl
                         stale_until = expiry + self.stale_max_age if self.optimistic_cache_enabled else expiry
@@ -2783,9 +2793,10 @@ class DNSResolver:
         finally:
             # Remove the future from the dict, but only if it's still the same one.
             # This prevents removing a future that was replaced by a new leader.
-            async with self._flight_lock:
-                if self._flights.get(flight_key) is future:
-                    self._flights.pop(flight_key, None)
+            if future is not None:
+                async with self._flight_lock:
+                    if self._flights.get(flight_key) is future:
+                        self._flights.pop(flight_key, None)
     # ---------- Helper methods ----------
     async def _check_hosts_and_blocklists(self, qname: str, qtype: int, original_data: bytes) -> Optional[bytes]:
         if qname:
@@ -3498,9 +3509,8 @@ class DNSResolver:
             except ImportError:
                 pass
 
-            # FIX: connect() is a coroutine that returns a context manager
-            # We must await it first, then enter the context
-            cm = await connect(resolved, port, configuration=config, create_protocol=DoQProtocol)
+            # FIX: connect() is not a coroutine; it synchronously returns an async context manager
+            cm = connect(resolved, port, configuration=config, create_protocol=DoQProtocol)
             try:
                 client = await cm.__aenter__()
                 client._cm = cm
