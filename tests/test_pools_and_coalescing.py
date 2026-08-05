@@ -51,12 +51,19 @@ async def test_flight_coalescing(monkeypatch):
     async def fake_try_upstream(upstream, data, _health_check=False, _no_retry=False):
         nonlocal call_count
         call_count += 1
-        await asyncio.sleep(0.2)  # was 0.05
-        return data[:2] + b'\x81\x80' + data[4:]
+        await asyncio.sleep(0.01)  # Reduced from 0.2 for faster test
+        # Return a response that matches the query ID
+        try:
+            query_msg = dns.message.from_wire(data)
+            resp = dns.message.make_response(query_msg)
+            resp.answer.append(dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "192.0.2.1"))
+            return resp.to_wire()
+        except Exception:
+            return data[:2] + b'\x81\x80' + data[4:]
 
     monkeypatch.setattr(resolver, '_try_upstream', fake_try_upstream)
 
-    q = b"\x12\x34" + b"\x01\x00" + b"\x00\x01\x00\x00\x00\x00\x00\x00" + b"\x07example\x03com\x00\x00\x01\x00\x01"
+    q = dns.message.make_query("example.com", "A").to_wire()
 
     async def invoke():
         return await resolver.forward_dns_query(q)

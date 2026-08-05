@@ -252,18 +252,27 @@ async def test_doq_connection_pool_reuse():
             pass
 
     with patch("aioquic.asyncio.connect", return_value=CM()) as mock_connect:
-        response_data = b"dummy_response"
-        prefixed_response = len(response_data).to_bytes(2, "big") + response_data
-        with patch("asyncio.wait_for", new=AsyncMock(return_value=prefixed_response)):
-            query = dns.message.make_query("example.com", "A").to_wire()
-            upstream = resolver.upstreams[0]
+        # Create a proper query and matching response
+        query = dns.message.make_query("example.com", "A")
+        query_wire = query.to_wire()
+        query_id = query_wire[:2]
 
-            result1 = await resolver._forward_quic(query, upstream)
-            assert result1 == response_data
+        resp = dns.message.make_response(query)
+        rr = dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "192.0.2.1")
+        resp.answer.append(rr)
+        response_wire = resp.to_wire()
+        # Ensure response has same ID as query
+        response_wire = query_id + response_wire[2:]
+        response_data = len(response_wire).to_bytes(2, 'big') + response_wire
+
+        with patch("asyncio.wait_for", new=AsyncMock(return_value=response_data)):
+            upstream = resolver.upstreams[0]
+            result1 = await resolver._forward_quic(query_wire, upstream)
+            assert result1 == response_wire
             assert mock_connect.call_count == 1
 
-            result2 = await resolver._forward_quic(query, upstream)
-            assert result2 == response_data
+            result2 = await resolver._forward_quic(query_wire, upstream)
+            assert result2 == response_wire
             assert mock_connect.call_count == 1
 
 
@@ -294,18 +303,25 @@ async def test_doq_connection_pool_closed_connection():
         with patch.object(resolver._quic_pool, "get") as mock_pool_get:
             mock_pool_get.side_effect = [None, client_closed]
 
-            response_data = b"dummy_response"
-            prefixed_response = len(response_data).to_bytes(2, "big") + response_data
-            with patch("asyncio.wait_for", new=AsyncMock(return_value=prefixed_response)):
-                query = dns.message.make_query("example.com", "A").to_wire()
-                upstream = resolver.upstreams[0]
+            # Create matching query/response
+            query = dns.message.make_query("example.com", "A")
+            query_wire = query.to_wire()
+            query_id = query_wire[:2]
 
-                result1 = await resolver._forward_quic(query, upstream)
-                assert result1 == response_data
+            resp = dns.message.make_response(query)
+            resp.answer.append(dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "192.0.2.1"))
+            response_wire = resp.to_wire()
+            response_wire = query_id + response_wire[2:]
+            response_data = len(response_wire).to_bytes(2, 'big') + response_wire
+
+            with patch("asyncio.wait_for", new=AsyncMock(return_value=response_data)):
+                upstream = resolver.upstreams[0]
+                result1 = await resolver._forward_quic(query_wire, upstream)
+                assert result1 == response_wire
                 assert mock_connect.call_count == 1
 
-                result2 = await resolver._forward_quic(query, upstream)
-                assert result2 == response_data
+                result2 = await resolver._forward_quic(query_wire, upstream)
+                assert result2 == response_wire
                 assert mock_connect.call_count == 2
 
 

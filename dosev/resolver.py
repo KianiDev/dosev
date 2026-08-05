@@ -3451,6 +3451,7 @@ class DNSResolver:
         from aioquic.asyncio import connect
         from aioquic.asyncio.protocol import QuicConnectionProtocol
         from aioquic.quic.configuration import QuicConfiguration
+        from aioquic.quic.events import StreamDataReceived
 
         host = upstream['address']
         port = upstream.get('port', 853)
@@ -3495,7 +3496,7 @@ class DNSResolver:
             except ImportError:
                 pass
 
-            cm = connect(resolved, port, configuration=config, create_protocol=DoQProtocol)
+            cm = await connect(resolved, port, configuration=config, create_protocol=DoQProtocol)
             client = await cm.__aenter__()
             client._cm = cm
             client._pending = {}
