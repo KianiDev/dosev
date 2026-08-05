@@ -43,23 +43,31 @@ async def test_client_pool_stop_closes_clients(monkeypatch):
     assert not pool._pools
 
 
+import dns.message
+import dns.rdataclass
+import dns.rdatatype
+import dns.rrset
+
 @pytest.mark.asyncio
 async def test_flight_coalescing(monkeypatch):
-    resolver = DNSResolver(upstreams=[{'address':'1.1.1.1','protocol':'udp','port':53,'ip':'1.1.1.1'}])
+    resolver = DNSResolver(
+        upstreams=[{'address':'1.1.1.1','protocol':'udp','port':53,'ip':'1.1.1.1'}],
+        cache_ttl=0,  # Disable caching
+        negative_cache_ttl=0
+    )
     call_count = 0
+    lock = asyncio.Lock()
 
     async def fake_try_upstream(upstream, data, _health_check=False, _no_retry=False):
         nonlocal call_count
-        call_count += 1
-        await asyncio.sleep(0.01)  # Reduced from 0.2 for faster test
-        # Return a response that matches the query ID
-        try:
-            query_msg = dns.message.from_wire(data)
-            resp = dns.message.make_response(query_msg)
-            resp.answer.append(dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "192.0.2.1"))
-            return resp.to_wire()
-        except Exception:
-            return data[:2] + b'\x81\x80' + data[4:]
+        async with lock:
+            call_count += 1
+        await asyncio.sleep(0.5)  # Extended wait to guarantee concurrency overlapping
+        query_msg = dns.message.from_wire(data)
+        resp = dns.message.make_response(query_msg)
+        rr = dns.rrset.from_text("example.com.", 0, dns.rdataclass.IN, dns.rdatatype.A, "192.0.2.1")  # TTL=0
+        resp.answer.append(rr)
+        return resp.to_wire()
 
     monkeypatch.setattr(resolver, '_try_upstream', fake_try_upstream)
 
@@ -68,7 +76,8 @@ async def test_flight_coalescing(monkeypatch):
     async def invoke():
         return await resolver.forward_dns_query(q)
 
+    # Run concurrent queries
     results = await asyncio.gather(invoke(), invoke(), invoke())
-    assert call_count == 1
+    assert call_count == 1, f"Expected 1 call, got {call_count}"
     assert all(r == results[0] for r in results)
- 
+    

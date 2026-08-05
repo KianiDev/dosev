@@ -3445,6 +3445,7 @@ class DNSResolver:
 
     # ---------- DOQ with connection pooling and fragmentation fix ----------
     async def _forward_quic(self, data: bytes, upstream: Dict[str, Any]) -> bytes:
+        """Forward DNS query over QUIC (DoQ)."""
         if not _HAS_AIOQUIC:
             raise RuntimeError("aioquic not available for DoQ")
 
@@ -3479,6 +3480,7 @@ class DNSResolver:
                             data = bytes(self._fragments.pop(event.stream_id))
                             fut.set_result(data)
 
+        # Get from pool
         client = await self._quic_pool.get(key)
         if client is not None and not self._is_quic_connection_alive(client):
             client = None
@@ -3496,54 +3498,74 @@ class DNSResolver:
             except ImportError:
                 pass
 
+            # FIX: connect() is a coroutine that returns a context manager
+            # We must await it first, then enter the context
             cm = await connect(resolved, port, configuration=config, create_protocol=DoQProtocol)
-            client = await cm.__aenter__()
-            client._cm = cm
-            client._pending = {}
-            client._fragments = {}
-
-        await client.wait_connected()
-
-        stream_id = client._quic.get_next_available_stream_id()
-        future = asyncio.get_running_loop().create_future()
-        client._pending[stream_id] = future
-
-        client._quic.send_stream_data(stream_id, len(data).to_bytes(2, "big") + data, end_stream=True)
-        client.transmit()
+            try:
+                client = await cm.__aenter__()
+                client._cm = cm
+                client._pending = {}
+                client._fragments = {}
+            except Exception:
+                await cm.__aexit__(None, None, None)
+                raise
 
         try:
-            response_data = await asyncio.wait_for(future, timeout=self.doh_timeout)
-        except asyncio.TimeoutError:
-            client._pending.pop(stream_id, None)
-            if self._is_quic_connection_alive(client):
-                client._quic.close()
-            raise TimeoutError(f"DoQ query to {host}:{port} timed out")
-        except Exception:
-            client._pending.pop(stream_id, None)
-            raise
-        finally:
-            client._pending.pop(stream_id, None)
-            client._fragments.pop(stream_id, None)
+            await client.wait_connected()
 
-        if len(response_data) < 2:
-            raise Exception("Invalid DoQ response (too short)")
-        resp_len = int.from_bytes(response_data[:2], "big")
-        if resp_len + 2 > len(response_data):
-            raise Exception("DoQ response truncated")
-        resp = response_data[2:2+resp_len]
+            stream_id = client._quic.get_next_available_stream_id()
+            future = asyncio.get_running_loop().create_future()
+            client._pending[stream_id] = future
 
-        # RFC 9250: Validate Transaction ID matches query
-        if len(resp) >= 2 and len(data) >= 2:
-            resp_id = int.from_bytes(resp[:2], 'big')
-            sent_id = int.from_bytes(data[:2], 'big')
-            if resp_id != sent_id:
-                self.logger.warning("DoQ response ID mismatch: sent %d, got %d", sent_id, resp_id)
-                raise OSError("DoQ Response ID mismatch")
+            # DoQ format: 2-byte length prefix + DNS message
+            client._quic.send_stream_data(
+                stream_id,
+                len(data).to_bytes(2, 'big') + data,
+                end_stream=True
+            )
+            client.transmit()
 
-        if self._is_quic_connection_alive(client):
+            try:
+                response_data = await asyncio.wait_for(future, timeout=self.doh_timeout)
+            except asyncio.TimeoutError:
+                client._pending.pop(stream_id, None)
+                if self._is_quic_connection_alive(client):
+                    client._quic.close()
+                raise TimeoutError(f"DoQ query to {host}:{port} timed out")
+            except Exception:
+                client._pending.pop(stream_id, None)
+                raise
+            finally:
+                client._pending.pop(stream_id, None)
+                client._fragments.pop(stream_id, None)
+
+            if len(response_data) < 2:
+                raise Exception("Invalid DoQ response (too short)")
+            resp_len = int.from_bytes(response_data[:2], 'big')
+            if resp_len + 2 > len(response_data):
+                raise Exception("DoQ response truncated")
+            resp = response_data[2:2+resp_len]
+
+            # RFC 9250: Validate Transaction ID matches query
+            if len(resp) >= 2 and len(data) >= 2:
+                resp_id = int.from_bytes(resp[:2], 'big')
+                sent_id = int.from_bytes(data[:2], 'big')
+                if resp_id != sent_id:
+                    self.logger.warning("DoQ response ID mismatch: sent %d, got %d", sent_id, resp_id)
+                    raise OSError("DoQ Response ID mismatch")
+
+            # Store in pool
             await self._quic_pool.put(key, client)
+            return resp
 
-        return resp
+        except Exception:
+            # Don't pool failed connections
+            if client is not None and hasattr(client, '_cm'):
+                try:
+                    await client._cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            raise
 
     # ---------- remainder of file ----------
     def _split_hostport(self, hostport: str, default_port: int = 53) -> Tuple[str, int]:

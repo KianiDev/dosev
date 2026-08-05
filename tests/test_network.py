@@ -245,8 +245,8 @@ async def test_doq_connection_pool_reuse():
     mock_client = MockQuicClient(closed=False)
     mock_client.wait_connected = AsyncMock(return_value=None)
 
-    # Mock the connect function to return a coroutine that yields the client
-    async def mock_connect_coro(*args, **kwargs):
+    # Mock the connect function to return a context manager
+    def mock_connect_func(*args, **kwargs):
         class CM:
             async def __aenter__(self):
                 return mock_client
@@ -254,7 +254,7 @@ async def test_doq_connection_pool_reuse():
                 pass
         return CM()
 
-    with patch("aioquic.asyncio.connect", return_value=CM()) as mock_connect:
+    with patch("aioquic.asyncio.connect", side_effect=mock_connect_func) as mock_connect:
         # Create a proper query and matching response
         query = dns.message.make_query("example.com", "A")
         query_wire = query.to_wire()
@@ -282,29 +282,29 @@ async def test_doq_connection_pool_reuse():
 @pytest.mark.asyncio
 async def test_doq_connection_pool_closed_connection():
     resolver = DNSResolver(upstreams=[{"address": "example.com", "protocol": "quic", "port": 853}])
-    client_open = MockQuicClient(closed=False)
-    client_open.wait_connected = AsyncMock(return_value=None)
-    client_closed = MockQuicClient(closed=True)
-    client_closed.wait_connected = AsyncMock(return_value=None)
 
-    class CMOpen:
-        async def __aenter__(self):
-            return client_open
-        async def __aexit__(self, *args):
-            pass
-    class CMClosed:
-        async def __aenter__(self):
-            return client_closed
-        async def __aexit__(self, *args):
-            pass
+    # Mock connect to return different clients
+    connect_call_count = 0
+    def mock_connect_func(*args, **kwargs):
+        nonlocal connect_call_count
+        connect_call_count += 1
+        if connect_call_count == 1:
+            client = MockQuicClient(closed=False)
+            client.wait_connected = AsyncMock(return_value=None)
+        else:
+            client = MockQuicClient(closed=True)
+            client.wait_connected = AsyncMock(return_value=None)
 
-    connect_returns = [CMOpen(), CMClosed()]
-    def connect_side_effect(*args, **kwargs):
-        return connect_returns.pop(0)
+        class CM:
+            async def __aenter__(self):
+                return client
+            async def __aexit__(self, *args):
+                pass
+        return CM()
 
-    with patch("aioquic.asyncio.connect", side_effect=connect_side_effect) as mock_connect:
+    with patch("aioquic.asyncio.connect", side_effect=mock_connect_func) as mock_connect:
         with patch.object(resolver._quic_pool, "get") as mock_pool_get:
-            mock_pool_get.side_effect = [None, client_closed]
+            mock_pool_get.side_effect = [None, MockQuicClient(closed=True)]
 
             # Create matching query/response
             query = dns.message.make_query("example.com", "A")
@@ -334,13 +334,15 @@ async def test_doq_connection_pool_handles_timeout():
     mock_client = MockQuicClient(closed=False)
     mock_client.wait_connected = AsyncMock(return_value=None)
 
-    class CM:
-        async def __aenter__(self):
-            return mock_client
-        async def __aexit__(self, *args):
-            pass
+    def mock_connect_func(*args, **kwargs):
+        class CM:
+            async def __aenter__(self):
+                return mock_client
+            async def __aexit__(self, *args):
+                pass
+        return CM()
 
-    with patch("aioquic.asyncio.connect", return_value=CM()) as mock_connect:
+    with patch("aioquic.asyncio.connect", side_effect=mock_connect_func) as mock_connect:
         with patch("asyncio.wait_for", new=AsyncMock(side_effect=asyncio.TimeoutError)):
             query = dns.message.make_query("example.com", "A").to_wire()
             upstream = resolver.upstreams[0]
@@ -358,20 +360,22 @@ async def test_doq_pool_handles_connection_error_during_handshake():
     mock_client._connected = False
     mock_client.wait_connected = AsyncMock(side_effect=ConnectionError("Connection failed"))
 
-    class CM:
-        async def __aenter__(self):
-            return mock_client
-        async def __aexit__(self, *args):
-            pass
+    def mock_connect_func(*args, **kwargs):
+        class CM:
+            async def __aenter__(self):
+                return mock_client
+            async def __aexit__(self, *args):
+                pass
+        return CM()
 
-    with patch("aioquic.asyncio.connect", return_value=CM()) as mock_connect:
+    with patch("aioquic.asyncio.connect", side_effect=mock_connect_func) as mock_connect:
         query = dns.message.make_query("example.com", "A").to_wire()
         upstream = resolver.upstreams[0]
 
         with patch.object(resolver._quic_pool, "put") as mock_put:
             with pytest.raises(ConnectionError):
                 await resolver._forward_quic(query, upstream)
-            mock_put.assert_not_called()
+            mock_put.assert_not_called()    
 
 
 # ---------- TCP fallback tests (already in resolver, but keep separate for clarity) ----------
