@@ -245,11 +245,14 @@ async def test_doq_connection_pool_reuse():
     mock_client = MockQuicClient(closed=False)
     mock_client.wait_connected = AsyncMock(return_value=None)
 
-    class CM:
-        async def __aenter__(self):
-            return mock_client
-        async def __aexit__(self, *args):
-            pass
+    # Mock the connect function to return a coroutine that yields the client
+    async def mock_connect_coro(*args, **kwargs):
+        class CM:
+            async def __aenter__(self):
+                return mock_client
+            async def __aexit__(self, *args):
+                pass
+        return CM()
 
     with patch("aioquic.asyncio.connect", return_value=CM()) as mock_connect:
         # Create a proper query and matching response
