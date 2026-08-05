@@ -76,6 +76,8 @@ doh = 5.0
 [advanced]
 # Number of retries per upstream before failing over.
 retries = 2
+# Initial backoff (seconds) before first retry, doubles each attempt.
+initial_backoff = 0.1
 # Rate limiting (queries per second per client IP). 0 = unlimited.
 rate_limit_rps = 0.0
 # Burst size for rate limiter (token bucket).
@@ -287,7 +289,10 @@ def _validate_and_warn(config: Dict[str, Any]) -> None:
     if config.get('dns_enable_doh', False) and not (config.get('dns_doh_cert_file') and config.get('dns_doh_key_file')):
         raise ValueError('dns_enable_doh requires dns_doh_cert_file and dns_doh_key_file')
 
-    if config.get('dns_enable_dot', False) or config.get('dns_enable_doh', False):
+    if config.get('dns_enable_http3', False) and not (config.get('dns_doh_cert_file') and config.get('dns_doh_key_file')):
+        raise ValueError('dns_enable_http3 requires dns_doh_cert_file and dns_doh_key_file')
+
+    if config.get('dns_enable_dot', False) or config.get('dns_enable_doh', False) or config.get('dns_enable_http3', False):
         if config.get('protocol') == 'udp':
             warnings.warn(
                 'Secure listeners are enabled while the main resolver protocol is udp; '
@@ -301,6 +306,19 @@ def _validate_and_warn(config: Dict[str, Any]) -> None:
     rate_limit_burst = config.get('rate_limit_burst', 0.0)
     if rate_limit_burst < 0:
         raise ValueError('rate_limit_burst must be non-negative')
+
+    dns_cache_ttl = config.get('dns_cache_ttl', 300)
+    if not isinstance(dns_cache_ttl, (int, float)) or dns_cache_ttl <= 0:
+        raise ValueError('dns_cache_ttl must be positive')
+    dns_cache_max_size = config.get('dns_cache_max_size', 1024)
+    if not isinstance(dns_cache_max_size, int) or dns_cache_max_size <= 0:
+        raise ValueError('dns_cache_max_size must be positive')
+    dns_negative_cache_ttl = config.get('dns_negative_cache_ttl', 5)
+    if not isinstance(dns_negative_cache_ttl, (int, float)) or dns_negative_cache_ttl <= 0:
+        raise ValueError('dns_negative_cache_ttl must be positive')
+    pool_max_size = config.get('pool_max_size', 5)
+    if not isinstance(pool_max_size, int) or pool_max_size <= 0:
+        raise ValueError('pool_max_size must be positive')
 
     if config.get('metrics_enabled', False) and config.get('metrics_port', 8000) == 53:
         warnings.warn('Metrics are enabled on port 53; this may conflict with DNS traffic.', RuntimeWarning)
@@ -382,6 +400,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
             'metrics_port': 8000,
             'uvloop_enable': False,
             'upstream_retries': 2,
+            'upstream_initial_backoff': 0.1,
             'upstream_udp_timeout': 2.0,
             'upstream_tcp_timeout': 5.0,
             'upstream_doh_timeout': 5.0,
@@ -460,6 +479,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
     upstream_udp_timeout = config.getfloat('timeouts', 'udp', fallback=2.0)
     upstream_tcp_timeout = config.getfloat('timeouts', 'tcp', fallback=5.0)
     upstream_doh_timeout = config.getfloat('timeouts', 'doh', fallback=5.0)
+    upstream_initial_backoff = config.getfloat('advanced', 'initial_backoff', fallback=0.1)
 
     # Advanced
     upstream_retries = config.getint('advanced', 'retries', fallback=2)
@@ -641,6 +661,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
         'metrics_port': metrics_port,
         'uvloop_enable': uvloop_enable,
         'upstream_retries': upstream_retries,
+        'upstream_initial_backoff': upstream_initial_backoff,
         'upstream_udp_timeout': upstream_udp_timeout,
         'upstream_tcp_timeout': upstream_tcp_timeout,
         'upstream_doh_timeout': upstream_doh_timeout,

@@ -164,6 +164,7 @@ async def test_http3_protocol_handles_get_request():
             send_responses.append((status, body, content_type))
         protocol._send_response = fake_send_response
 
+        protocol._client_ip = "1.2.3.4"
         query = dns.message.make_query("example.com", "A").to_wire()
         b64 = base64.urlsafe_b64encode(query).decode()
         headers = {
@@ -199,6 +200,7 @@ async def test_http3_protocol_handles_post_request():
             send_responses.append((status, body, content_type))
         protocol._send_response = fake_send_response
 
+        protocol._client_ip = "1.2.3.4"
         query = dns.message.make_query("example.com", "A").to_wire()
         headers = {
             ":method": "POST",

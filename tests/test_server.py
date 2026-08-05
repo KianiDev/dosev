@@ -240,6 +240,28 @@ def test_drop_dns_privileges_drops_privs_when_root(monkeypatch):
     assert called.get('chroot') == '/var/empty'
 
 
+def test_drop_dns_privileges_raises_when_user_resolution_fails(monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+
+    import sys
+    try:
+        import pwd
+    except ImportError:
+        pwd = types.SimpleNamespace()
+        sys.modules["pwd"] = pwd
+    try:
+        import grp
+    except ImportError:
+        grp = types.SimpleNamespace()
+        sys.modules["grp"] = grp
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError("no such user")), raising=False)
+    monkeypatch.setattr(grp, "getgrnam", lambda name: types.SimpleNamespace(gr_gid=999), raising=False)
+
+    with pytest.raises(KeyError):
+        _drop_dns_privileges("missinguser", "nogroup", None)
+
+
 # ---------- Reload resolver ----------
 @pytest.mark.asyncio
 async def test_reload_resolver_updates_max_edns_payload(monkeypatch):

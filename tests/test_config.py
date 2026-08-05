@@ -110,6 +110,30 @@ def test_validate_invalid_validation_timeout():
         _validate_and_warn({"dnssec_validation_timeout": -1.0})
 
 
+def test_validate_invalid_cache_and_pool_options():
+    """Validation should reject invalid cache TTL/size and pool settings."""
+    with pytest.raises(ValueError, match="dns_cache_ttl must be positive"):
+        _validate_and_warn({"dns_cache_ttl": 0})
+
+    with pytest.raises(ValueError, match="dns_cache_max_size must be positive"):
+        _validate_and_warn({"dns_cache_max_size": 0})
+
+    with pytest.raises(ValueError, match="dns_negative_cache_ttl must be positive"):
+        _validate_and_warn({"dns_negative_cache_ttl": 0})
+
+    with pytest.raises(ValueError, match="pool_max_size must be positive"):
+        _validate_and_warn({"pool_max_size": 0})
+
+
+def test_validate_http3_requires_cert_and_key():
+    """Validation should require cert/key when HTTP/3 is enabled."""
+    with pytest.raises(ValueError, match="dns_enable_http3 requires dns_doh_cert_file and dns_doh_key_file"):
+        _validate_and_warn({"dns_enable_http3": True})
+
+    with pytest.raises(ValueError, match="dns_enable_http3 requires dns_doh_cert_file and dns_doh_key_file"):
+        _validate_and_warn({"dns_enable_http3": True, "dns_doh_cert_file": "/tmp/cert.pem"})
+
+
 def test_load_config_parses_all_extra_sections(tmp_path):
     cfg_path = tmp_path / "dosev.conf"
     cfg = configparser.ConfigParser()

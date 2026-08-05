@@ -6,6 +6,7 @@ import asyncio
 import time
 import tempfile
 import os
+import base64
 import pytest
 from unittest.mock import AsyncMock, patch
 
@@ -82,6 +83,8 @@ async def test_no_cd_flag_triggers_validation(resolver_with_dnssec):
 
     query = dns.message.make_query("example.com", "A")
     query.flags &= ~0x0010
+    query.use_edns(edns=0, payload=1232, options=[])
+    query.ednsflags = dns.flags.DO  # <-- add this
     qwire = query.to_wire()
 
     resp = dns.message.make_response(query)
@@ -209,6 +212,660 @@ class TestDNSSECChain:
 
         result = await resolver._prove_insecure_delegation("example.com", ".")
         assert result is True
+
+    @pytest.mark.asyncio
+    async def test_chain_validation_nsec3_nxdomain_full_proof(self):
+        resolver = DNSResolver(
+            dnssec_enabled=True,
+            dnssec_chain_validation=True,
+            dnssec_max_validations=10,
+            dnssec_max_dnskey_records=5,
+            dnssec_validation_timeout=2.0,
+            trust_anchors=None,
+        )
+
+        dnskey_rrset = make_dnskey_rrset("example.com.", 256, 3, 8, bytes.fromhex("deadbeef"))
+
+        async def fake_get_key(zone):
+            if zone == "example.com":
+                return dnskey_rrset
+            return None
+        resolver._get_validated_dnskey = fake_get_key
+
+        # Build an NXDOMAIN response for foo.example.com with NSEC3 proof.
+        msg = dns.message.make_query("foo.example.com.", dns.rdatatype.A)
+        resp = dns.message.make_response(msg)
+        resp.set_rcode(dns.rcode.NXDOMAIN)
+
+        hash_map = {
+            "example.com.": "22222222222222222222222222222222",
+            "*.example.com.": "44444444444444444444444444444444",
+            "foo.example.com.": "33333333333333333333333333333333",
+            "*.foo.example.com.": "55555555555555555555555555555555",
+        }
+
+        def fake_hash(name: str, salt: bytes, iterations: int, algorithm: int) -> str:
+            return hash_map.get(name, "77777777777777777777777777777777")
+        resolver._nsec3_hash = fake_hash
+
+        next_example = base64.b32decode("44444444444444444444444444444444")
+        next_wildcard = base64.b32decode("66666666666666666666666666666666")
+
+        nsec3_example = dns.rdtypes.ANY.NSEC3.NSEC3(
+            rdclass=dns.rdataclass.IN,
+            rdtype=dns.rdatatype.NSEC3,
+            algorithm=1,
+            flags=0,
+            iterations=0,
+            salt=b'',
+            next=next_example,
+            windows=[(0, b'\x00')],
+        )
+        nsec3_example_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
+        nsec3_example_rrset.ttl = 3600
+        nsec3_example_rrset.add(nsec3_example)
+
+        nsec3_wildcard = dns.rdtypes.ANY.NSEC3.NSEC3(
+            rdclass=dns.rdataclass.IN,
+            rdtype=dns.rdatatype.NSEC3,
+            algorithm=1,
+            flags=0,
+            iterations=0,
+            salt=b'',
+            next=next_wildcard,
+            windows=[(0, b'\x00')],
+        )
+        nsec3_wildcard_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['*.example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
+        nsec3_wildcard_rrset.ttl = 3600
+        nsec3_wildcard_rrset.add(nsec3_wildcard)
+
+        rrsig_example = dns.rrset.from_text(
+            f"{hash_map['example.com.']}.example.com.",
+            3600,
+            "IN",
+            "RRSIG",
+            "NSEC3 8 2 3600 20350101000000 20300101000000 12345 example.com. deadbeef"
+        )
+        rrsig_wildcard = dns.rrset.from_text(
+            f"{hash_map['*.example.com.']}.example.com.",
+            3600,
+            "IN",
+            "RRSIG",
+            "NSEC3 8 2 3600 20350101000000 20300101000000 12345 example.com. deadbeef"
+        )
+
+        resp.authority.append(nsec3_example_rrset)
+        resp.authority.append(rrsig_example)
+        resp.authority.append(nsec3_wildcard_rrset)
+        resp.authority.append(rrsig_wildcard)
+
+        with patch('dns.dnssec.validate_rrsig', return_value=None):
+            secure, insecure = await resolver._dnssec_validate_chain("foo.example.com.", resp.to_wire(), dnssec_requested=True)
+            assert secure is True
+            assert insecure is False
+
+    @pytest.mark.asyncio
+    async def test_chain_validation_nsec3_nxdomain_closest_encloser_wildcard_candidate(self):
+        resolver = DNSResolver(
+            dnssec_enabled=True,
+            dnssec_chain_validation=True,
+            dnssec_max_validations=10,
+            dnssec_max_dnskey_records=5,
+            dnssec_validation_timeout=2.0,
+            trust_anchors=None,
+        )
+
+        dnskey_rrset = make_dnskey_rrset("example.com.", 256, 3, 8, bytes.fromhex("deadbeef"))
+        async def fake_get_key(zone):
+            if zone == "example.com":
+                return dnskey_rrset
+            return None
+        resolver._get_validated_dnskey = fake_get_key
+
+        hash_map = {
+            "www.foo.example.com.": "33333333333333333333333333333333",
+            "foo.example.com.": "55555555555555555555555555555555",
+            "example.com.": "22222222222222222222222222222222",
+            "*.example.com.": "66666666666666666666666666666666",
+        }
+        hashed_names = []
+        def fake_hash(name: str, salt: bytes, iterations: int, algorithm: int) -> str:
+            hashed_names.append(name)
+            return hash_map.get(name, "ffffffffffffffffffffffffffffffff")
+        resolver._nsec3_hash = fake_hash
+
+        msg = dns.message.make_query("www.foo.example.com.", dns.rdatatype.A)
+        resp = dns.message.make_response(msg)
+        resp.set_rcode(dns.rcode.NXDOMAIN)
+
+        next_example = base64.b32decode(hash_map["*.example.com."])
+        nsec3_example = dns.rdtypes.ANY.NSEC3.NSEC3(
+            rdclass=dns.rdataclass.IN,
+            rdtype=dns.rdatatype.NSEC3,
+            algorithm=1,
+            flags=0,
+            iterations=0,
+            salt=b'',
+            next=next_example,
+            windows=[(0, b'\x00')],
+        )
+        nsec3_example_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
+        nsec3_example_rrset.ttl = 3600
+        nsec3_example_rrset.add(nsec3_example)
+
+        wrap_example = base64.b32decode(hash_map["example.com."])
+        nsec3_wildcard = dns.rdtypes.ANY.NSEC3.NSEC3(
+            rdclass=dns.rdataclass.IN,
+            rdtype=dns.rdatatype.NSEC3,
+            algorithm=1,
+            flags=0,
+            iterations=0,
+            salt=b'',
+            next=wrap_example,
+            windows=[(0, b'\x00')],
+        )
+        nsec3_wildcard_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['*.example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
+        nsec3_wildcard_rrset.ttl = 3600
+        nsec3_wildcard_rrset.add(nsec3_wildcard)
+
+        rrsig_example = dns.rrset.from_text(
+            f"{hash_map['example.com.']}.example.com.",
+            3600,
+            "IN",
+            "RRSIG",
+            "NSEC3 8 2 3600 20350101000000 20300101000000 12345 example.com. deadbeef"
+        )
+        rrsig_wildcard = dns.rrset.from_text(
+            f"{hash_map['*.example.com.']}.example.com.",
+            3600,
+            "IN",
+            "RRSIG",
+            "NSEC3 8 2 3600 20350101000000 20300101000000 12345 example.com. deadbeef"
+        )
+
+        resp.authority.append(nsec3_example_rrset)
+        resp.authority.append(rrsig_example)
+        resp.authority.append(nsec3_wildcard_rrset)
+        resp.authority.append(rrsig_wildcard)
+
+        with patch('dns.dnssec.validate_rrsig', return_value=None):
+            assert await resolver._validate_nsec3_negative("www.foo.example.com.", resp) is True
+        assert "*.example.com." in hashed_names
+        assert "*.foo.example.com." not in hashed_names
+
+    @pytest.mark.asyncio
+    async def test_chain_validation_nsec3_nodata_exact_hash_type_bitmap(self):
+        resolver = DNSResolver(
+            dnssec_enabled=True,
+            dnssec_chain_validation=True,
+            dnssec_max_validations=10,
+            dnssec_max_dnskey_records=5,
+            dnssec_validation_timeout=2.0,
+            trust_anchors=None,
+        )
+
+        dnskey_rrset = make_dnskey_rrset("example.com.", 256, 3, 8, bytes.fromhex("deadbeef"))
+
+        async def fake_get_key(zone):
+            if zone == "example.com":
+                return dnskey_rrset
+            return None
+        resolver._get_validated_dnskey = fake_get_key
+
+        msg = dns.message.make_query("foo.example.com.", dns.rdatatype.A)
+        resp = dns.message.make_response(msg)
+        resp.set_rcode(dns.rcode.NOERROR)
+
+        qname_hash = b"\x11" * 20
+        hash_map = {
+            "foo.example.com.": base64.b32encode(qname_hash).decode().lower().rstrip("="),
+        }
+
+        def fake_hash(name: str, salt: bytes, iterations: int, algorithm: int) -> str:
+            return hash_map.get(name, "ffffffffffffffffffffffffffffffff")
+        resolver._nsec3_hash = fake_hash
+
+        nsec3 = dns.rdtypes.ANY.NSEC3.NSEC3(
+            rdclass=dns.rdataclass.IN,
+            rdtype=dns.rdatatype.NSEC3,
+            algorithm=1,
+            flags=0,
+            iterations=0,
+            salt=b'',
+            next=b"\x22" * 20,
+            windows=[(0, b'\x00')],
+        )
+        nsec3_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['foo.example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
+        nsec3_rrset.ttl = 3600
+        nsec3_rrset.add(nsec3)
+
+        rrsig = dns.rrset.from_text(
+            f"{hash_map['foo.example.com.']}.example.com.",
+            3600,
+            "IN",
+            "RRSIG",
+            "NSEC3 8 2 3600 20350101000000 20300101000000 12345 example.com. deadbeef"
+        )
+
+        resp.authority.append(nsec3_rrset)
+        resp.authority.append(rrsig)
+
+        with patch('dns.dnssec.validate_rrsig', return_value=None):
+            secure, insecure = await resolver._dnssec_validate_chain("foo.example.com.", resp.to_wire(), dnssec_requested=True)
+            assert secure is True
+            assert insecure is False
+
+    @pytest.mark.asyncio
+    async def test_chain_validation_nsec3_nxdomain_wildcard_absent(self):
+        resolver = DNSResolver(
+            dnssec_enabled=True,
+            dnssec_chain_validation=True,
+            dnssec_max_validations=10,
+            dnssec_max_dnskey_records=5,
+            dnssec_validation_timeout=2.0,
+            trust_anchors=None,
+        )
+
+        dnskey_rrset = make_dnskey_rrset("example.com.", 256, 3, 8, bytes.fromhex("deadbeef"))
+
+        async def fake_get_key(zone):
+            if zone == "example.com":
+                return dnskey_rrset
+            return None
+        resolver._get_validated_dnskey = fake_get_key
+
+        msg = dns.message.make_query("foo.example.com.", dns.rdatatype.A)
+        resp = dns.message.make_response(msg)
+        resp.set_rcode(dns.rcode.NXDOMAIN)
+
+        hash_map = {
+            "example.com.": base64.b32encode(b"\x22" * 20).decode().lower().rstrip("="),
+            "foo.example.com.": base64.b32encode(b"\x55" * 20).decode().lower().rstrip("="),
+            "*.example.com.": base64.b32encode(b"\x33" * 20).decode().lower().rstrip("="),
+        }
+
+        def fake_hash(name: str, salt: bytes, iterations: int, algorithm: int) -> str:
+            return hash_map.get(name, "ffffffffffffffffffffffffffffffff")
+        resolver._nsec3_hash = fake_hash
+
+        nsec3_example = dns.rdtypes.ANY.NSEC3.NSEC3(
+            rdclass=dns.rdataclass.IN,
+            rdtype=dns.rdatatype.NSEC3,
+            algorithm=1,
+            flags=0,
+            iterations=0,
+            salt=b'',
+            next=b"\x66" * 20,
+            windows=[(0, b'\x00')],
+        )
+        nsec3_example_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
+        nsec3_example_rrset.ttl = 3600
+        nsec3_example_rrset.add(nsec3_example)
+
+        rrsig_example = dns.rrset.from_text(
+            f"{hash_map['example.com.']}.example.com.",
+            3600,
+            "IN",
+            "RRSIG",
+            "NSEC3 8 2 3600 20350101000000 20300101000000 12345 example.com. deadbeef"
+        )
+
+        resp.authority.append(nsec3_example_rrset)
+        resp.authority.append(rrsig_example)
+
+        with patch('dns.dnssec.validate_rrsig', return_value=None):
+            secure, insecure = await resolver._dnssec_validate_chain("foo.example.com.", resp.to_wire(), dnssec_requested=True)
+            assert secure is True
+            assert insecure is False
+
+    @pytest.mark.asyncio
+    async def test_chain_validation_nsec3_nxdomain_wraparound_with_wildcard_and_multiple_rrsets(self):
+        resolver = DNSResolver(
+            dnssec_enabled=True,
+            dnssec_chain_validation=True,
+            dnssec_max_validations=10,
+            dnssec_max_dnskey_records=5,
+            dnssec_validation_timeout=2.0,
+            trust_anchors=None,
+        )
+
+        dnskey_rrset = make_dnskey_rrset("example.com.", 256, 3, 8, bytes.fromhex("deadbeef"))
+
+        async def fake_get_key(zone):
+            if zone == "example.com":
+                return dnskey_rrset
+            return None
+        resolver._get_validated_dnskey = fake_get_key
+
+        msg = dns.message.make_query("foo.example.com.", dns.rdatatype.A)
+        resp = dns.message.make_response(msg)
+        resp.set_rcode(dns.rcode.NXDOMAIN)
+
+        hash_map = {
+            "example.com.": base64.b32encode(b"\x22" * 20).decode().lower().rstrip("="),
+            "*.example.com.": base64.b32encode(b"\x33" * 20).decode().lower().rstrip("="),
+            "foo.example.com.": base64.b32encode(b"\x55" * 20).decode().lower().rstrip("="),
+        }
+
+        def fake_hash(name: str, salt: bytes, iterations: int, algorithm: int) -> str:
+            return hash_map.get(name, "ffffffffffffffffffffffffffffffff")
+        resolver._nsec3_hash = fake_hash
+
+        nsec3_example = dns.rdtypes.ANY.NSEC3.NSEC3(
+            rdclass=dns.rdataclass.IN,
+            rdtype=dns.rdatatype.NSEC3,
+            algorithm=1,
+            flags=0,
+            iterations=0,
+            salt=b'',
+            next=b"\x33" * 20,
+            windows=[(0, b'\x00')],
+        )
+        nsec3_example_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
+        nsec3_example_rrset.ttl = 3600
+        nsec3_example_rrset.add(nsec3_example)
+
+        nsec3_wildcard = dns.rdtypes.ANY.NSEC3.NSEC3(
+            rdclass=dns.rdataclass.IN,
+            rdtype=dns.rdatatype.NSEC3,
+            algorithm=1,
+            flags=0,
+            iterations=0,
+            salt=b'',
+            next=b"\x22" * 20,
+            windows=[(0, b'\x00')],
+        )
+        nsec3_wildcard_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['*.example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
+        nsec3_wildcard_rrset.ttl = 3600
+        nsec3_wildcard_rrset.add(nsec3_wildcard)
+
+        rrsig_example = dns.rrset.from_text(
+            f"{hash_map['example.com.']}.example.com.",
+            3600,
+            "IN",
+            "RRSIG",
+            "NSEC3 8 2 3600 20350101000000 20300101000000 12345 example.com. deadbeef"
+        )
+        rrsig_wildcard = dns.rrset.from_text(
+            f"{hash_map['*.example.com.']}.example.com.",
+            3600,
+            "IN",
+            "RRSIG",
+            "NSEC3 8 2 3600 20350101000000 20300101000000 12345 example.com. deadbeef"
+        )
+
+        resp.authority.append(nsec3_example_rrset)
+        resp.authority.append(rrsig_example)
+        resp.authority.append(nsec3_wildcard_rrset)
+        resp.authority.append(rrsig_wildcard)
+
+        validate_entries = []
+        def fake_validate_rrsig(rrset, rrsig, keys, origin=None, now=None, policy=None):
+            validate_entries.append(str(rrset.name))
+            return None
+
+        with patch('dns.dnssec.validate_rrsig', side_effect=fake_validate_rrsig):
+            secure, insecure = await resolver._dnssec_validate_chain("foo.example.com.", resp.to_wire(), dnssec_requested=True)
+            assert secure is True
+            assert insecure is False
+            assert validate_entries == [
+                str(nsec3_example_rrset.name),
+                str(nsec3_wildcard_rrset.name),
+            ]
+
+    @pytest.mark.asyncio
+    async def test_chain_validation_nsec3_nxdomain_wildcard_interval_separate_proofs(self):
+        resolver = DNSResolver(
+            dnssec_enabled=True,
+            dnssec_chain_validation=True,
+            dnssec_max_validations=10,
+            dnssec_max_dnskey_records=5,
+            dnssec_validation_timeout=2.0,
+            trust_anchors=None,
+        )
+
+        dnskey_rrset = make_dnskey_rrset("example.com.", 256, 3, 8, bytes.fromhex("deadbeef"))
+
+        async def fake_get_key(zone):
+            if zone == "example.com":
+                return dnskey_rrset
+            return None
+        resolver._get_validated_dnskey = fake_get_key
+
+        msg = dns.message.make_query("foo.example.com.", dns.rdatatype.A)
+        resp = dns.message.make_response(msg)
+        resp.set_rcode(dns.rcode.NXDOMAIN)
+
+        hash_map = {
+            "example.com.": base64.b32encode(b"\x22" * 20).decode().lower().rstrip("="),
+            "foo.example.com.": base64.b32encode(b"\x33" * 20).decode().lower().rstrip("="),
+            "*.example.com.": base64.b32encode(b"\x44" * 20).decode().lower().rstrip("="),
+        }
+
+        def fake_hash(name: str, salt: bytes, iterations: int, algorithm: int) -> str:
+            return hash_map.get(name, "ffffffffffffffffffffffffffffffff")
+        resolver._nsec3_hash = fake_hash
+
+        nsec3_example = dns.rdtypes.ANY.NSEC3.NSEC3(
+            rdclass=dns.rdataclass.IN,
+            rdtype=dns.rdatatype.NSEC3,
+            algorithm=1,
+            flags=0,
+            iterations=0,
+            salt=b'',
+            next=b"\x55" * 20,
+            windows=[(0, b'\x00')],
+        )
+        nsec3_example_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
+        nsec3_example_rrset.ttl = 3600
+        nsec3_example_rrset.add(nsec3_example)
+
+        nsec3_wildcard = dns.rdtypes.ANY.NSEC3.NSEC3(
+            rdclass=dns.rdataclass.IN,
+            rdtype=dns.rdatatype.NSEC3,
+            algorithm=1,
+            flags=0,
+            iterations=0,
+            salt=b'',
+            next=b"\x66" * 20,
+            windows=[(0, b'\x00')],
+        )
+        nsec3_wildcard_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['*.example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
+        nsec3_wildcard_rrset.ttl = 3600
+        nsec3_wildcard_rrset.add(nsec3_wildcard)
+
+        rrsig_example = dns.rrset.from_text(
+            f"{hash_map['example.com.']}.example.com.",
+            3600,
+            "IN",
+            "RRSIG",
+            "NSEC3 8 2 3600 20350101000000 20300101000000 12345 example.com. deadbeef"
+        )
+        rrsig_wildcard = dns.rrset.from_text(
+            f"{hash_map['*.example.com.']}.example.com.",
+            3600,
+            "IN",
+            "RRSIG",
+            "NSEC3 8 2 3600 20350101000000 20300101000000 12345 example.com. deadbeef"
+        )
+
+        resp.authority.append(nsec3_example_rrset)
+        resp.authority.append(rrsig_example)
+        resp.authority.append(nsec3_wildcard_rrset)
+        resp.authority.append(rrsig_wildcard)
+
+        validated_rrsets = []
+        def fake_validate_rrsig(rrset, rrsig, keys, origin=None, now=None, policy=None):
+            validated_rrsets.append(str(rrset.name))
+            return None
+
+        with patch('dns.dnssec.validate_rrsig', side_effect=fake_validate_rrsig):
+            secure, insecure = await resolver._dnssec_validate_chain("foo.example.com.", resp.to_wire(), dnssec_requested=True)
+            assert secure is True
+            assert insecure is False
+            assert validated_rrsets == [
+                str(nsec3_example_rrset.name),
+                str(nsec3_wildcard_rrset.name),
+            ]
+
+    @pytest.mark.asyncio
+    async def test_chain_validation_nsec3_nodata_wildcard_nonexistence(self):
+        resolver = DNSResolver(
+            dnssec_enabled=True,
+            dnssec_chain_validation=True,
+            dnssec_max_validations=10,
+            dnssec_max_dnskey_records=5,
+            dnssec_validation_timeout=2.0,
+            trust_anchors=None,
+        )
+
+        dnskey_rrset = make_dnskey_rrset("example.com.", 256, 3, 8, bytes.fromhex("deadbeef"))
+
+        async def fake_get_key(zone):
+            if zone == "example.com":
+                return dnskey_rrset
+            return None
+        resolver._get_validated_dnskey = fake_get_key
+
+        msg = dns.message.make_query("foo.example.com.", dns.rdatatype.A)
+        resp = dns.message.make_response(msg)
+        resp.set_rcode(dns.rcode.NOERROR)
+
+        hash_map = {
+            "example.com.": base64.b32encode(b"\x22" * 20).decode().lower().rstrip("="),
+            "foo.example.com.": base64.b32encode(b"\x55" * 20).decode().lower().rstrip("="),
+            "*.example.com.": base64.b32encode(b"\x33" * 20).decode().lower().rstrip("="),
+        }
+
+        def fake_hash(name: str, salt: bytes, iterations: int, algorithm: int) -> str:
+            return hash_map.get(name, "ffffffffffffffffffffffffffffffff")
+        resolver._nsec3_hash = fake_hash
+
+        nsec3_example = dns.rdtypes.ANY.NSEC3.NSEC3(
+            rdclass=dns.rdataclass.IN,
+            rdtype=dns.rdatatype.NSEC3,
+            algorithm=1,
+            flags=0,
+            iterations=0,
+            salt=b'',
+            next=b"\x66" * 20,
+            windows=[(0, b'\x00')],
+        )
+        nsec3_example_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
+        nsec3_example_rrset.ttl = 3600
+        nsec3_example_rrset.add(nsec3_example)
+
+        rrsig_example = dns.rrset.from_text(
+            f"{hash_map['example.com.']}.example.com.",
+            3600,
+            "IN",
+            "RRSIG",
+            "NSEC3 8 2 3600 20350101000000 20300101000000 12345 example.com. deadbeef"
+        )
+
+        resp.authority.append(nsec3_example_rrset)
+        resp.authority.append(rrsig_example)
+
+        with patch('dns.dnssec.validate_rrsig', return_value=None):
+            secure, insecure = await resolver._dnssec_validate_chain("foo.example.com.", resp.to_wire(), dnssec_requested=True)
+            assert secure is True
+            assert insecure is False
+
+    @pytest.mark.asyncio
+    async def test_chain_validation_nsec3_nxdomain_wildcard_exists(self):
+        resolver = DNSResolver(
+            dnssec_enabled=True,
+            dnssec_chain_validation=True,
+            dnssec_max_validations=10,
+            dnssec_max_dnskey_records=5,
+            dnssec_validation_timeout=2.0,
+            trust_anchors=None,
+        )
+
+        dnskey_rrset = make_dnskey_rrset("example.com.", 256, 3, 8, bytes.fromhex("deadbeef"))
+
+        async def fake_get_key(zone):
+            if zone == "example.com":
+                return dnskey_rrset
+            return None
+        resolver._get_validated_dnskey = fake_get_key
+
+        msg = dns.message.make_query("foo.example.com.", dns.rdatatype.A)
+        resp = dns.message.make_response(msg)
+        resp.set_rcode(dns.rcode.NXDOMAIN)
+
+        hash_map = {
+            "example.com.": base64.b32encode(b"\x22" * 20).decode().lower().rstrip("="),
+            "*.example.com.": base64.b32encode(b"\x33" * 20).decode().lower().rstrip("="),
+            "foo.example.com.": base64.b32encode(b"\x55" * 20).decode().lower().rstrip("="),
+        }
+
+        def fake_hash(name: str, salt: bytes, iterations: int, algorithm: int) -> str:
+            return hash_map.get(name, "ffffffffffffffffffffffffffffffff")
+        resolver._nsec3_hash = fake_hash
+
+        nsec3_example = dns.rdtypes.ANY.NSEC3.NSEC3(
+            rdclass=dns.rdataclass.IN,
+            rdtype=dns.rdatatype.NSEC3,
+            algorithm=1,
+            flags=0,
+            iterations=0,
+            salt=b'',
+            next=b"\x66" * 20,
+            windows=[(0, b'\x00')],
+        )
+        nsec3_example_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
+        nsec3_example_rrset.ttl = 3600
+        nsec3_example_rrset.add(nsec3_example)
+
+        nsec3_wildcard = dns.rdtypes.ANY.NSEC3.NSEC3(
+            rdclass=dns.rdataclass.IN,
+            rdtype=dns.rdatatype.NSEC3,
+            algorithm=1,
+            flags=0,
+            iterations=0,
+            salt=b'',
+            next=b"\x77" * 20,
+            windows=[(0, b'\x00')],
+        )
+        nsec3_wildcard_rrset = dns.rrset.RRset(dns.name.from_text(f"{hash_map['*.example.com.']}.example.com."), dns.rdataclass.IN, dns.rdatatype.NSEC3)
+        nsec3_wildcard_rrset.ttl = 3600
+        nsec3_wildcard_rrset.add(nsec3_wildcard)
+
+        rrsig_example = dns.rrset.from_text(
+            f"{hash_map['example.com.']}.example.com.",
+            3600,
+            "IN",
+            "RRSIG",
+            "NSEC3 8 2 3600 20350101000000 20300101000000 12345 example.com. deadbeef"
+        )
+        rrsig_wildcard = dns.rrset.from_text(
+            f"{hash_map['*.example.com.']}.example.com.",
+            3600,
+            "IN",
+            "RRSIG",
+            "NSEC3 8 2 3600 20350101000000 20300101000000 12345 example.com. deadbeef"
+        )
+
+        resp.authority.append(nsec3_example_rrset)
+        resp.authority.append(rrsig_example)
+        resp.authority.append(nsec3_wildcard_rrset)
+        resp.authority.append(rrsig_wildcard)
+
+        validate_entries = []
+        def fake_validate_rrsig(rrset, rrsig, keys, origin=None, now=None, policy=None):
+            validate_entries.append((str(rrset.name), str(rrsig.signer)))
+            assert str(rrset.name).endswith("example.com.")
+            return None
+
+        with patch('dns.dnssec.validate_rrsig', side_effect=fake_validate_rrsig):
+            secure, insecure = await resolver._dnssec_validate_chain("foo.example.com.", resp.to_wire(), dnssec_requested=True)
+            assert secure is True
+            assert insecure is False
+            assert validate_entries == [
+                (str(nsec3_example_rrset.name), str(rrsig_example[0].signer)),
+                (str(nsec3_wildcard_rrset.name), str(rrsig_wildcard[0].signer)),
+            ]
 
     @pytest.mark.asyncio
     async def test_chain_validation_fails_on_bogus_signature(self):

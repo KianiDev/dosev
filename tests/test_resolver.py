@@ -328,7 +328,7 @@ async def test_negative_cache_uses_soa_minimum(resolver):
     resolver._try_upstream = fake_upstream
 
     response1 = await resolver.forward_dns_query(qwire)
-    key = resolver._build_cache_key(qwire)
+    key = ("nxdomain.example", 1, "global")  # qname, qtype, "global"
     entry = await resolver._negative_cache_get(key)
     assert entry is not None
 
@@ -346,7 +346,7 @@ async def test_optimistic_cache_serves_stale(resolver):
 
     query = dns.message.make_query("example.com", "A")
     qwire = query.to_wire()
-    key = resolver._build_cache_key(qwire)
+    key = ("nxdomain.example", 1, "global")
 
     resp = dns.message.make_response(query)
     rr = dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "93.184.216.34")
@@ -594,7 +594,7 @@ async def test_forward_udp_connection_lost():
     data = dns.message.make_query("example.com", "A").to_wire()
 
     loop = asyncio.get_running_loop()
-    with patch.object(loop, "sock_sendall", new=AsyncMock(side_effect=ConnectionError("Lost"))):
+    with patch.object(loop, "sock_sendto", new=AsyncMock(side_effect=ConnectionError("Lost"))):
         with patch.object(resolver, "_get_udp_socket", new=AsyncMock(return_value=MagicMock())):
             with pytest.raises(ConnectionError, match="Lost"):
                 await resolver._forward_udp(data, resolver.upstreams[0])
@@ -608,6 +608,7 @@ async def test_forward_tcp_pool_reuse():
     )
     data = dns.message.make_query("example.com", "A").to_wire()
     resp = make_a_response("example.com")
+    resp = data[:2] + resp[2:]
 
     async def fake_connect(*args, **kwargs):
         reader = AsyncMock()
@@ -1815,3 +1816,326 @@ async def test_resolve_upstream_ip_falls_back_to_system_resolver():
                 result = await resolver._resolve_upstream_ip("example.com")
                 assert result == "203.0.113.1"
                 mock_getaddrinfo.assert_called()
+                
+                
+# ---------- TCP Length Validation ----------
+@pytest.mark.asyncio
+async def test_tcp_length_validation_zero():
+    """Test that length=0 raises ValueError."""
+    resolver = DNSResolver(
+        upstreams=[{"address": "127.0.0.1", "protocol": "tcp", "port": 12345, "ip": "127.0.0.1"}],
+        tcp_timeout=2.0,
+    )
+
+    resolver._tcp_pool.get = AsyncMock(return_value=None)
+    resolver._tcp_pool.put = AsyncMock()
+
+    async def mock_connect_zero(*args, **kwargs):
+        reader = AsyncMock()
+        reader.readexactly = AsyncMock(side_effect=[b'\x00\x00'])  # length 0
+        writer = MagicMock()
+        writer.is_closing = MagicMock(return_value=False)
+        writer.write = MagicMock()
+        writer.drain = AsyncMock()
+        return reader, writer
+
+    with patch("asyncio.open_connection", side_effect=mock_connect_zero):
+        with pytest.raises(ValueError, match="TCP message length 0 is less than required DNS header size"):
+            await resolver._forward_tcp(b"test", resolver.upstreams[0])
+
+
+@pytest.mark.asyncio
+async def test_tcp_length_validation_valid():
+    """Test that a valid length (10) succeeds."""
+    resolver = DNSResolver(
+        upstreams=[{"address": "127.0.0.1", "protocol": "tcp", "port": 12345, "ip": "127.0.0.1"}],
+        tcp_timeout=2.0,
+    )
+
+    resolver._tcp_pool.get = AsyncMock(return_value=None)
+    resolver._tcp_pool.put = AsyncMock()
+
+    async def mock_connect_valid(*args, **kwargs):
+        reader = AsyncMock()
+        reader.readexactly = AsyncMock(side_effect=[
+            b'\x00\x0a',  # length 10
+            b'response10'  # 10 bytes
+        ])
+        writer = MagicMock()
+        writer.is_closing = MagicMock(return_value=False)
+        writer.write = MagicMock()
+        writer.drain = AsyncMock()
+        return reader, writer
+
+    with patch("asyncio.open_connection", side_effect=mock_connect_valid):
+        resp = await resolver._forward_tcp(b"test", resolver.upstreams[0])
+        assert resp == b'response10'
+
+
+@pytest.mark.asyncio
+async def test_tcp_length_validation_max():
+    """Test that length=65535 (maximum allowed) succeeds."""
+    resolver = DNSResolver(
+        upstreams=[{"address": "127.0.0.1", "protocol": "tcp", "port": 12345, "ip": "127.0.0.1"}],
+        tcp_timeout=2.0,
+    )
+
+    resolver._tcp_pool.get = AsyncMock(return_value=None)
+    resolver._tcp_pool.put = AsyncMock()
+
+    body = b'X' * 65535
+    async def mock_connect_max(*args, **kwargs):
+        reader = AsyncMock()
+        reader.readexactly = AsyncMock(side_effect=[
+            b'\xff\xff',  # length 65535
+            body
+        ])
+        writer = MagicMock()
+        writer.is_closing = MagicMock(return_value=False)
+        writer.write = MagicMock()
+        writer.drain = AsyncMock()
+        return reader, writer
+
+    with patch("asyncio.open_connection", side_effect=mock_connect_max):
+        resp = await resolver._forward_tcp(b"test", resolver.upstreams[0])
+        assert resp == body
+
+
+@pytest.mark.asyncio
+async def test_tcp_length_validation_exceeds_limit():
+    """Test that a length > MAX_TCP_RESPONSE_SIZE raises ValueError.
+       To test this without patching the constant, we use a smaller constant for the test.
+    """
+    resolver = DNSResolver(
+        upstreams=[{"address": "127.0.0.1", "protocol": "tcp", "port": 12345, "ip": "127.0.0.1"}],
+        tcp_timeout=2.0,
+    )
+
+    resolver._tcp_pool.get = AsyncMock(return_value=None)
+    resolver._tcp_pool.put = AsyncMock()
+
+    # Patch the constant to a small value for this test
+    with patch("dosev.resolver.MAX_TCP_RESPONSE_SIZE", 100):
+        async def mock_connect_too_large(*args, **kwargs):
+            reader = AsyncMock()
+            reader.readexactly = AsyncMock(side_effect=[
+                b'\x00\x65',  # length 101 (> 100)
+            ])
+            writer = MagicMock()
+            writer.is_closing = MagicMock(return_value=False)
+            writer.write = MagicMock()
+            writer.drain = AsyncMock()
+            return reader, writer
+
+        with patch("asyncio.open_connection", side_effect=mock_connect_too_large):
+            with pytest.raises(ValueError, match="TCP message length 101 exceeds maximum 100"):
+                await resolver._forward_tcp(b"test", resolver.upstreams[0])
+                
+# ---------- TXID Validation for TCP/TLS/DoQ ----------
+@pytest.mark.asyncio
+async def test_forward_tcp_txid_validation():
+    """TCP forward should reject response with mismatched transaction ID."""
+    resolver = DNSResolver(
+        upstreams=[{"address": "127.0.0.1", "protocol": "tcp", "port": 12345, "ip": "127.0.0.1"}],
+        tcp_timeout=1.0,
+    )
+
+    # Mock the connection to return a response with mismatched ID
+    async def mock_open_connection(*args, **kwargs):
+        reader = AsyncMock()
+        # Length prefix + response with different ID
+        # Query ID is 0x1234, response ID 0x5678
+        length = 12
+        response = b'\x56\x78' + b'\x81\x80' + b'\x00' * 10
+        reader.readexactly = AsyncMock(side_effect=[
+            length.to_bytes(2, 'big'),  # length
+            response  # payload
+        ])
+        writer = MagicMock()
+        writer.is_closing = MagicMock(return_value=False)
+        writer.write = MagicMock()
+        writer.drain = AsyncMock()
+        return reader, writer
+
+    # Force a new connection (bypass pool)
+    resolver._tcp_pool.get = AsyncMock(return_value=None)
+    resolver._tcp_pool.put = AsyncMock()
+
+    query = dns.message.make_query("example.com", "A")
+    query.id = 0x1234
+    qwire = query.to_wire()
+
+    with patch("asyncio.open_connection", side_effect=mock_open_connection):
+        with pytest.raises(OSError, match="TCP Response ID mismatch"):
+            await resolver._forward_tcp(qwire, resolver.upstreams[0])
+
+
+@pytest.mark.asyncio
+async def test_forward_tls_txid_validation():
+    """TLS forward should reject response with mismatched transaction ID."""
+    resolver = DNSResolver(
+        upstreams=[{"address": "127.0.0.1", "protocol": "tls", "port": 853, "hostname": "example.com"}],
+        tcp_timeout=1.0,
+    )
+
+    async def mock_open_connection(*args, **kwargs):
+        reader = AsyncMock()
+        length = 12
+        response = b'\x56\x78' + b'\x81\x80' + b'\x00' * 10
+        reader.readexactly = AsyncMock(side_effect=[
+            length.to_bytes(2, 'big'),
+            response
+        ])
+        writer = MagicMock()
+        writer.is_closing = MagicMock(return_value=False)
+        writer.write = MagicMock()
+        writer.drain = AsyncMock()
+        writer.get_extra_info = MagicMock(return_value=None)
+        return reader, writer
+
+    resolver._tcp_pool.get = AsyncMock(return_value=None)
+    resolver._tcp_pool.put = AsyncMock()
+
+    query = dns.message.make_query("example.com", "A")
+    query.id = 0x1234
+    qwire = query.to_wire()
+
+    with patch("asyncio.open_connection", side_effect=mock_open_connection):
+        with pytest.raises(OSError, match="TLS Response ID mismatch"):
+            await resolver._forward_tls(qwire, resolver.upstreams[0])
+
+
+@pytest.mark.asyncio
+async def test_forward_quic_txid_validation():
+    """DoQ forward should reject response with mismatched transaction ID."""
+    resolver = DNSResolver(
+        upstreams=[{"address": "example.com", "protocol": "quic", "port": 853, "hostname": "example.com"}],
+        doh_timeout=1.0,
+    )
+
+    class MockQuicClient:
+        def __init__(self):
+            self._quic = MagicMock()
+            self._quic.get_next_available_stream_id = MagicMock(return_value=0)
+            self._quic.send_stream_data = MagicMock()
+            self.transmit = MagicMock()
+            self._pending = {}
+            self._cm = None
+
+        async def wait_connected(self):
+            return True
+
+    # Override _forward_quic to bypass real network and test the validation logic
+    original_forward_quic = resolver._forward_quic
+
+    async def mock_forward_quic(data, upstream):
+        # Simulate response with mismatched ID
+        resp_len = 12
+        response = b'\x56\x78' + b'\x81\x80' + b'\x00' * 10
+        prefixed = len(response).to_bytes(2, 'big') + response
+        # Call the real _forward_quic but inject our response data
+        # We'll patch asyncio.wait_for to return our prefixed response
+        with patch("asyncio.wait_for", new=AsyncMock(return_value=prefixed)):
+            # Need to force pool to return None to create new client
+            resolver._quic_pool.get = AsyncMock(return_value=None)
+            resolver._quic_pool.put = AsyncMock()
+            return await original_forward_quic(data, upstream)
+
+    resolver._forward_quic = mock_forward_quic
+
+    query = dns.message.make_query("example.com", "A")
+    query.id = 0x1234
+    qwire = query.to_wire()
+
+    with patch("aioquic.asyncio.connect", new=AsyncMock(return_value=MockQuicClient())):
+        with pytest.raises(OSError, match="DoQ Response ID mismatch"):
+            await resolver._forward_quic(qwire, resolver.upstreams[0])
+            
+# ---------- EDNS0 Multiple OPT Records ----------
+@pytest.mark.asyncio
+async def test_multiple_opt_records_return_formerr():
+    """Query with more than one OPT record should be rejected with FORMERR."""
+    resolver = DNSResolver(upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}])
+
+    # Build a query with two OPT records
+    query = dns.message.make_query("example.com", "A")
+    query.use_edns(payload=4096)
+    # Add a second OPT record manually
+    opt2 = dns.rrset.RRset(dns.name.root, dns.rdataclass.IN, dns.rdatatype.OPT)
+    opt2.ttl = 0
+    opt2.add(dns.rdtypes.ANY.OPT.OPT(0, 4096, 0, 0, []))
+    query.additional.append(opt2)
+
+    qwire = query.to_wire()
+
+    # Since forward_dns_query now validates OPT count, it should return FORMERR
+    response = await resolver.forward_dns_query(qwire, client_ip="192.0.2.1")
+    msg = dns.message.from_wire(response)
+    assert msg.rcode() == dns.rcode.FORMERR
+
+
+@pytest.mark.asyncio
+async def test_single_opt_record_is_accepted():
+    """Query with exactly one OPT record should pass through."""
+    resolver = DNSResolver(upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}])
+    # Mock upstream to return a response quickly
+    async def fake_try_upstream(*args, **kwargs):
+        return dns.message.make_response(dns.message.make_query("example.com", "A")).to_wire()
+    resolver._try_upstream = fake_try_upstream
+
+    query = dns.message.make_query("example.com", "A")
+    query.use_edns(payload=4096)
+    qwire = query.to_wire()
+
+    response = await resolver.forward_dns_query(qwire, client_ip="192.0.2.1")
+    msg = dns.message.from_wire(response)
+    assert msg.rcode() == dns.rcode.NOERROR
+    
+# ---------- ECS Scope-Aware Caching ----------
+@pytest.mark.asyncio
+async def test_ecs_scope_cache_isolation():
+    """Responses with ECS scope > 0 should be cached with subnet-specific key."""
+    resolver = DNSResolver(
+        upstreams=[{"address": "1.1.1.1", "protocol": "udp", "ip": "1.1.1.1"}],
+        ecs_enabled=True,
+    )
+
+    # Mock _wire_cache to track cache keys
+    cache_keys = []
+    original_set = resolver._wire_cache_set
+
+    async def mock_set(key, value):
+        cache_keys.append(key)
+        # Let original set do its job
+        await original_set(key, value)
+
+    resolver._wire_cache_set = mock_set
+
+    # Build a response with ECS scope > 0
+    query = dns.message.make_query("example.com", "A")
+    resp = dns.message.make_response(query)
+    rr = dns.rrset.from_text("example.com.", 60, dns.rdataclass.IN, dns.rdatatype.A, "192.0.2.1")
+    resp.answer.append(rr)
+    # Add ECS option with scope=24
+    ecs_opt = dns.edns.ECSOption(address="192.0.2.0", srclen=24, scopelen=24)
+    resp.options.append(ecs_opt)
+    resp_wire = resp.to_wire()
+
+    async def fake_try_upstream(*args, **kwargs):
+        return resp_wire
+    resolver._try_upstream = fake_try_upstream
+
+    client_ip = "192.0.2.100"
+    qwire = query.to_wire()
+
+    await resolver.forward_dns_query(qwire, client_ip=client_ip)
+
+    # Check that cache key includes client subnet
+    found = False
+    for key in cache_keys:
+        if isinstance(key, tuple) and len(key) >= 3:
+            # key format: (qname, qtype, subnet_key)
+            if "192.0.2.0" in str(key) and "24" in str(key):
+                found = True
+                break
+    assert found, "Cache key should include subnet prefix for scoped response"           

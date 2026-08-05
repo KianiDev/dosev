@@ -1,4 +1,4 @@
-# dosev/resolver.py – DNSSEC‑chain‑of‑trust version with NSEC3 support
+# dosev/resolver.py – DNSSEC‑chain‑of‑trust version with full NSEC3 proof and corrected pools
 # Full corrected version – all background tasks are started via `start()` to avoid
 # `RuntimeError: no running event loop` when constructing the resolver outside an async context.
 
@@ -8,6 +8,7 @@ import socket
 import ssl
 import struct
 import time
+import threading
 import hashlib
 import ipaddress
 import os
@@ -19,6 +20,7 @@ from urllib.parse import urlparse
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
+import ipaddress
 
 DEFAULT_LOG_DIR = os.path.join(os.getenv('LOCALAPPDATA') or os.path.expanduser('~'), 'dosev', 'logs') if os.name == 'nt' else '/var/log/dosev'
 
@@ -38,6 +40,7 @@ try:
     from aioquic.quic.configuration import QuicConfiguration
     from aioquic.quic.connection import QuicConnection
     from aioquic.quic.events import QuicEvent
+    from aioquic.quic.events import StreamDataReceived
     _HAS_AIOQUIC = True
 except Exception:
     aioquic = None
@@ -64,6 +67,7 @@ try:
     import dns.message
     import dns.dnssec
     import dns.name
+    import dns.flags
     import dns.resolver
     import dns.rdatatype
     import dns.rrset
@@ -105,6 +109,10 @@ NSEC3_OPT_OUT = 0x01
 # Global executor for CPU‑bound crypto tasks
 _CRYPTO_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 
+# Maximum allowed TCP message size (RFC 1035 allows up to 65535, but we enforce a cap)
+MAX_TCP_RESPONSE_SIZE = 65535
+
+MAX_NSEC3_ITERATIONS = 100  # RFC 9276 recommended limit to prevent CPU exhaustion DoS
 
 class AsyncTTLCache:
     """Async-capable TTL cache with optional size limit and per-item TTL."""
@@ -145,8 +153,9 @@ class AsyncTTLCache:
 class RateLimiter:
     """Token-bucket rate limiter for DNS queries (per IP)."""
     def __init__(self, rate: float, burst: float) -> None:
-        self.rate: float = rate
-        self.burst: float = burst
+        # clamp values to safe ranges
+        self.rate: float = max(0.0, float(rate))
+        self.burst: float = max(1.0, float(burst) if burst is not None else 1.0)
         self._buckets: Dict[str, Tuple[float, float]] = {}
         self._lock: asyncio.Lock = asyncio.Lock()
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -351,14 +360,7 @@ class ClientPool:
 
 # ---------- H3 DoH Protocol with proper pooling support ----------
 class H3DohProtocol(QuicConnectionProtocol):
-    """HTTP/3 protocol handler for DoH that supports connection pooling.
-    
-    This follows the same pattern as aioquic's HttpClient example:
-    - Uses H3Connection for HTTP/3 framing
-    - Stores per-stream events in a deque
-    - Uses a Future to signal when the response is complete
-    - Allows reusing the same connection for multiple requests
-    """
+    """HTTP/3 protocol handler for DoH that supports connection pooling."""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._http: Optional[H3Connection] = None
@@ -367,13 +369,11 @@ class H3DohProtocol(QuicConnectionProtocol):
         self._loop = asyncio.get_running_loop()
 
     def quic_event_received(self, event: QuicEvent) -> None:
-        """Process QUIC events and forward HTTP/3 events to the handler."""
         if self._http is not None:
             for http_event in self._http.handle_event(event):
                 self._http_event_received(http_event)
 
     def _http_event_received(self, event: H3Event) -> None:
-        """Handle HTTP/3 events (headers, data, etc.)."""
         if isinstance(event, HeadersReceived) or isinstance(event, DataReceived):
             stream_id = event.stream_id
             if stream_id in self._request_events:
@@ -384,7 +384,6 @@ class H3DohProtocol(QuicConnectionProtocol):
                         waiter.set_result(self._request_events.pop(stream_id, deque()))
 
     async def send_request(self, data: bytes, hostname: str, path: str = "/dns-query") -> bytes:
-        """Send a DNS query over HTTP/3 and return the response."""
         if self._http is None:
             self._http = H3Connection(self._quic)
 
@@ -393,7 +392,6 @@ class H3DohProtocol(QuicConnectionProtocol):
         waiter = self._loop.create_future()
         self._request_waiter[stream_id] = waiter
 
-        # Send headers
         self._http.send_headers(
             stream_id=stream_id,
             headers=[
@@ -408,18 +406,15 @@ class H3DohProtocol(QuicConnectionProtocol):
             end_stream=False,
         )
 
-        # Send body
         self._http.send_data(stream_id=stream_id, data=data, end_stream=True)
         self.transmit()
 
-        # Wait for the response – cleanup happens in finally regardless of how we exit
         try:
             events = await asyncio.wait_for(waiter, timeout=30.0)
         finally:
             self._request_events.pop(stream_id, None)
             self._request_waiter.pop(stream_id, None)
 
-        # Reassemble the response body
         body = bytearray()
         for event in events:
             if isinstance(event, DataReceived):
@@ -427,7 +422,6 @@ class H3DohProtocol(QuicConnectionProtocol):
         return bytes(body)
 
     def close(self) -> None:
-        """Close the QUIC connection."""
         if self._quic:
             self._quic.close()
             self.transmit()
@@ -443,22 +437,26 @@ class H3ConnectionPool:
         self._cleanup_task: Optional[asyncio.Task] = None
 
     async def get(self, key: Tuple) -> Optional[H3DohProtocol]:
-        """Get an existing H3 connection from the pool, or None."""
         async with self._lock:
-            if key in self._pools and self._pools[key]:
-                client, _ = self._pools[key].pop()
-                # Check if the connection is still alive
-                if client._quic and not getattr(client._quic, 'closed', False):
-                    return client
+            if key not in self._pools or not self._pools[key]:
+                return None
+            client, _ = self._pools[key].pop()
+            # Check if the connection is still alive
+            try:
+                if client._quic is None:
+                    return None
+                # Try to get a stream ID – raises if connection is closed
+                client._quic.get_next_available_stream_id()
+                return client
+            except Exception:
                 # Connection is dead, close it and discard
                 try:
                     client.close()
                 except Exception:
                     pass
-        return None
+                return None
 
     async def put(self, key: Tuple, client: H3DohProtocol) -> None:
-        """Return an H3 connection to the pool."""
         async with self._lock:
             if key not in self._pools:
                 self._pools[key] = []
@@ -471,7 +469,6 @@ class H3ConnectionPool:
             self._pools[key].append((client, time.time()))
 
     async def start_cleanup(self) -> None:
-        """Start background cleanup of idle connections."""
         async def _cleanup():
             while True:
                 await asyncio.sleep(self.idle_timeout / 2)
@@ -494,7 +491,6 @@ class H3ConnectionPool:
         self._cleanup_task = asyncio.create_task(_cleanup())
 
     async def stop(self) -> None:
-        """Stop cleanup and close all connections."""
         if self._cleanup_task:
             self._cleanup_task.cancel()
             try:
@@ -514,6 +510,26 @@ class H3ConnectionPool:
 
 
 class DNSResolver:
+    
+    # Reserved / Private IP Subnets per RFC 6890, RFC 1918, RFC 4291
+    PRIVATE_SUBNETS = [
+        ipaddress.ip_network("127.0.0.0/8"),       # Loopback
+        ipaddress.ip_network("10.0.0.0/8"),         # Private
+        ipaddress.ip_network("172.16.0.0/12"),      # Private
+        ipaddress.ip_network("192.168.0.0/16"),     # Private
+        ipaddress.ip_network("100.64.0.0/10"),      # CGNAT (RFC 6598)
+        ipaddress.ip_network("169.254.0.0/16"),     # Link-local
+        ipaddress.ip_network("192.0.2.0/24"),       # TEST-NET-1 (RFC 5737)
+        ipaddress.ip_network("198.51.100.0/24"),    # TEST-NET-2
+        ipaddress.ip_network("203.0.113.0/24"),     # TEST-NET-3
+        ipaddress.ip_network("224.0.0.0/4"),        # Multicast
+        ipaddress.ip_network("240.0.0.0/4"),        # Reserved
+        ipaddress.ip_network("::1/128"),            # IPv6 Loopback
+        ipaddress.ip_network("fc00::/7"),           # IPv6 Unique Local (ULA)
+        ipaddress.ip_network("fe80::/10"),          # IPv6 Link-local
+        ipaddress.ip_network("2001:db8::/32"),      # Documentation (RFC 3849)
+    ]
+    
     def __init__(self,
                   upstreams: Optional[List[Dict[str, Any]]] = None,
                   verbose: bool = False,
@@ -526,6 +542,7 @@ class DNSResolver:
                   udp_timeout: float = 2.0,
                   tcp_timeout: float = 5.0,
                   retries: int = 1,
+                  initial_backoff: float = 0.1,
                   dns_logging_enabled: bool = False,
                   dns_log_dir: str = DEFAULT_LOG_DIR,
                   dns_log_prefix: str = "dns-requests",
@@ -596,6 +613,7 @@ class DNSResolver:
         self.udp_timeout: float = udp_timeout
         self.tcp_timeout: float = tcp_timeout
         self.retries: int = max(1, int(retries))
+        self.initial_backoff: float = initial_backoff
 
         self.dns_logging_enabled: bool = dns_logging_enabled
         self._file_logger: Optional[logging.Logger] = None
@@ -643,6 +661,9 @@ class DNSResolver:
 
         self.metrics_enabled: bool = bool(metrics_enabled) and _HAS_PROM
         self._metrics: Optional[Dict[str, Any]] = None
+        # Prometheus metrics server is started in a controllable WSGI server so
+        # tests and consumers can shut it down cleanly. Only start when the
+        # prometheus client is available and metrics are enabled.
         if self.metrics_enabled:
             try:
                 self._metrics = {
@@ -651,13 +672,32 @@ class DNSResolver:
                     'request_latency_seconds': Histogram('dosev_dns_request_latency_seconds', 'Upstream request latency seconds', ['proto'])
                 }
                 try:
-                    from prometheus_client import start_http_server
-                    start_http_server(int(metrics_port))
+                    # Use make_wsgi_app for a stoppable server.
+                    from prometheus_client import make_wsgi_app
+                    from wsgiref.simple_server import make_server, WSGIRequestHandler
+
+                    class _SilentHandler(WSGIRequestHandler):
+                        def log_message(self, format, *args):
+                            return
+
+                    app = make_wsgi_app()
+                    server = make_server('', int(metrics_port), app, handler_class=_SilentHandler)
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    self._prometheus_server = server
+                    self._prometheus_thread = thread
+                    self._prometheus_started = True
                     self.logger.info("Prometheus metrics server started on :%s", metrics_port)
                 except Exception as e:
                     self.logger.debug("Could not start prometheus http server: %s", e)
+                    self._prometheus_server = None
+                    self._prometheus_thread = None
+                    self._prometheus_started = False
             except Exception:
                 self._metrics = None
+                self._prometheus_server = None
+                self._prometheus_thread = None
+                self._prometheus_started = False
 
         if uvloop_enable and _HAS_UVLOOP:
             try:
@@ -701,7 +741,9 @@ class DNSResolver:
 
         self.doh_version: str = doh_version
         self.doh_auto_cache_ttl: int = doh_auto_cache_ttl
+        # Auto-DoH version cache with bounded size to avoid unbounded growth
         self._doh_auto_cache: Dict[str, Tuple[str, float]] = {}
+        self._doh_auto_cache_maxsize: int = max(256, int(cache_max_size) // 8 if cache_max_size else 256)
         self._doh_auto_lock: asyncio.Lock = asyncio.Lock()
 
         self.load_balancing: str = load_balancing
@@ -731,7 +773,7 @@ class DNSResolver:
 
         # Load trust anchors synchronously (safe)
         if self.dnssec_enabled:
-            self._load_trust_anchors()
+            self._load_trust_anchors()    
 
     def _init_caches(self, cache_ttl: int, cache_max_size: int, negative_cache_ttl: int) -> None:
         if _HAS_CACHETOOLS:
@@ -744,9 +786,125 @@ class DNSResolver:
             self._wire_cache: Any = AsyncTTLCache(maxsize=cache_max_size, ttl=cache_ttl)
             self._negative_cache: Any = AsyncTTLCache(maxsize=cache_max_size, ttl=negative_cache_ttl)
             self._cache_is_sync: bool = False
+            
+    def _is_in_bailiwick(self, record_name: dns.name.Name, query_name: dns.name.Name) -> bool:
+        """
+        Validates whether a record name falls within the bailiwick (zone of authority)
+        of the queried name per RFC 5452 §3.
+        """
+        # Record name must be equal to or a subdomain of the queried name's apex/zone
+        return record_name.is_subdomain(query_name) or record_name == query_name
+    
+    # -------------------------------------------------------------------------
+    # ECS Privacy & Scoping Helpers (RFC 7871)
+    # -------------------------------------------------------------------------
+    def _truncate_ecs_ip(self, client_ip_str: str) -> Tuple[str, int]:
+        """Truncate client IP to privacy-safe prefix lengths (RFC 7871 §11.3)."""
+        if not client_ip_str:
+            return "", 0
+        try:
+            ip = ipaddress.ip_address(client_ip_str)
+            if ip.version == 4:
+                net = ipaddress.ip_network(f"{client_ip_str}/24", strict=False)
+                return str(net.network_address), 24
+            else:
+                net = ipaddress.ip_network(f"{client_ip_str}/56", strict=False)
+                return str(net.network_address), 56
+        except ValueError:
+            return client_ip_str, 0
+
+    def _build_ecs_cache_key(self, qname: str, qtype: int, client_ip: Optional[str] = None, scope_prefix: int = 0) -> Tuple:
+        """Build cache key respecting EDNS Client Subnet scope (RFC 7871 §7.1.2)."""
+        if scope_prefix > 0 and client_ip:
+            masked_ip, _ = self._truncate_ecs_ip(client_ip)
+            return (qname.lower(), qtype, f"{masked_ip}/{scope_prefix}")
+        return (qname.lower(), qtype, "global")
+
+    def _attach_ecs_option(self, query_data: bytes, client_ip: str) -> bytes:
+        """Attach truncated EDNS Client Subnet option to wire query data."""
+        if not getattr(self, 'ecs_enabled', True) or not client_ip:
+            return query_data
+
+        try:
+            msg = dns.message.from_wire(query_data)
+            masked_ip, source_prefix = self._truncate_ecs_ip(client_ip)
+            if source_prefix > 0:
+                ecs_opt = dns.edns.ECSOption(address=masked_ip, srclen=source_prefix)
+                opts = [o for o in msg.options if o.otype != dns.edns.ECS]
+                opts.append(ecs_opt)
+                msg.use_edns(payload=self.max_edns_payload, options=opts)
+                return msg.to_wire()
+        except Exception as e:
+            self.logger.debug("Failed to attach ECS option: %s", e)
+        return query_data
+
+    def _extract_ecs_scope(self, response_bytes: bytes) -> int:
+        """Extract EDNS Client Subnet scope prefix length from response."""
+        try:
+            msg = dns.message.from_wire(response_bytes)
+            for opt in msg.options:
+                if opt.otype == dns.edns.ECS:
+                    return getattr(opt, 'scope', 0)
+        except Exception:
+            pass
+        return 0
+
+    # -------------------------------------------------------------------------
+    # Bailiwick Scrubbing Helper (RFC 5452 §3 / RFC 2181 §5.4.1)
+    # -------------------------------------------------------------------------
+    def _scrub_unsolicited_sections(self, response_bytes: bytes, qname_str: str) -> bytes:
+        """Filter out-of-bailiwick records from Authority and Additional sections."""
+        if not getattr(self, 'scrub_unsolicited_ns', True):
+            return response_bytes
+
+        try:
+            msg = dns.message.from_wire(response_bytes)
+            qname = dns.name.from_text(qname_str)
+
+            def is_in_bailiwick(name: dns.name.Name) -> bool:
+                return name.is_subdomain(qname) or name == qname
+
+            # Clean Authority section
+            msg.authority = [rrset for rrset in msg.authority if is_in_bailiwick(rrset.name)]
+            
+            # Clean Additional section (keep OPT pseudo-records)
+            msg.additional = [
+                rrset for rrset in msg.additional 
+                if rrset.rdtype == dns.rdatatype.OPT or is_in_bailiwick(rrset.name)
+            ]
+            return msg.to_wire()
+        except Exception as e:
+            self.logger.debug("Bailiwick scrubbing failed: %s", e)
+            return response_bytes
+        
+    def _has_multiple_opt_records(self, msg: dns.message.Message) -> bool:
+        """
+        RFC 6891 §6.1.1: A DNS message MUST NOT contain more than one OPT RR.
+        """
+        opt_count = 0
+        for rrset in msg.additional:
+            if rrset.rdtype == dns.rdatatype.OPT:
+                opt_count += len(rrset)  # Accurately count RData instances in RRset
+                if opt_count > 1:
+                    return True
+        return False
+
+    def _make_rcode_response(self, original_data: bytes, rcode: int) -> bytes:
+        """Construct an error response (FORMERR, REFUSED, SERVFAIL) retaining query ID."""
+        try:
+            msg = dns.message.from_wire(original_data)
+            resp = dns.message.make_response(msg)
+            resp.set_rcode(rcode)
+            return resp.to_wire()
+        except Exception:
+            # Fallback: build minimal 12-byte header response
+            orig_id = original_data[:2] if len(original_data) >= 2 else b'\x00\x00'
+            # Set QR bit (0x8000) + RCODE
+            flags = (0x8000 | (rcode & 0x0F)).to_bytes(2, 'big')
+            # Header: ID, flags, QDCOUNT=0, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
+            return orig_id + flags + (b'\x00\x00' * 4)
 
     async def start(self) -> None:
-        """Start all background tasks (rate limiter cleanup, insecure cache cleanup, H3 pool cleanup, etc.)."""
         if self._started:
             return
         self._started = True
@@ -830,11 +988,9 @@ class DNSResolver:
                 self.logger.warning("Health check loop error: %s", e)
 
     async def start_health_checks(self) -> None:
-        # Deprecated: use start() instead
         await self.start()
 
     async def start_background_tasks(self) -> None:
-        # Deprecated: use start() instead
         await self.start()
 
     async def _get_healthy_upstreams(self, upstreams: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -888,6 +1044,50 @@ class DNSResolver:
         self._background_tasks.clear()
         if self.rate_limiter:
             await self.rate_limiter.stop_cleanup()
+
+    async def shutdown(self, shutdown_executor: bool = False, stop_prometheus: bool = False) -> None:
+        """Gracefully shutdown background tasks, pools and executors.
+
+        Args:
+            shutdown_executor: if True, call shutdown() on module-level
+                `_CRYPTO_EXECUTOR` to stop worker threads.
+            stop_prometheus: if True, stop the internally started Prometheus
+                WSGI server (if present).
+        """
+        try:
+            await self.stop_background_tasks()
+        except Exception:
+            pass
+
+        try:
+            await self.stop_pool_cleanups()
+        except Exception:
+            pass
+
+        if shutdown_executor:
+            try:
+                _CRYPTO_EXECUTOR.shutdown(wait=False)
+            except Exception:
+                pass
+
+        if stop_prometheus and getattr(self, '_prometheus_server', None):
+            try:
+                try:
+                    self._prometheus_server.shutdown()
+                except Exception:
+                    pass
+                try:
+                    self._prometheus_server.server_close()
+                except Exception:
+                    pass
+                thr = getattr(self, '_prometheus_thread', None)
+                if thr and thr.is_alive():
+                    try:
+                        thr.join(timeout=1.0)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
     # ---------- blocklist helpers ----------
     async def set_blocklist(self, domains: Iterable[str]) -> None:
@@ -1225,10 +1425,6 @@ class DNSResolver:
         except Exception:
             return None
 
-    def _extract_client_ip(self, data: bytes) -> str:
-        # This is a stub; real implementation should extract from transport.
-        return "unknown"
-
     def _extract_question_section(self, packet: bytes) -> Tuple[bytes, int, int]:
         if not packet or len(packet) < 12:
             return b'', 0, 12
@@ -1286,7 +1482,15 @@ class DNSResolver:
             resp.set_rcode(dns.rcode.SERVFAIL)
             return resp.to_wire()
         except Exception:
-            return b""
+            try:
+                qid = 0
+                if isinstance(query_data, (bytes, bytearray)) and len(query_data) >= 2:
+                    qid = (query_data[0] << 8) | query_data[1]
+                resp = dns.message.Message(id=qid)
+                resp.set_rcode(dns.rcode.SERVFAIL)
+                return resp.to_wire()
+            except Exception:
+                return b""
 
     # ---------- Trust anchor management ----------
     def _fetch_root_trust_anchor_from_iana(self) -> Optional[str]:
@@ -1441,15 +1645,42 @@ class DNSResolver:
         if not self.dnssec_enabled:
             return False
         async with self._trust_anchor_lock:
-            new_ds = await asyncio.get_running_loop().run_in_executor(None, self._fetch_root_trust_anchor_from_iana)
-            if new_ds is None:
+            ds_text = await asyncio.get_running_loop().run_in_executor(None, self._fetch_root_trust_anchor_from_iana)
+            if ds_text is None:
                 return False
             try:
-                rr = dns.rrset.from_text(".", 0, "IN", "DS", new_ds)
-                anchors = {dns.name.root: rr}
-                self._dnssec_raw_anchors = anchors
+                ds_rrset = dns.rrset.from_text(".", 0, "IN", "DS", ds_text)
+                root_dnskey_msg = await self._dnssec_lookup(".", dns.rdatatype.DNSKEY, dnssec_ok=True)
+                if root_dnskey_msg is None:
+                    self.logger.warning("Failed to fetch root DNSKEY from DNS during trust-anchor update")
+                    return False
+                dnskey_rrset = None
+                for rrset in root_dnskey_msg.answer:
+                    if rrset.rdtype == dns.rdatatype.DNSKEY:
+                        dnskey_rrset = rrset
+                        break
+                if dnskey_rrset is None:
+                    self.logger.warning("No DNSKEY RRset in root response during trust-anchor update")
+                    return False
+                try:
+                    dns.dnssec.validate_keys(dnskey_rrset, ds_rrset)
+                except dns.dnssec.ValidationFailure as e:
+                    self.logger.warning("DNSKEY validation against new DS failed: %s", e)
+                    return False
+                if self.dnssec_max_dnskey_records > 0:
+                    limited_rrset = dns.rrset.RRset(dnskey_rrset.name, dnskey_rrset.rdclass, dnskey_rrset.rdtype)
+                    limited_rrset.ttl = dnskey_rrset.ttl
+                    count = 0
+                    for r in dnskey_rrset:
+                        if count >= self.dnssec_max_dnskey_records:
+                            break
+                        limited_rrset.add(r)
+                        count += 1
+                    dnskey_rrset = limited_rrset
+                self._dnssec_raw_anchors = {dns.name.root: dnskey_rrset}
                 self._dnssec_keyring = None
-                self.logger.info("Updated root trust anchor from IANA: %s", new_ds)
+                self.logger.info("Updated root trust anchor from IANA: validated %d DNSKEY records",
+                                 len(dnskey_rrset))
                 return True
             except Exception as e:
                 self.logger.warning("Failed to update trust anchor from IANA: %s", e)
@@ -1485,21 +1716,34 @@ class DNSResolver:
         for upstream in upstream_list:
             try:
                 resp_bytes = await self._try_upstream(upstream, data, _health_check=False, _no_retry=True)
-                return dns.message.from_wire(resp_bytes)
+                try:
+                    return dns.message.from_wire(resp_bytes)
+                except Exception:
+                    self.logger.debug("Malformed upstream response during DNSSEC lookup for %s from %s", qname, upstream.get('address'))
+                    continue
             except Exception:
                 continue
         return None
 
     @staticmethod
-    def _nsec3_hash(name: str, salt: bytes, iterations: int, algorithm: int) -> str:
+    def _nsec3_hash(self, name: str, salt: bytes, iterations: int, algorithm: int) -> Optional[str]:
+        """Return base32-encoded NSEC3 hash (lowercase, no padding)."""
         if algorithm != 1:
-            raise ValueError(f"Unsupported NSEC3 algorithm: {algorithm}")
-        name_obj = dns.name.from_text(name)
-        name_wire = name_obj.to_wire(canonicalize=True)
-        data = name_wire + salt
+            self.logger.warning("Unsupported NSEC3 algorithm: %d", algorithm)
+            return None
+        if iterations > self.MAX_NSEC3_ITERATIONS:
+            self.logger.warning("NSEC3 iterations (%d) exceed safe limit", iterations)
+            return None
+        try:
+            name_wire = dns.name.from_text(name).to_wire()
+        except Exception:
+            name_wire = name.lower().encode('utf-8')
+        digest = hashlib.sha1(name_wire + salt).digest()
         for _ in range(iterations):
-            data = hashlib.sha1(data).digest()
-        return base64.b32encode(data).decode().lower().rstrip("=")
+            digest = hashlib.sha1(digest + salt).digest()
+        # base32 encode without padding, lowercase
+        b32 = base64.b32encode(digest).decode().lower().rstrip('=')
+        return b32
 
     @staticmethod
     def _nsec3_bitmap_contains(windows: Tuple[Tuple[int, bytes], ...], rdtype: int) -> bool:
@@ -1513,7 +1757,12 @@ class DNSResolver:
                         return True
         return False
 
-    async def _get_validated_dnskey(self, zone: str) -> Optional[dns.rrset.RRset]:
+# Add a depth parameter to _get_validated_dnskey:
+    async def _get_validated_dnskey(self, zone: str, _depth: int = 0) -> Optional[dns.rrset.RRset]:
+        if _depth > self.dnssec_max_iterations:
+            self.logger.warning("DNSSEC chain depth exceeded limit (%d) for zone %s", self.dnssec_max_iterations, zone)
+            return None
+
         cache_key = zone
         async with self._dnssec_cache_lock:
             if cache_key in self._dnssec_key_cache:
@@ -1529,7 +1778,7 @@ class DNSResolver:
             return None
 
         parent_zone = ".".join(zone.split(".")[1:]) or "."
-        parent_ds = await self._get_ds_for_zone(zone, parent_zone)
+        parent_ds = await self._get_ds_for_zone(zone, parent_zone, _depth + 1)
         if parent_ds is None:
             if await self._prove_insecure_delegation(zone, parent_zone):
                 async with self._dnssec_cache_lock:
@@ -1538,7 +1787,7 @@ class DNSResolver:
             self.logger.debug("Cannot prove insecure for %s, treating as insecure", zone)
             return None
 
-        parent_key = await self._get_validated_dnskey(parent_zone)
+        parent_key = await self._get_validated_dnskey(parent_zone, _depth + 1)
         if parent_key is None:
             self.logger.debug("No validated key for parent %s", parent_zone)
             return None
@@ -1589,7 +1838,11 @@ class DNSResolver:
             self._dnssec_key_cache[zone] = (child_dnskey, time.time() + ttl)
         return child_dnskey
 
-    async def _get_ds_for_zone(self, zone: str, parent_zone: str) -> Optional[dns.rrset.RRset]:
+    async def _get_ds_for_zone(self, zone: str, parent_zone: str, _depth: int = 0) -> Optional[dns.rrset.RRset]:
+        if _depth > self.dnssec_max_iterations:
+            self.logger.warning("DNSSEC chain depth exceeded limit (%d) for DS zone %s", self.dnssec_max_iterations, zone)
+            return None
+
         cache_key = f"DS:{zone}"
         async with self._dnssec_cache_lock:
             if cache_key in self._dnssec_ds_cache:
@@ -1665,6 +1918,8 @@ class DNSResolver:
         algorithm = first_rr.algorithm
 
         zone_hash = self._nsec3_hash(zone, salt, iterations, algorithm)
+        if zone_hash is None:
+            return False
 
         for idx, rrset in enumerate(nsec3_rrsets):
             for rr in rrset:
@@ -1692,6 +1947,162 @@ class DNSResolver:
 
         return False
 
+    # ---------- Full NSEC3 negative validation (RFC 5155) ----------
+    async def _validate_nsec3_negative(self, qname: str, msg: dns.message.Message) -> bool:
+        """
+        Validate a negative answer (NXDOMAIN or NODATA) using NSEC3 records.
+        Implements closest-encloser, next-closer, and type-bitmap check per RFC 5155.
+        """
+        if msg.rcode() != dns.rcode.NXDOMAIN and not (msg.rcode() == dns.rcode.NOERROR and not msg.answer):
+            return False
+
+        # Find NSEC3 RRsets and their RRSIGs in authority
+        nsec3_rrsets = []
+        nsec3_sigs: Dict[dns.name.Name, dns.rrset.RRset] = {}
+        for rrset in msg.authority:
+            if rrset.rdtype == dns.rdatatype.NSEC3:
+                nsec3_rrsets.append(rrset)
+            elif rrset.rdtype == dns.rdatatype.RRSIG and any(r.type_covered == dns.rdatatype.NSEC3 for r in rrset):
+                existing = nsec3_sigs.get(rrset.name)
+                if existing is None:
+                    nsec3_sigs[rrset.name] = rrset
+                else:
+                    for r in rrset:
+                        existing.add(r)
+        if not nsec3_rrsets or not nsec3_sigs:
+            return False
+
+        # Validate signatures for each NSEC3 RRset by owner name
+        try:
+            for rrset in nsec3_rrsets:
+                sig_rrset = nsec3_sigs.get(rrset.name)
+                if sig_rrset is None:
+                    return False
+
+                validated = False
+                last_exc = None
+                for sig in sig_rrset:
+                    if sig.type_covered != dns.rdatatype.NSEC3:
+                        continue
+
+                    signer = str(sig.signer).lower().rstrip('.')
+                    signer_name_obj = dns.name.from_text(signer)
+                    key_rrset = await self._get_validated_dnskey(signer)
+                    if key_rrset is None:
+                        if signer in ('.', '') and self._dnssec_raw_anchors and dns.name.root in self._dnssec_raw_anchors:
+                            key_rrset = self._dnssec_raw_anchors[dns.name.root]
+                    if key_rrset is None:
+                        continue
+
+                    try:
+                        dns.dnssec.validate_rrsig(rrset, sig, {signer_name_obj: key_rrset})
+                        validated = True
+                        break
+                    except dns.dnssec.ValidationFailure as exc:
+                        last_exc = exc
+                        continue
+
+                if not validated:
+                    if last_exc is not None:
+                        raise last_exc
+                    return False
+        except dns.dnssec.ValidationFailure:
+            return False
+
+        first_rr = nsec3_rrsets[0][0]
+        salt = first_rr.salt
+        iterations = first_rr.iterations
+        algorithm = first_rr.algorithm
+
+        qname_obj = dns.name.from_text(qname)
+        qname_hash = self._nsec3_hash(str(qname_obj), salt, iterations, algorithm)
+        if qname_hash is None:
+            return False
+
+        # Sort NSEC3 RRsets by hash order and index exact hashes.
+        sorted_nsec3 = []
+        hash_to_rr: Dict[str, Tuple[str, str, dns.rdtypes.ANY.NSEC3.NSEC3, dns.rrset.RRset]] = {}
+        for rrset in nsec3_rrsets:
+            for rr in rrset:
+                rr_name = str(rrset.name).lower().rstrip('.')
+                hash_part = rr_name.split('.')[0]
+                next_hash = base64.b32encode(rr.next).decode().lower().rstrip('=')
+                entry = (hash_part, next_hash, rr, rrset)
+                sorted_nsec3.append(entry)
+                hash_to_rr[hash_part] = entry
+        sorted_nsec3.sort(key=lambda x: x[0])
+
+        def find_cover(hash_value: str):
+            if not sorted_nsec3:
+                return None
+            for idx, (hash_part, next_hash, rr, rrset) in enumerate(sorted_nsec3):
+                if hash_part <= hash_value < next_hash:
+                    return hash_part, next_hash, rr, rrset
+                if idx == len(sorted_nsec3) - 1:
+                    first_hash = sorted_nsec3[0][0]
+                    if hash_part <= hash_value or hash_value < first_hash:
+                        return hash_part, next_hash, rr, rrset
+            return None
+
+        def find_closest_encloser():
+            labels = qname_obj.labels
+            for i in range(1, len(labels)):
+                candidate = dns.name.Name(labels[i:])
+                candidate_hash = self._nsec3_hash(str(candidate), salt, iterations, algorithm)
+                exact = hash_to_rr.get(candidate_hash)
+                if exact is not None:
+                    return candidate, exact
+            return None, None
+
+        def next_closer_name(closest_encloser: dns.name.Name) -> Optional[dns.name.Name]:
+            ce_len = len(closest_encloser.labels)
+            q_len = len(qname_obj.labels)
+            if ce_len >= q_len:
+                return None
+            cut = q_len - ce_len - 1
+            return dns.name.Name(qname_obj.labels[cut:])
+
+        def wildcard_name_for_closest_encloser(closest_encloser: dns.name.Name) -> dns.name.Name:
+            return dns.name.Name([b'*'] + list(closest_encloser.labels))
+
+        def validate_wildcard_nonexistence():
+            closest_encloser, closest_rr = find_closest_encloser()
+            if closest_encloser is None or closest_rr is None:
+                return False
+            next_closer = next_closer_name(closest_encloser)
+            if next_closer is None:
+                return False
+            next_closer_hash = self._nsec3_hash(str(next_closer), salt, iterations, algorithm)
+            if find_cover(next_closer_hash) is None:
+                return False
+            wildcard_name = wildcard_name_for_closest_encloser(closest_encloser)
+            wildcard_hash = self._nsec3_hash(str(wildcard_name), salt, iterations, algorithm)
+            if find_cover(wildcard_hash) is None:
+                return False
+            return True
+
+        if msg.rcode() == dns.rcode.NXDOMAIN:
+            # qname itself must not exist.
+            if qname_hash in hash_to_rr:
+                return False
+
+            return validate_wildcard_nonexistence()
+
+        exact_match = hash_to_rr.get(qname_hash)
+        if exact_match is None:
+            if msg.rcode() == dns.rcode.NOERROR and not msg.answer:
+                return validate_wildcard_nonexistence()
+            return False
+        if exact_match is None:
+            return False
+
+        if not msg.question:
+            return False
+        qtype = msg.question[0].rdtype
+        if self._nsec3_bitmap_contains(exact_match[2].windows, qtype):
+            return False
+        return True
+
     async def _dnssec_validate_chain(self, qname: str, response_wire: bytes, dnssec_requested: bool = True) -> Tuple[bool, bool]:
         if not self.dnssec_enabled:
             return False, True
@@ -1715,7 +2126,24 @@ class DNSResolver:
             return False, True
 
     async def _dnssec_validate_chain_internal(self, qname: str, response_wire: bytes, dnssec_requested: bool = True) -> Tuple[bool, bool]:
-        msg = dns.message.from_wire(response_wire)
+        try:
+            msg = dns.message.from_wire(response_wire)
+        except Exception as e:
+            # Malformed response from upstream; treat as insecure rather than raising
+            self.logger.warning("Malformed DNS response during DNSSEC validation for %s: %s", qname, e)
+            return False, True
+        # Check if this is a negative answer (NXDOMAIN or NODATA)
+        is_negative = (msg.rcode() == dns.rcode.NXDOMAIN or
+                       (msg.rcode() == dns.rcode.NOERROR and not msg.answer))
+
+        if is_negative:
+            if await self._validate_nsec3_negative(qname, msg):
+                self.logger.debug("NSEC3 negative validation passed for %s", qname)
+                return True, False
+            else:
+                return False, True
+
+        # Positive answer: validate signatures
         has_rrsig = any(rr.rdtype == dns.rdatatype.RRSIG for rr in msg.answer)
         if not has_rrsig:
             return False, True
@@ -1746,8 +2174,15 @@ class DNSResolver:
 
             key_rrset = await self._get_validated_dnskey(signer_name)
             if key_rrset is None:
-                self.logger.debug("No validated key for signer %s, treating as insecure", signer_name)
-                return False, True
+                if signer_name == "." or signer_name == "":
+                    if self._dnssec_raw_anchors and dns.name.root in self._dnssec_raw_anchors:
+                        key_rrset = self._dnssec_raw_anchors[dns.name.root]
+                    else:
+                        self.logger.debug("No root key for signer %s, treating as insecure", signer_name)
+                        return False, True
+                else:
+                    self.logger.debug("No validated key for signer %s, treating as insecure", signer_name)
+                    return False, True
 
             validation_counter += 1
             if validation_counter > max_validations:
@@ -1758,21 +2193,21 @@ class DNSResolver:
             try:
                 await loop.run_in_executor(
                     _CRYPTO_EXECUTOR,
-                    dns.dnssec.validate_rrsig,
-                    rrset,
-                    sig_rdata,
-                    {signer_name_obj: key_rrset}
+                    lambda: dns.dnssec.validate_rrsig(rrset, sig_rdata, {signer_name_obj: key_rrset})
                 )
-            except dns.dnssec.ValidationFailure:
-                if signer_name == "." or signer_name == "":
-                    await loop.run_in_executor(
-                        _CRYPTO_EXECUTOR,
-                        dns.dnssec.validate_rrsig,
-                        rrset,
-                        sig_rdata,
-                        self._dnssec_raw_anchors
-                    )
+            except dns.dnssec.ValidationFailure as e:
+                # If signer is root, try validating with configured anchors; otherwise propagate the failure.
+                if (signer_name == "." or signer_name == "") and self._dnssec_raw_anchors:
+                    try:
+                        await loop.run_in_executor(
+                            _CRYPTO_EXECUTOR,
+                            lambda: dns.dnssec.validate_rrsig(rrset, sig_rdata, self._dnssec_raw_anchors)
+                        )
+                    except dns.dnssec.ValidationFailure:
+                        self.logger.warning("RRSIG validation against root anchors failed for %s", rrset.name)
+                        raise
                 else:
+                    self.logger.warning("RRSIG validation failed for %s, signer=%s", rrset.name, signer_name)
                     raise
 
         return True, False
@@ -1850,6 +2285,35 @@ class DNSResolver:
         except Exception as e:
             self.logger.warning("DNSSEC validation error for %s: %s", qname, e)
             raise
+
+    # ---------- Rate limiting helper ----------
+    async def _check_rate_limit(self, client_ip: str) -> bool:
+        if self.rate_limiter is None:
+            return True
+        return await self.rate_limiter.is_allowed(client_ip)
+
+    def _is_quic_connection_alive(self, client: Any) -> bool:
+        if client is None:
+            return False
+        quic = getattr(client, '_quic', None)
+        if quic is None:
+            return False
+        if hasattr(quic, 'closed') and quic.closed:
+            return False
+        if hasattr(quic, 'is_closing'):
+            maybe_closed = quic.is_closing
+            if callable(maybe_closed):
+                try:
+                    closed = maybe_closed()
+                except Exception:
+                    closed = False
+                if isinstance(closed, bool) and closed:
+                    return False
+        try:
+            quic.get_next_available_stream_id()
+            return True
+        except Exception:
+            return False
 
     # ---------- upstream resolution ----------
     async def _resolve_upstream_ip(self, hostname: str, ip_override: Optional[str] = None) -> str:
@@ -2013,132 +2477,315 @@ class DNSResolver:
 
     # ---------- NS scrubbing ----------
     def _scrub_authority_section(self, response_bytes: bytes, qname: str) -> bytes:
+        """Remove unsolicited NS records from Authority and out‑of‑bailiwick records from Additional."""
         if not self.scrub_unsolicited_ns or not _HAS_DNSPY:
             return response_bytes
 
         try:
             msg = dns.message.from_wire(response_bytes)
-            if not msg.authority:
+            if not msg.authority and not msg.additional:
                 return response_bytes
 
-            qname_lower = qname.lower().rstrip('.')
+            qname_obj = dns.name.from_text(qname.lower().rstrip('.'))
+
+            # ---- Scrub Authority (NS records) ----
             filtered_authority = []
             for rrset in msg.authority:
                 if rrset.rdtype != dns.rdatatype.NS:
                     filtered_authority.append(rrset)
                     continue
-
+                # Always keep root NS
                 if rrset.name == dns.name.root:
                     filtered_authority.append(rrset)
                     continue
-
-                rr_name = str(rrset.name).lower().rstrip('.')
-                if rr_name == qname_lower:
-                    filtered_authority.append(rrset)
-                elif qname_lower.endswith('.' + rr_name):
-                    filtered_authority.append(rrset)
-                elif rr_name.endswith('.' + qname_lower):
+                # Keep if within bailiwick – allow exact match or superdomain
+                if rrset.name == qname_obj or qname_obj.is_subdomain(rrset.name):
                     filtered_authority.append(rrset)
                 else:
-                    self.logger.debug("Scrubbed unsolicited NS record for %s (qname=%s)", rr_name, qname)
+                    self.logger.debug("Scrubbed unsolicited NS record: %s (qname=%s)",
+                                    rrset.name.to_text(), qname)
+
+            # ---- Scrub Additional (glue, etc.) ----
+            filtered_additional = []
+            for rrset in msg.additional:
+                # Always keep OPT (EDNS0) records
+                if rrset.rdtype == dns.rdatatype.OPT:
+                    filtered_additional.append(rrset)
+                    continue
+                # Keep if within bailiwick
+                if self._is_in_bailiwick(rrset.name, qname_obj):
+                    filtered_additional.append(rrset)
+                else:
+                    self.logger.debug("Scrubbed out‑of‑bailiwick Additional record: %s (qname=%s)",
+                                    rrset.name.to_text(), qname)
 
             msg.authority = filtered_authority
+            msg.additional = filtered_additional
             return msg.to_wire()
+
         except Exception as e:
             self.logger.debug("NS scrubbing failed: %s", e)
             return response_bytes
 
-    # ---------- forward_dns_query (fixed coalescing) ----------
+    # ---------- forward_dns_query (fixed coalescing, rate limiting removed) ----------
     def _finalize_response(self, resp: bytes, orig_id: int, cd_flag: bool) -> bytes:
-        """Stamp the response with the original transaction ID and copy CD bit."""
+        """
+        Stamp the response with the original transaction ID and copy CD bit.
+        """
         result = self._set_query_id(resp, orig_id)
         if cd_flag and len(result) >= 4:
             flags = int.from_bytes(result[2:4], 'big')
-            flags |= 0x0010
+            flags |= dns.flags.CD  # CORRECT: bit 13 (0x2000) per RFC 1035/4035
             result = result[:2] + flags.to_bytes(2, 'big') + result[4:]
         return result
 
-    async def forward_dns_query(self, data: bytes) -> bytes:
-        if self.rate_limiter is not None:
-            client_ip = self._extract_client_ip(data)
+    async def forward_dns_query(self, original_data: bytes, client_ip: Optional[str] = None) -> bytes:
+        """
+        Forwards DNS query with rate-limiting, RFC 6891 OPT validation,
+        blocklist checking, DNSSEC, ECS, scope-aware caching, rebind protection,
+        out-of-bailiwick scrubbing, and IPv6 record stripping.
+        """
+        # 1. Rate Limiting (cheap, before parsing)
+        if client_ip and self.rate_limiter:
             if not await self.rate_limiter.is_allowed(client_ip):
-                self.logger.info("Rate‑limited client %s", client_ip)
-                return self._make_servfail_response(data)
+                self.logger.warning("Rate limit exceeded for %s", client_ip)
+                return self._make_rcode_response(original_data, dns.rcode.REFUSED)
 
-        original_data = data
-
-        cd_flag = False
-        if len(original_data) >= 4:
-            flags = int.from_bytes(original_data[2:4], 'big')
-            cd_flag = bool(flags & 0x0010)
-
-        data = self._normalize_query_for_forward(data)
-        if cd_flag:
-            flags = int.from_bytes(data[2:4], 'big')
-            flags |= 0x0010
-            data = data[:2] + flags.to_bytes(2, 'big') + data[4:]
-
-        qname = self._extract_qname_from_wire(data)
-        qtype = self._extract_qtype_from_wire(data) or 1
-        key = self._build_cache_key(data)
-        orig_id = int.from_bytes(data[:2], 'big')
-
-        dnssec_requested = self._dnssec_requested(original_data)
-        if cd_flag:
-            dnssec_requested = False
-
-        host_values = await self._check_hosts_and_blocklists(qname, qtype, original_data)
-        if host_values is not None:
-            return host_values
-
-        flight_key = (qname, qtype, dnssec_requested)
-        async with self._flight_lock:
-            existing = self._flights.get(flight_key)
-            if existing is not None:
-                self.logger.debug("Coalescing query for %s", qname)
-                canonical = await existing
-                return self._finalize_response(canonical, orig_id, cd_flag)
-            fut = asyncio.get_running_loop().create_future()
-            self._flights[flight_key] = fut
+        # 2. Wire Format & RFC 6891 Single-OPT Check
+        if len(original_data) < 12:
+            return self._make_rcode_response(original_data, dns.rcode.FORMERR)
 
         try:
-            cached = await self._check_caches(key, qname, original_data, dnssec_requested)
-            if cached is not None:
-                fut.set_result(cached)
-                return self._finalize_response(cached, orig_id, cd_flag)
+            msg = dns.message.from_wire(original_data)
+        except Exception:
+            return self._make_rcode_response(original_data, dns.rcode.FORMERR)
 
-            upstream_list = list(self.upstreams) if self.upstreams else []
+        if not msg.question:
+            reply = dns.message.make_response(msg)
+            reply.set_rcode(dns.rcode.FORMERR)
+            return reply.to_wire()
+
+        # RFC 6891 §6.1.1: at most one OPT record
+        opt_count = sum(1 for rrset in msg.additional if rrset.rdtype == dns.rdatatype.OPT)
+        if opt_count > 1:
+            self.logger.warning("Rejecting query with %d OPT records (RFC 6891 FORMERR)", opt_count)
+            reply = dns.message.make_response(msg)
+            reply.set_rcode(dns.rcode.FORMERR)
+            return reply.to_wire()
+
+        qname = msg.question[0].name.to_text()
+        qtype = msg.question[0].rdtype
+        orig_id = msg.id
+        cd_flag = bool(msg.flags & dns.flags.CD)
+        do_flag = bool(msg.ednsflags & dns.flags.DO) if msg.edns is not None else False
+
+        # 3. Hosts override (local A/AAAA)
+        host_entry = await self.get_host_for(qname)
+        if host_entry:
+            if qtype in (dns.rdatatype.A, dns.rdatatype.AAAA, dns.rdatatype.ANY):
+                try:
+                    resp = dns.message.make_response(msg)
+                    ttl = 60
+                    for ip in host_entry:
+                        if qtype == dns.rdatatype.A and ':' not in ip:
+                            rr = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.A, ip)
+                            resp.answer.append(rr)
+                        elif qtype == dns.rdatatype.AAAA and ':' in ip:
+                            rr = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.AAAA, ip)
+                            resp.answer.append(rr)
+                        elif qtype == dns.rdatatype.ANY:
+                            if ':' not in ip:
+                                rr = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.A, ip)
+                                resp.answer.append(rr)
+                            else:
+                                rr = dns.rrset.from_text(qname, ttl, dns.rdataclass.IN, dns.rdatatype.AAAA, ip)
+                                resp.answer.append(rr)
+                    self._log_event("Hosts override", qname, client_ip)
+                    return resp.to_wire()
+                except Exception as e:
+                    self.logger.warning("Failed to synthesise hosts response for %s: %s", qname, e)
+
+        # 4. Blocklist Check
+        if await self.is_blocked(qname):
+            self.logger.info("Blocked query for %s", qname)
+            return self.build_block_response(original_data)
+
+        # 5. Build cache key (without ECS for negative cache)
+        cache_key = (qname, qtype, "global")
+
+        # 6. Negative cache lookup
+        neg_entry = await self._negative_cache_get(cache_key)
+        if neg_entry is not None:
+            self.logger.debug("Negative-cache hit for %s", qname)
+            return self._set_query_id(neg_entry, orig_id)
+
+        # 7. Prepare forward message with EDNS0 ECS
+        forward_msg = dns.message.from_wire(original_data)
+        if not self.ecs_enabled and forward_msg.options:
+            # Remove ECS option by creating a new options list
+            filtered = [opt for opt in forward_msg.options if opt.otype != 8]
+            forward_msg.use_edns(
+                edns=forward_msg.edns,
+                payload=forward_msg.payload,
+                options=filtered,
+            )
+
+        client_subnet_prefix = 0
+        if client_ip and self.ecs_enabled:
+            try:
+                ip_obj = ipaddress.ip_address(client_ip)
+                if ip_obj.version == 4:
+                    prefix_len = 24
+                    net = ipaddress.IPv4Network(f"{client_ip}/24", strict=False)
+                    subnet_bytes = net.network_address.packed[:3]
+                    family = 1
+                else:
+                    prefix_len = 56
+                    net = ipaddress.IPv6Network(f"{client_ip}/56", strict=False)
+                    subnet_bytes = net.network_address.packed[:7]
+                    family = 2
+                client_subnet_prefix = prefix_len
+                ecs_data = struct.pack("!HBB", family, prefix_len, 0) + subnet_bytes
+                ecs_option = dns.edns.GenericOption(8, ecs_data)
+                options = [opt for opt in (forward_msg.options or []) if opt.otype != 8]
+                options.append(ecs_option)
+                forward_msg.use_edns(edns=0, payload=self.max_edns_payload, options=options)
+            except Exception as e:
+                self.logger.debug("Failed to attach ECS: %s", e)
+
+        forward_data = forward_msg.to_wire()
+
+        # 8. Scope-aware wire cache lookup (positive)
+        cached_entry = None
+        if client_subnet_prefix > 0:
+            subnet_key = (qname, qtype, f"{client_ip}/{client_subnet_prefix}")
+            cached_entry = await self._wire_cache_get_valid(subnet_key)
+        if cached_entry is None:
+            global_key = (qname, qtype, "global")
+            cached_entry = await self._wire_cache_get_valid(global_key)
+
+        if cached_entry is not None:
+            resp_bytes, _ = cached_entry
+            self.logger.debug("Wire-cache hit for %s", qname)
+            return self._set_query_id(resp_bytes, orig_id)
+
+        # 9. Flight coalescing (in-flight query deduplication)
+        flight_key = (qname, qtype, client_subnet_prefix, client_ip if client_subnet_prefix else None)
+        async with self._flight_lock:
+            existing_future = self._flights.get(flight_key)
+            if existing_future and not existing_future.done():
+                self.logger.debug("Coalescing flight for %s", qname)
+                # Wait for the existing flight to complete, then return its result.
+                try:
+                    return await existing_future
+                except Exception as e:
+                    self.logger.debug("Coalesced flight failed: %s", e)
+                    # If the existing flight failed, remove it and continue to retry.
+                    self._flights.pop(flight_key, None)
+                    # fall through to create a new flight
+            # Create a new future and store it
+            future = asyncio.get_running_loop().create_future()
+            self._flights[flight_key] = future
+
+        # At this point, we are the "leader" – we must set the future result/exception.
+        try:
+            # 10. Select upstream(s) and execute load-balancing strategy
+            upstream_list = self.upstreams or []
             if not upstream_list:
                 upstream_list = [{
-                    'address': '1.1.1.1', 'protocol': 'udp', 'port': 53,
-                    'hostname': '1.1.1.1', 'ip': '1.1.1.1'
+                    'address': '1.1.1.1',
+                    'protocol': 'udp',
+                    'port': 53,
+                    'hostname': '1.1.1.1',
+                    'ip': '1.1.1.1'
                 }]
+                self.logger.warning("No upstreams defined; using default 1.1.1.1 over UDP")
 
             if self._health_enabled:
-                healthy_list = await self._get_healthy_upstreams(upstream_list)
-                if healthy_list:
-                    upstream_list = healthy_list
+                upstream_list = await self._get_healthy_upstreams(upstream_list)
 
-            strategy = self.load_balancing
-            try:
-                resp = await self._execute_strategy(strategy, upstream_list, data, qname, dnssec_requested, key, orig_id)
-            except Exception as e:
-                self.logger.error("Upstream query failed: %s", e)
-                if not fut.done():
-                    fut.set_exception(e)
-                raise
+            response = await self._execute_strategy(
+                self.load_balancing,
+                upstream_list,
+                forward_data,
+                qname,
+                do_flag,
+                cache_key,
+                orig_id
+            )
 
-            fut.set_result(resp)
-            return self._finalize_response(resp, orig_id, cd_flag)
+            # 11. DNSSEC validation (if enabled and CD flag not set)
+            if self.dnssec_enabled and not cd_flag and do_flag:
+                try:
+                    secure, insecure = await self._dnssec_validate(qname, response, do_flag)
+                    if not secure and not insecure:
+                        self.logger.warning("DNSSEC validation failed for %s", qname)
+                        response = self._make_rcode_response(original_data, dns.rcode.SERVFAIL)
+                except Exception as e:
+                    self.logger.warning("DNSSEC error for %s: %s", qname, e)
+                    response = self._make_rcode_response(original_data, dns.rcode.SERVFAIL)
+
+            # 12. Rebind protection
+            if self.rebind_protection_enabled:
+                response = self._apply_rebind_protection(response)
+                if response is None:
+                    response = self._make_rcode_response(original_data, dns.rcode.REFUSED)
+
+            # 13. NS scrubbing
+            if self.scrub_unsolicited_ns:
+                response = self._scrub_authority_section(response, qname)
+
+            # 14. IPv6 stripping
+            if self.strip_ipv6_records:
+                response = self._strip_ipv6_records(response)
+
+            # 15. Cache the response (positive or negative)
+            if self._is_negative_response(response):
+                ttl = self._extract_soa_minimum(response)
+                if ttl is None:
+                    ttl = self.negative_cache_ttl
+                await self._negative_cache_set(cache_key, response, ttl=ttl)
+            else:
+                try:
+                    resp_msg = dns.message.from_wire(response)
+                    min_ttl = min(
+                        (rr.ttl for sec in (resp_msg.answer, resp_msg.authority, resp_msg.additional)
+                        for rr in sec if rr.rdtype != dns.rdatatype.OPT),
+                        default=300
+                    )
+                    returned_scope = 0
+                    for opt in resp_msg.options:
+                        if opt.otype == 8 and len(opt.data) >= 4:
+                            returned_scope = opt.data[3]
+                            break
+                    if returned_scope > 0 and client_ip:
+                        final_key = (qname, qtype, f"{client_ip}/{returned_scope}")
+                    else:
+                        final_key = (qname, qtype, "global")
+                    if min_ttl > 0:
+                        expiry = time.time() + min_ttl
+                        stale_until = expiry + self.stale_max_age if self.optimistic_cache_enabled else expiry
+                        val = (response, expiry, forward_data, stale_until, False)
+                        await self._wire_cache_set(final_key, val)
+                except Exception as e:
+                    self.logger.debug("Cache set error: %s", e)
+
+            # 16. Set the future result (for any concurrent waiters) and return
+            if not future.done():
+                future.set_result(response)
+            return response
+
         except Exception as e:
-            if not fut.done():
-                fut.set_exception(e)
-            self.logger.error("Upstream query failed: %s", e)
+            # Set the future exception before raising
+            if not future.done():
+                future.set_exception(e)
             raise
         finally:
+            # Remove the future from the dict, but only if it's still the same one.
+            # This prevents removing a future that was replaced by a new leader.
             async with self._flight_lock:
-                self._flights.pop(flight_key, None)
-
+                if self._flights.get(flight_key) is future:
+                    self._flights.pop(flight_key, None)
     # ---------- Helper methods ----------
     async def _check_hosts_and_blocklists(self, qname: str, qtype: int, original_data: bytes) -> Optional[bytes]:
         if qname:
@@ -2357,47 +3004,61 @@ class DNSResolver:
 
     async def _forward_udp(self, data: bytes, upstream: Dict[str, Any]) -> bytes:
         host = upstream['address']
-        port = upstream.get('port', 53)
+        port = int(upstream.get('port', 53))
         ip_override = upstream.get('ip')
 
         resolved = await self._resolve_upstream_ip(host, ip_override)
-        key = (resolved, int(port))
+        if self.disable_ipv6 and self._is_ipv6_address(resolved):
+            raise Exception("IPv6 disabled but resolved to IPv6")
 
-        async with self._udp_sockets_lock:
-            if key not in self._udp_locks:
-                self._udp_locks[key] = asyncio.Lock()
-            lock = self._udp_locks[key]
+        # Determine address family
+        family = socket.AF_INET6 if self._is_ipv6_address(resolved) else socket.AF_INET
 
-        async with lock:
-            sock = await self._get_udp_socket(key)
-            loop = asyncio.get_running_loop()
-            try:
-                await loop.sock_sendall(sock, data)
+        # Fresh ephemeral socket per query (RFC 5452 source-port randomization)
+        sock = socket.socket(family, socket.SOCK_DGRAM)
+        sock.setblocking(False)
 
-                sock.setblocking(True)
-                try:
-                    response, addr = await asyncio.wait_for(
-                        loop.run_in_executor(None, sock.recvfrom, self.max_edns_payload or 4096),
-                        timeout=self.udp_timeout
-                    )
-                finally:
-                    sock.setblocking(False)
+        loop = asyncio.get_running_loop()
+        try:
+            # Send query asynchronously without blocking loop
+            await loop.sock_sendto(sock, data, (resolved, port))
 
-                if len(response) >= 2:
-                    resp_id = int.from_bytes(response[:2], 'big')
-                    sent_id = int.from_bytes(data[:2], 'big')
-                    if resp_id != sent_id:
-                        self.logger.warning("UDP response ID mismatch: sent %d, got %d", sent_id, resp_id)
-                        raise OSError("Response ID mismatch")
-                return response
-            except (OSError, socket.error) as e:
-                if key in self._udp_sockets:
-                    del self._udp_sockets[key]
-                    try:
-                        sock.close()
-                    except Exception:
-                        pass
-                raise e
+            # Receive response asynchronously (pure asyncio, no executor needed)
+            buf_size = getattr(self, 'max_edns_payload', 4096) or 4096
+            response, addr = await asyncio.wait_for(
+                loop.sock_recvfrom(sock, buf_size),
+                timeout=self.udp_timeout
+            )
+
+            # RFC 5452 §4.4: Verify response comes from expected upstream IP & port
+            resp_ip, resp_port = addr[0], addr[1]
+            if resp_ip != resolved or resp_port != port:
+                self.logger.warning(
+                    "Spoofed/unexpected UDP sender: expected %s:%d, got %s:%d",
+                    resolved, port, resp_ip, resp_port
+                )
+                raise OSError("UDP response origin mismatch")
+
+            # RFC 5452 §4.1: Validate Transaction ID (TXID)
+            if len(response) >= 2:
+                resp_id = int.from_bytes(response[:2], 'big')
+                sent_id = int.from_bytes(data[:2], 'big')
+                if resp_id != sent_id:
+                    self.logger.warning("UDP response ID mismatch: sent %d, got %d", sent_id, resp_id)
+                    raise OSError("Response ID mismatch")
+            else:
+                raise OSError("Truncated DNS response")
+
+            return response
+
+        except (OSError, socket.error) as e:
+            self.logger.warning("UDP forward error to %s:%d: %s", resolved, port, e)
+            raise
+        except asyncio.TimeoutError:
+            self.logger.warning("UDP timeout to %s:%d", resolved, port)
+            raise
+        finally:
+            sock.close()
 
     async def _forward_tcp(self, data: bytes, upstream: Dict[str, Any]) -> bytes:
         host = upstream['address']
@@ -2405,6 +3066,7 @@ class DNSResolver:
         ip_override = upstream.get('ip')
         key = (host, port)
         pooled = await self._tcp_pool.get(key)
+
         if pooled:
             reader, writer = pooled
             if writer.is_closing():
@@ -2419,20 +3081,38 @@ class DNSResolver:
             if self.disable_ipv6 and self._is_ipv6_address(resolved):
                 raise Exception("IPv6 disabled but resolved to IPv6")
             reader, writer = await asyncio.open_connection(resolved, int(port))
+
         try:
             writer.write(len(data).to_bytes(2, "big") + data)
             await writer.drain()
+
             length_bytes = await asyncio.wait_for(reader.readexactly(2), timeout=self.tcp_timeout)
-            length = int.from_bytes(length_bytes, "big")
+            length = int.from_bytes(length_bytes, 'big')
+
+            # Validate TCP DNS payload length (RFC 1035 §4.1.1 requires at least a 12-byte header)
+            if length < 12:
+                raise ValueError(f"TCP message length {length} is less than required DNS header size (12 bytes)")
+            if length > MAX_TCP_RESPONSE_SIZE:
+                raise ValueError(f"TCP message length {length} exceeds maximum {MAX_TCP_RESPONSE_SIZE}")
+
             resp = await asyncio.wait_for(reader.readexactly(length), timeout=self.tcp_timeout)
+
+            # RFC 7766: Validate Transaction ID matches query
+            if len(resp) >= 2 and len(data) >= 2:
+                resp_id = int.from_bytes(resp[:2], 'big')
+                sent_id = int.from_bytes(data[:2], 'big')
+                if resp_id != sent_id:
+                    self.logger.warning("TCP response ID mismatch: sent %d, got %d", sent_id, resp_id)
+                    raise OSError("TCP Response ID mismatch")
+
             await self._tcp_pool.put(key, reader, writer)
             return resp
         except Exception:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
+            if pooled:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
             raise
 
     async def _forward_tls(self, data: bytes, upstream: Dict[str, Any]) -> bytes:
@@ -2493,9 +3173,26 @@ class DNSResolver:
             self.logger.debug("Sending %d bytes to %s:%s", len(data), host, port)
             writer.write(len(data).to_bytes(2, "big") + data)
             await writer.drain()
+
             length_bytes = await asyncio.wait_for(reader.readexactly(2), timeout=self.tcp_timeout)
             length = int.from_bytes(length_bytes, "big")
+
+            # Validate TCP DNS payload length (RFC 1035 §4.1.1 requires at least a 12-byte header)
+            if length < 12:
+                raise ValueError(f"TCP message length {length} is less than required DNS header size (12 bytes)")
+            if length > MAX_TCP_RESPONSE_SIZE:
+                raise ValueError(f"TCP message length {length} exceeds maximum {MAX_TCP_RESPONSE_SIZE}")
+
             resp = await asyncio.wait_for(reader.readexactly(length), timeout=self.tcp_timeout)
+
+            # RFC 7858 / RFC 1035 §4.1.1: Validate Transaction ID matches query
+            if len(resp) >= 2 and len(data) >= 2:
+                resp_id = int.from_bytes(resp[:2], 'big')
+                sent_id = int.from_bytes(data[:2], 'big')
+                if resp_id != sent_id:
+                    self.logger.warning("TLS response ID mismatch: sent %d, got %d", sent_id, resp_id)
+                    raise OSError("TLS Response ID mismatch")
+
             await self._tcp_pool.put(key, reader, writer)
             return resp
         except Exception:
@@ -2541,6 +3238,14 @@ class DNSResolver:
                 version, expiry = self._doh_auto_cache[hostname]
                 if version == '_failed' and now < expiry:
                     return '1.1'
+            # Evict oldest entries if cache exceeds maxsize
+            try:
+                if len(self._doh_auto_cache) >= self._doh_auto_cache_maxsize:
+                    # remove the entry with the earliest expiry
+                    oldest = min(self._doh_auto_cache.items(), key=lambda kv: kv[1][1])[0]
+                    del self._doh_auto_cache[oldest]
+            except Exception:
+                pass
             self._doh_auto_cache[hostname] = ('_probing', now + 10)
 
         probe_data = dns.message.make_query('probe.invalid', 'A').to_wire()
@@ -2562,6 +3267,13 @@ class DNSResolver:
 
         async with self._doh_auto_lock:
             if self._doh_auto_cache.get(hostname, ('', 0))[0] == '_probing':
+                # Before writing, keep cache bounded
+                try:
+                    if len(self._doh_auto_cache) >= self._doh_auto_cache_maxsize:
+                        oldest = min(self._doh_auto_cache.items(), key=lambda kv: kv[1][1])[0]
+                        del self._doh_auto_cache[oldest]
+                except Exception:
+                    pass
                 self._doh_auto_cache[hostname] = (version, time.time() + self.doh_auto_cache_ttl)
             elif version == '1.1':
                 self._doh_auto_cache[hostname] = ('_failed', time.time() + self.doh_auto_cache_ttl // 2)
@@ -2735,10 +3447,10 @@ class DNSResolver:
     async def _forward_quic(self, data: bytes, upstream: Dict[str, Any]) -> bytes:
         if not _HAS_AIOQUIC:
             raise RuntimeError("aioquic not available for DoQ")
+
         from aioquic.asyncio import connect
         from aioquic.asyncio.protocol import QuicConnectionProtocol
         from aioquic.quic.configuration import QuicConfiguration
-        from aioquic.quic.events import StreamDataReceived
 
         host = upstream['address']
         port = upstream.get('port', 853)
@@ -2767,9 +3479,8 @@ class DNSResolver:
                             fut.set_result(data)
 
         client = await self._quic_pool.get(key)
-        if client is not None:
-            if client._quic is None or getattr(client._quic, 'closed', False):
-                client = None
+        if client is not None and not self._is_quic_connection_alive(client):
+            client = None
 
         if client is None:
             config = QuicConfiguration(
@@ -2803,7 +3514,7 @@ class DNSResolver:
             response_data = await asyncio.wait_for(future, timeout=self.doh_timeout)
         except asyncio.TimeoutError:
             client._pending.pop(stream_id, None)
-            if not getattr(client._quic, 'closed', False):
+            if self._is_quic_connection_alive(client):
                 client._quic.close()
             raise TimeoutError(f"DoQ query to {host}:{port} timed out")
         except Exception:
@@ -2820,7 +3531,15 @@ class DNSResolver:
             raise Exception("DoQ response truncated")
         resp = response_data[2:2+resp_len]
 
-        if not getattr(client._quic, 'closed', False):
+        # RFC 9250: Validate Transaction ID matches query
+        if len(resp) >= 2 and len(data) >= 2:
+            resp_id = int.from_bytes(resp[:2], 'big')
+            sent_id = int.from_bytes(data[:2], 'big')
+            if resp_id != sent_id:
+                self.logger.warning("DoQ response ID mismatch: sent %d, got %d", sent_id, resp_id)
+                raise OSError("DoQ Response ID mismatch")
+
+        if self._is_quic_connection_alive(client):
             await self._quic_pool.put(key, client)
 
         return resp
@@ -2989,18 +3708,18 @@ class DNSResolver:
             self.logger.debug("rebind protection failed: %s", e)
             return response_bytes
 
-    @staticmethod
-    def _is_private_ip(ip_str: str) -> bool:
+    def _is_private_ip(self, ip_str: str) -> bool:
+        """Checks whether an IP address belongs to a private/reserved range."""
         try:
             ip = ipaddress.ip_address(ip_str)
+            # First, use ipaddress built-in checks (covers many common ranges)
+            if (ip.is_private or ip.is_loopback or ip.is_link_local or 
+                ip.is_multicast or ip.is_unspecified or ip.is_reserved):
+                return True
+            # Then check our explicit list for ranges not covered by ipaddress
+            return any(ip in subnet for subnet in self.PRIVATE_SUBNETS)
         except ValueError:
             return False
-        if isinstance(ip, ipaddress.IPv4Address):
-            return (ip.is_private or ip.is_loopback or ip.is_link_local or
-                    ip.is_reserved or ip.is_multicast or ip.is_unspecified)
-        else:
-            return (ip.is_private or ip.is_loopback or ip.is_link_local or
-                    ip.is_reserved or ip.is_multicast or ip.is_unspecified)
 
     def _set_tc_bit(self, response_bytes: bytes) -> bytes:
         if len(response_bytes) < 4:
@@ -3018,7 +3737,7 @@ class DNSResolver:
             except Exception as e:
                 raise e
 
-        backoff = 0.1
+        backoff = self.initial_backoff
         last_exc: Optional[Exception] = None
         for attempt in range(self.retries):
             try:
@@ -3225,6 +3944,7 @@ class DNSResolver:
                             udp_timeout: Optional[float] = None,
                             tcp_timeout: Optional[float] = None,
                             retries: Optional[int] = None,
+                            initial_backoff: Optional[float] = None,
                             dns_logging_enabled: Optional[bool] = None,
                             pinned_certs: Optional[Dict[str, str]] = None,
                             dnssec_enabled: Optional[bool] = None,
@@ -3283,6 +4003,8 @@ class DNSResolver:
                 self.tcp_timeout = tcp_timeout
             if retries is not None:
                 self.retries = max(1, int(retries))
+            if initial_backoff is not None:
+                self.initial_backoff = float(initial_backoff)
             if dns_logging_enabled is not None:
                 self.dns_logging_enabled = dns_logging_enabled
                 if self.dns_logging_enabled and self._file_logger is None:

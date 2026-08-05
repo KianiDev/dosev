@@ -1,4 +1,4 @@
-# dosev/server.py – with HTTP/3, health checks, and new DNSSEC/NS scrub parameters
+# dosev/server.py – with HTTP/3, health checks, and rate limiting per transport
 
 import asyncio
 import base64
@@ -55,10 +55,9 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
         resolver = self.holder.resolver
         client_ip = addr[0]
 
-        if resolver.rate_limiter is not None:
-            if not await resolver.rate_limiter.is_allowed(client_ip):
-                logging.debug("Rate‑limited UDP query from %s", client_ip)
-                return
+        if not await resolver._check_rate_limit(client_ip):
+            logging.debug("Rate‑limited UDP query from %s", client_ip)
+            return
 
         try:
             qname: Optional[str] = None
@@ -102,7 +101,7 @@ class UDPResolverProtocol(asyncio.DatagramProtocol):
                 req_msg = dns.message.from_wire(data)
                 if req_msg.opt:
                     client_payload = req_msg.payload
-            except:
+            except Exception:
                 pass
             if len(response) > client_payload:
                 response = resolver._set_tc_bit(response)
@@ -128,11 +127,10 @@ async def _tcp_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
     resolver = holder.resolver
     client_ip = peer[0] if peer else "unknown"
 
-    if resolver.rate_limiter is not None:
-        if not await resolver.rate_limiter.is_allowed(client_ip):
-            logging.debug("Rate‑limited TCP query from %s", client_ip)
-            writer.close()
-            return
+    if not await resolver._check_rate_limit(client_ip):
+        logging.debug("Rate‑limited TCP query from %s", client_ip)
+        writer.close()
+        return
 
     try:
         try:
@@ -214,6 +212,7 @@ async def reload_resolver(holder: ResolverHolder,
         tcp_timeout=config.get("upstream_tcp_timeout"),
         doh_timeout=config.get("upstream_doh_timeout"),
         retries=config.get("upstream_retries"),
+        initial_backoff=config.get("upstream_initial_backoff", 0.1),
         pinned_certs=config.get("dns_pinned_certs"),
         dnssec_enabled=config.get("dnssec_enabled", False),
         auto_update_trust_anchor=config.get("auto_update_trust_anchor", True),
@@ -288,6 +287,7 @@ def _drop_dns_privileges(user: str, group: Optional[str] = None,
                 logging.info('chroot to %s successful', chroot_dir)
             except Exception as e:
                 logging.warning('chroot failed: %s', e)
+                raise
         try:
             os.setgid(gid)
             os.setuid(pw.pw_uid)
@@ -297,8 +297,10 @@ def _drop_dns_privileges(user: str, group: Optional[str] = None,
                 logging.debug('Failed to set supplementary groups during drop_privileges', exc_info=True)
         except Exception as e:
             logging.warning('Failed to drop privileges: %s', e)
+            raise
     except Exception as e:
         logging.error('drop_privileges helper error: %s', e)
+        raise
 
 
 def _create_ssl_context(cert_file: str, key_file: str) -> ssl.SSLContext:
@@ -321,6 +323,10 @@ def _get_client_address(writer: asyncio.StreamWriter) -> str:
 async def _handle_doh_request(request: web.Request, holder: ResolverHolder) -> web.Response:
     resolver = holder.resolver
     client_ip = request.remote or 'unknown'
+
+    if not await resolver._check_rate_limit(client_ip):
+        return web.Response(status=429, text='Too Many Requests')
+
     qname: Optional[str] = None
     try:
         if request.method == 'GET':
@@ -401,9 +407,17 @@ class Http3ServerProtocol(QuicConnectionProtocol):
         self._request_data: Dict[int, bytearray] = {}
         self._request_headers: Dict[int, dict] = {}
         self._holder: Optional[ResolverHolder] = None
+        self._client_ip: str = "unknown"
 
     def set_holder(self, holder: ResolverHolder) -> None:
         self._holder = holder
+
+    def datagram_received(self, data: bytes, addr) -> None:
+        if addr and isinstance(addr, tuple):
+            self._client_ip = addr[0]
+        else:
+            self._client_ip = "unknown"
+        super().datagram_received(data, addr)
 
     def quic_event_received(self, event: QuicEvent) -> None:
         for http_event in self._http.handle_event(event):
@@ -427,6 +441,12 @@ class Http3ServerProtocol(QuicConnectionProtocol):
             return
 
         resolver = self._holder.resolver
+        client_ip = getattr(self, "_client_ip", "unknown")
+
+        if not await resolver._check_rate_limit(client_ip):
+            await self._send_response(stream_id, 429, b"Too Many Requests")
+            return
+
         method = headers.get(":method", "GET")
         path = headers.get(":path", "/dns-query")
 
@@ -579,6 +599,7 @@ async def run_server(listen_ip: str, listen_port: int,
         udp_timeout=upstream_udp_timeout,
         tcp_timeout=upstream_tcp_timeout,
         retries=upstream_retries,
+        initial_backoff=upstream_initial_backoff,
         dns_logging_enabled=dns_logging_enabled,
         dns_log_dir=dns_log_dir,
         dns_log_prefix=dns_log_prefix,
@@ -618,7 +639,6 @@ async def run_server(listen_ip: str, listen_port: int,
     holder = ResolverHolder(resolver)
     loop = asyncio.get_running_loop()
 
-    # Start background tasks
     await resolver.start_background_tasks()
 
     if blocklists is None:

@@ -75,6 +75,7 @@ def main() -> None:
         metrics_port=config.get("metrics_port", 8000),
         uvloop_enable=config.get("uvloop_enable", False),
         upstream_retries=config.get("upstream_retries", 2),
+        upstream_initial_backoff=config.get("upstream_initial_backoff", 0.1),
         upstream_udp_timeout=config.get("upstream_udp_timeout", 2.0),
         upstream_tcp_timeout=config.get("upstream_tcp_timeout", 5.0),
         upstream_doh_timeout=config.get("upstream_doh_timeout", 5.0),
