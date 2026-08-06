@@ -1,13 +1,5 @@
-# [1.9.1] – 2026-08-06
+# [1.9.2] – 2026-08-06
 
 ## Fixed
 
-- **DoQ (DNS over QUIC) `StreamDataReceived` attribute error** – The `DoQProtocol` inside `_forward_quic()` incorrectly referenced `event.stream_ended`; the aioquic event uses `event.end_stream`. This caused `AttributeError` exceptions on every DoQ response, preventing successful DoQ queries. The attribute has been corrected to `event.end_stream`, restoring full DoQ functionality.
-
-## Changed
-
-- **Health check protocol detection** – Added recognition for the `doq` protocol alias (now treated as `quic`) in `_try_upstream()` to prevent "Unsupported upstream protocol: doq" warnings when health checks target DoQ upstreams configured with protocol `doq`.
-
-## Security
-
-- No security fixes in this release.
+- **HTTP/2 DoH SNI mismatch causing certificate verification failure** – When an upstream used a fixed IP (`ip` option) with the HTTPS protocol, the HTTP/2 client (`httpx`) constructed the URL using the IP address, causing the SNI (Server Name Indication) to be the IP instead of the domain name. This resulted in certificate verification errors (`IP address mismatch`) and prevented the upstream from being marked healthy. The fix explicitly sets `server_hostname` to the domain name in the HTTP/2 transport, ensuring the correct SNI is sent while still connecting to the fixed IP.
