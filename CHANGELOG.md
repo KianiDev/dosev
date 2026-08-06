@@ -1,5 +1,3 @@
-# [1.9.3] – 2026-08-06
+# [1.9.4] – 2026-08-06
 
-## Fixed
-
-- **HTTP/2 DoH SNI mismatch causing certificate verification failure** – When an upstream used a fixed IP (`ip` option) with the HTTPS protocol, the HTTP/2 client (`httpx`) constructed the URL using the IP address, causing the SNI (Server Name Indication) to be the IP instead of the domain name. This resulted in certificate verification errors (`IP address mismatch`) and prevented the upstream from being marked healthy. The fix uses httpx's `sni_hostname` request extension to explicitly set the correct SNI while still connecting to the fixed IP.
+- **HTTP/2 ALPN not being advertised** – The `http2=True` flag was incorrectly passed to `AsyncClient` instead of `AsyncHTTPTransport`. When a custom transport is provided, `AsyncClient` ignores its `http2` parameter. The transport defaulted to `http2=False`, so only `http/1.1` was advertised in the TLS ALPN extension. This caused all HTTPS upstream connections to negotiate HTTP/1.1 instead of HTTP/2, even when the server supported it. The fix moves `http2=True` to the `AsyncHTTPTransport` constructor.
