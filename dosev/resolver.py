@@ -3384,7 +3384,7 @@ class DNSResolver:
         resolved = await self._resolve_upstream_ip(host, ip_override)
 
         if client is None:
-            transport = httpx.AsyncHTTPTransport(verify=ssl.create_default_context())  # No server_hostname here
+            transport = httpx.AsyncHTTPTransport(http2=True, verify=ssl.create_default_context())
             client = httpx.AsyncClient(http2=True, transport=transport)
 
         url = f"https://{resolved}:{port}{path}"
