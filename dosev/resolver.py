@@ -3487,10 +3487,9 @@ class DNSResolver:
                     fut = self._pending.get(event.stream_id)
                     if fut and not fut.done():
                         self._fragments.setdefault(event.stream_id, bytearray()).extend(event.data)
-                        if event.stream_ended:
+                        if event.end_stream:
                             data = bytes(self._fragments.pop(event.stream_id))
                             fut.set_result(data)
-
         # Get from pool
         client = await self._quic_pool.get(key)
         if client is not None and not self._is_quic_connection_alive(client):
