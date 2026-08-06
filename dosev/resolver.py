@@ -3384,13 +3384,14 @@ class DNSResolver:
         resolved = await self._resolve_upstream_ip(host, ip_override)
 
         if client is None:
-            transport = httpx.AsyncHTTPTransport(
-                        verify=ssl.create_default_context(),
-                        server_hostname=hostname   # <-- sets SNI to the domain
-                    )
+            transport = httpx.AsyncHTTPTransport(verify=ssl.create_default_context())  # No server_hostname here
             client = httpx.AsyncClient(http2=True, transport=transport)
 
         url = f"https://{resolved}:{port}{path}"
+        
+        # Set SNI via extensions
+        extensions = {"sni_hostname": hostname}  # <-- FIX: this is how httpx sets SNI
+
         try:
             resp = await client.post(
                 url,
@@ -3401,6 +3402,7 @@ class DNSResolver:
                 },
                 content=data,
                 timeout=self.doh_timeout,
+                extensions=extensions,  # <-- pass it here
             )
             if resp.status_code < 200 or resp.status_code >= 300:
                 raise Exception(f"HTTP/2 upstream returned status {resp.status_code}")
