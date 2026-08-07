@@ -1,3 +1,5 @@
-# [1.9.4] – 2026-08-06
+# [1.9.5] – 2026-08-07
 
-- **HTTP/2 ALPN not being advertised** – The `http2=True` flag was incorrectly passed to `AsyncClient` instead of `AsyncHTTPTransport`. When a custom transport is provided, `AsyncClient` ignores its `http2` parameter. The transport defaulted to `http2=False`, so only `http/1.1` was advertised in the TLS ALPN extension. This caused all HTTPS upstream connections to negotiate HTTP/1.1 instead of HTTP/2, even when the server supported it. The fix moves `http2=True` to the `AsyncHTTPTransport` constructor.
+## Fixed
+
+- **Transaction ID mismatch in coalesced DNS responses** – When multiple identical queries were coalesced (single‑flight deduplication), the followers received the response with the leader's original transaction ID instead of their own. This caused clients to reject the response with "answer does not represent the original request". The fix stamps the coalesced response with the follower's query ID before returning it, preserving the existing retry-on-failure logic.
