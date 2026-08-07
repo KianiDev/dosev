@@ -445,7 +445,7 @@ def load_config(path: str = 'config/dosev.conf') -> Dict[str, Any]:
             },
         }
 
-    config.read(path)
+    config.read(path, encoding='utf-8')
 
     # Server
     listen_ip = config.get('server', 'listen_ip', fallback='0.0.0.0')
