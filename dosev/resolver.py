@@ -3430,31 +3430,55 @@ class DNSResolver:
         client = await self._h3_pool.get(key)
 
         if client is None:
-            # Create a new connection
             config = QuicConfiguration(
                 is_client=True,
-                alpn_protocols=["h3"],  # Use literal to avoid import issues
+                alpn_protocols=["h3"],
                 verify_mode=ssl.CERT_REQUIRED,
             )
             config.server_name = hostname
 
-            # Manually enter the context manager (aioquic's connect is an async context manager)
             cm = connect(resolved, port, configuration=config, create_protocol=H3DohProtocol)
-            client = await cm.__aenter__()
-            # Store the context manager so we can properly exit later
-            client._cm = cm
+            try:
+                client = await cm.__aenter__()
+                client._cm = cm
+            except asyncio.CancelledError:
+                # Clean up on cancellation during handshake
+                await cm.__aexit__(None, None, None)
+                raise
+            except Exception:
+                await cm.__aexit__(None, None, None)
+                raise
 
         try:
             response = await client.send_request(data, hostname, path)
+        except asyncio.CancelledError:
+            # Clean up on cancellation (e.g., health‑check timeout)
+            if hasattr(client, '_cm'):
+                try:
+                    await client._cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            else:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            raise
         except Exception:
-            # On failure, close the connection and don't pool it
-            try:
-                client.close()
-            except Exception:
-                pass
+            # On other failures, close and don't pool
+            if hasattr(client, '_cm'):
+                try:
+                    await client._cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            else:
+                try:
+                    client.close()
+                except Exception:
+                    pass
             raise
         else:
-            # Success: return the connection to the pool
+            # Success: return connection to pool
             await self._h3_pool.put(key, client)
             return response
 
@@ -3494,7 +3518,7 @@ class DNSResolver:
                         if event.end_stream:
                             data = bytes(self._fragments.pop(event.stream_id))
                             fut.set_result(data)
-        # Get from pool
+
         client = await self._quic_pool.get(key)
         if client is not None and not self._is_quic_connection_alive(client):
             client = None
@@ -3512,7 +3536,6 @@ class DNSResolver:
             except ImportError:
                 pass
 
-            # FIX: connect() is not a coroutine; it synchronously returns an async context manager
             cm = connect(resolved, port, configuration=config, create_protocol=DoQProtocol)
             try:
                 client = await cm.__aenter__()
@@ -3522,6 +3545,10 @@ class DNSResolver:
             except Exception:
                 await cm.__aexit__(None, None, None)
                 raise
+
+        # Define future early to allow cancellation in all error paths
+        future = None
+        stream_id = None
 
         try:
             await client.wait_connected()
@@ -3541,14 +3568,27 @@ class DNSResolver:
             try:
                 response_data = await asyncio.wait_for(future, timeout=self.doh_timeout)
             except asyncio.TimeoutError:
+                # Clean up the pending future and close the stream
                 client._pending.pop(stream_id, None)
+                if future and not future.done():
+                    future.cancel()
                 if self._is_quic_connection_alive(client):
                     client._quic.close()
                 raise TimeoutError(f"DoQ query to {host}:{port} timed out")
-            except Exception:
+            except asyncio.CancelledError:
+                # Explicitly cancel the future before re-raising
+                if future and not future.done():
+                    future.cancel()
                 client._pending.pop(stream_id, None)
                 raise
+            except Exception:
+                client._pending.pop(stream_id, None)
+                if future and not future.done():
+                    future.cancel()
+                raise
             finally:
+                if future and not future.done():
+                    future.cancel()
                 client._pending.pop(stream_id, None)
                 client._fragments.pop(stream_id, None)
 
@@ -3567,9 +3607,18 @@ class DNSResolver:
                     self.logger.warning("DoQ response ID mismatch: sent %d, got %d", sent_id, resp_id)
                     raise OSError("DoQ Response ID mismatch")
 
-            # Store in pool
+            # Store in pool on success
             await self._quic_pool.put(key, client)
             return resp
+
+        except asyncio.CancelledError:
+            # Clean up the connection on cancellation (e.g., health-check timeout)
+            if client is not None and hasattr(client, '_cm'):
+                try:
+                    await client._cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            raise
 
         except Exception:
             # Don't pool failed connections
