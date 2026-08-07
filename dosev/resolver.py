@@ -2686,12 +2686,11 @@ class DNSResolver:
                     self._flights[flight_key] = future
 
             if existing_future:
-                # Wait for the existing flight to complete OUTSIDE the lock
                 try:
-                    return await existing_future
+                    resp = await existing_future
+                    return self._set_query_id(resp, orig_id)   # <-- add this line
                 except Exception as e:
                     self.logger.debug("Coalesced flight failed: %s", e)
-                    # Loop around and try to become the leader again
                     continue
             
             # We are the leader; exit the loop
